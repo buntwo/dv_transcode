@@ -1,3 +1,11 @@
+# macoS
+.DS_Store
+
+# video/data dirs
+Originals/
+Access/
+Logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
