@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from transcode_naming import build_access_output_name
 from utils import auto_sibling_dir_for_path
 
 
@@ -133,21 +134,15 @@ def build_paths(cfg: Config, input_file: Path) -> Paths:
         sibling_dirname=cfg.logs_dirname,
     )
 
-    input_dir = input_file.parent
-    parts = input_dir.parts
-    matches = [i for i, part in enumerate(parts) if part == cfg.originals_dirname]
-    if not matches:
-        raise SystemExit(f"Input path must be inside a dir under {cfg.originals_dirname}/: {input_dir}")
-
-    originals_idx = matches[-1]
-    rel_dir = Path(*parts[originals_idx + 1 :])
-
-    path_prefix = str(rel_dir).replace("/", "_").replace(" ", "_").strip("_")
-    while "__" in path_prefix:
-        path_prefix = path_prefix.replace("__", "_")
-
     stem = input_file.stem
-    output_name = f"{path_prefix}_{stem}{cfg.output_suffix}.mp4" if path_prefix else f"{stem}{cfg.output_suffix}.mp4"
+    try:
+        output_name = build_access_output_name(
+            input_file,
+            originals_dirname=cfg.originals_dirname,
+            output_suffix=cfg.output_suffix,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_dir = Path(__file__).resolve().parent
