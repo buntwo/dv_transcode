@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import re
 import shlex
 import subprocess
 import sys
@@ -13,6 +15,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -20,10 +23,14 @@ from pathlib import Path
 from transcode_naming import build_access_output_name
 from utils import auto_sibling_dir_for_path
 
+DEFAULT_VALIDATE_DURATION_TOLERANCE = 0.17  # 5 NTSC DV frames at 29.97 fps.
+
 
 @dataclass
 class Config:
     mode: str
+    validate_duration: bool
+    validate_duration_tolerance: float
     format_type: str
     start: str | None
     end: str | None
@@ -70,6 +77,41 @@ class ProcessResult:
     crop_bottom: int
 
 
+@dataclass
+class DurationRow:
+    path: Path
+    duration_seconds: float
+
+
+@dataclass
+class DurationGroup:
+    logical_source: Path
+    original_file: Path
+    input_files: list[Path]
+    output_files: list[Path]
+    output_resolution_errors: list[str | None] = field(default_factory=list)
+
+
+@dataclass
+class DurationValidationResult:
+    group: DurationGroup
+    original_row: DurationRow | None
+    input_rows: list[DurationRow]
+    output_rows: list[DurationRow]
+    original_total: float | None
+    input_total: float | None
+    output_total: float | None
+    delta_original_vs_input: float | None
+    delta_original_vs_output: float | None
+    delta_input_vs_output: float | None
+    tolerance: float
+    errors: list[str]
+
+    @property
+    def passed(self) -> bool:
+        return not self.errors
+
+
 try:
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
@@ -80,9 +122,17 @@ except Exception:
 def parse_args() -> tuple[Config, list[Path]]:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in."
+        description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in.",
+        epilog=(
+            "Examples:\n"
+            "  transcode3.py --mode transcode --format video8 Originals/set/tape/out.dv\n"
+            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out.dv\n"
+            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out_partA.dv "
+            "Originals/set/tape/out_partB.dv"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--mode", choices=["transcode", "preview"], default="transcode")
+    parser.add_argument("--mode", choices=["transcode", "preview", "validate-duration"], default="transcode")
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8"], required=True)
     parser.add_argument("--start")
     parser.add_argument("--end")
@@ -95,6 +145,8 @@ def parse_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--map-both-audio", action="store_true")
     parser.add_argument("--log-level", choices=["quiet", "error", "warning", "info"], default="warning")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--no-validate-duration", action="store_true")
+    parser.add_argument("--validate-duration-tolerance", type=float, default=DEFAULT_VALIDATE_DURATION_TOLERANCE)
     parser.add_argument("--output-suffix", default="")
     parser.add_argument("--originals-dirname", default="Originals")
     parser.add_argument("--access-dirname", default="Access")
@@ -111,6 +163,8 @@ def parse_args() -> tuple[Config, list[Path]]:
 
     cfg = Config(
         mode=args.mode,
+        validate_duration=not args.no_validate_duration,
+        validate_duration_tolerance=args.validate_duration_tolerance,
         format_type=args.format_type,
         start=args.start,
         end=args.end,
@@ -188,6 +242,240 @@ def build_runtime_paths(paths: Paths, artifact_dir: Path) -> Paths:
         csv_with_play=artifact_dir / paths.csv_with_play.name,
         srt_file=artifact_dir / paths.srt_file.name,
     )
+
+
+PART_SUFFIX_RE = re.compile(r"^(?P<base>.+)_part(?P<part>[A-Za-z0-9]+)$")
+
+
+def infer_logical_original_path(input_file: Path) -> Path:
+    """Map part files back to their logical original DV path."""
+    match = PART_SUFFIX_RE.match(input_file.stem)
+    if match is None:
+        return input_file
+    return input_file.with_name(f"{match.group('base')}{input_file.suffix}")
+
+
+def resolve_validation_output_path(cfg: Config, input_file: Path) -> tuple[Path, str | None]:
+    """Resolve the MP4 path to probe during validation."""
+    expected_output = build_paths(cfg, input_file).output_file
+    if expected_output.exists():
+        return expected_output, None
+
+    if cfg.format_type != "digital8":
+        return expected_output, f"missing exact output {expected_output}"
+
+    dated_matches = sorted(expected_output.parent.glob(f"*_{expected_output.name}"))
+    if len(dated_matches) == 1:
+        return dated_matches[0], None
+    if not dated_matches:
+        return expected_output, (
+            "no dated Digital8 match found for expected output "
+            f"{expected_output.name} in {expected_output.parent}"
+        )
+
+    candidates = ", ".join(path.name for path in dated_matches)
+    return expected_output, (
+        f"ambiguous dated Digital8 matches for expected output {expected_output.name}: {candidates}"
+    )
+
+
+def build_duration_validation_groups(cfg: Config, input_files: list[Path]) -> list[DurationGroup]:
+    """Group input DVs by their logical original DV."""
+    grouped: dict[Path, list[Path]] = {}
+    for input_file in input_files:
+        resolved = input_file.resolve()
+        logical_original = infer_logical_original_path(resolved)
+        grouped.setdefault(logical_original, []).append(resolved)
+
+    groups: list[DurationGroup] = []
+    for logical_original in sorted(grouped):
+        parts = sorted(grouped[logical_original], key=lambda path: path.name)
+        resolved_outputs = [resolve_validation_output_path(cfg, part) for part in parts]
+        groups.append(
+            DurationGroup(
+                logical_source=logical_original,
+                original_file=logical_original,
+                input_files=parts,
+                output_files=[path for path, _ in resolved_outputs],
+                output_resolution_errors=[error for _, error in resolved_outputs],
+            )
+        )
+    return groups
+
+
+def probe_media_duration_seconds(path: Path) -> float:
+    """Return media duration from ffprobe in seconds."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        raise RuntimeError(f"ffprobe failed for {path}: {stderr}") from exc
+
+    value = proc.stdout.strip()
+    if not value:
+        raise RuntimeError(f"ffprobe returned no duration for {path}")
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise RuntimeError(f"ffprobe returned invalid duration for {path}: {value!r}") from exc
+    if not math.isfinite(seconds):
+        raise RuntimeError(f"ffprobe returned non-finite duration for {path}: {value!r}")
+    return seconds
+
+
+def format_seconds_precise(seconds: float | None) -> str:
+    """Format a duration for audit display."""
+    return "n/a" if seconds is None else f"{seconds:.3f}"
+
+
+def build_duration_rows(paths: list[Path]) -> list[DurationRow]:
+    """Probe all paths and return rows in order."""
+    return [DurationRow(path=path, duration_seconds=probe_media_duration_seconds(path)) for path in paths]
+
+
+def validate_duration_group(group: DurationGroup, tolerance: float) -> DurationValidationResult:
+    """Validate one logical source against its input DV parts and output MP4s."""
+    errors: list[str] = []
+    original_row: DurationRow | None = None
+    input_rows: list[DurationRow] = []
+    output_rows: list[DurationRow] = []
+
+    try:
+        original_row = DurationRow(group.original_file, probe_media_duration_seconds(group.original_file))
+    except Exception as exc:
+        errors.append(f"Original DV probe failed: {exc}")
+
+    try:
+        input_rows = build_duration_rows(group.input_files)
+    except Exception as exc:
+        errors.append(f"Input DV probe failed: {exc}")
+
+    output_resolution_errors = list(group.output_resolution_errors)
+    if len(output_resolution_errors) < len(group.output_files):
+        output_resolution_errors.extend([None] * (len(group.output_files) - len(output_resolution_errors)))
+    for output_file, resolution_error in zip(group.output_files, output_resolution_errors):
+        if resolution_error is not None and resolution_error.startswith("ambiguous"):
+            errors.append(f"Output MP4 probe failed: {resolution_error}")
+            continue
+        try:
+            output_rows.append(DurationRow(path=output_file, duration_seconds=probe_media_duration_seconds(output_file)))
+        except Exception as exc:
+            if resolution_error is not None:
+                errors.append(f"Output MP4 probe failed: {resolution_error}; {exc}")
+            else:
+                errors.append(f"Output MP4 probe failed: {exc}")
+
+    original_total = original_row.duration_seconds if original_row else None
+    input_total = sum(row.duration_seconds for row in input_rows) if input_rows else None
+    output_total = sum(row.duration_seconds for row in output_rows) if output_rows else None
+
+    delta_original_vs_input = (
+        abs(original_total - input_total) if original_total is not None and input_total is not None else None
+    )
+    delta_original_vs_output = (
+        abs(original_total - output_total) if original_total is not None and output_total is not None else None
+    )
+    delta_input_vs_output = abs(input_total - output_total) if input_total is not None and output_total is not None else None
+
+    if delta_original_vs_input is not None and delta_original_vs_input > tolerance:
+        errors.append(
+            "Original DV total differs from input DV total by "
+            f"{delta_original_vs_input:.3f}s (tolerance {tolerance:.3f}s)"
+        )
+    if delta_original_vs_output is not None and delta_original_vs_output > tolerance:
+        errors.append(
+            "Original DV total differs from MP4 total by "
+            f"{delta_original_vs_output:.3f}s (tolerance {tolerance:.3f}s)"
+        )
+
+    return DurationValidationResult(
+        group=group,
+        original_row=original_row,
+        input_rows=input_rows,
+        output_rows=output_rows,
+        original_total=original_total,
+        input_total=input_total,
+        output_total=output_total,
+        delta_original_vs_input=delta_original_vs_input,
+        delta_original_vs_output=delta_original_vs_output,
+        delta_input_vs_output=delta_input_vs_output,
+        tolerance=tolerance,
+        errors=errors,
+    )
+
+
+def print_duration_validation_result(result: DurationValidationResult) -> None:
+    """Print a fixed-width validation report for one logical source."""
+    def build_panel(title: str, rows: list[DurationRow], include_total: bool) -> list[str]:
+        panel_name_width = max(
+            len("Filename"),
+            len("TOTAL"),
+            *(len(row.path.name) for row in rows),
+        )
+        panel_duration_width = max(len("Duration (s)"), 12)
+        lines = [
+            title,
+            f"  {'Filename'.ljust(panel_name_width)}  {'Duration (s)'.rjust(panel_duration_width)}",
+            f"  {'-' * panel_name_width}  {'-' * panel_duration_width}",
+        ]
+        for row in rows:
+            lines.append(
+                f"  {row.path.name.ljust(panel_name_width)}  {format_seconds_precise(row.duration_seconds).rjust(panel_duration_width)}"
+            )
+        if include_total:
+            total = sum(row.duration_seconds for row in rows) if rows else None
+            lines.append(f"  {'TOTAL'.ljust(panel_name_width)}  {format_seconds_precise(total).rjust(panel_duration_width)}")
+        return lines
+
+    def print_side_by_side(panels: list[list[str]]) -> None:
+        widths = [max(len(line) for line in panel) for panel in panels]
+        height = max(len(panel) for panel in panels)
+        padded_panels = [panel + [""] * (height - len(panel)) for panel in panels]
+        for row_idx in range(height):
+            print("    ".join(padded_panels[idx][row_idx].ljust(widths[idx]) for idx in range(len(panels))))
+
+    print(f"\nDuration audit: {result.group.original_file.name}")
+    print_side_by_side(
+        [
+            build_panel("Original DV", [result.original_row] if result.original_row is not None else [], include_total=False),
+            build_panel("Input DVs", result.input_rows, include_total=True),
+            build_panel("Output MP4s", result.output_rows, include_total=True),
+        ]
+    )
+    print()
+
+    print(f"Delta original vs input  {format_seconds_precise(result.delta_original_vs_input)}")
+    print(f"Delta original vs mp4    {format_seconds_precise(result.delta_original_vs_output)}")
+    print(f"Delta input vs mp4       {format_seconds_precise(result.delta_input_vs_output)}")
+    print(f"Tolerance             {result.tolerance:.3f}")
+    print("PASS" if result.passed else "FAIL")
+    for error in result.errors:
+        print(f"  {error}")
+
+
+def validate_durations(cfg: Config, input_files: list[Path]) -> list[DurationValidationResult]:
+    """Run duration validation for the batch and print a report."""
+    results = [
+        validate_duration_group(group, cfg.validate_duration_tolerance)
+        for group in build_duration_validation_groups(cfg, input_files)
+    ]
+    for result in results:
+        print_duration_validation_result(result)
+    return results
 
 
 def get_hqdn3d_args(preset: str) -> str | None:
@@ -571,22 +859,29 @@ def main() -> int:
     prompted = cfg.assume_yes or cfg.mode == "preview"
     results: list[ProcessResult] = []
 
-    for input_file in input_files:
-        print(f'processing {input_file.name}')
-        try:
-            result = process_one_file(cfg, input_file, prompt=not prompted)
-            results.append(result)
-            prompted = True
-            if result.rc != 0:
+    if cfg.mode != "validate-duration":
+        for input_file in input_files:
+            print(f'processing {input_file.name}')
+            try:
+                result = process_one_file(cfg, input_file, prompt=not prompted)
+                results.append(result)
+                prompted = True
+                if result.rc != 0:
+                    failures += 1
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"ERROR processing {input_file}: {e}", file=sys.stderr)
                 failures += 1
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            print(f"ERROR processing {input_file}: {e}", file=sys.stderr)
-            failures += 1
 
     if cfg.mode == "transcode":
         print_transcode_time_summary(results)
+        if cfg.validate_duration:
+            validation_results = validate_durations(cfg, input_files)
+            failures += sum(1 for result in validation_results if not result.passed)
+    elif cfg.mode == "validate-duration":
+        validation_results = validate_durations(cfg, input_files)
+        failures += sum(1 for result in validation_results if not result.passed)
 
     return 0 if failures == 0 else 1
 

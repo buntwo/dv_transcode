@@ -12,6 +12,338 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import transcode3  # noqa: E402
 
 
+def make_config(**overrides) -> transcode3.Config:
+    values = {
+        "mode": "transcode",
+        "validate_duration": True,
+        "validate_duration_tolerance": transcode3.DEFAULT_VALIDATE_DURATION_TOLERANCE,
+        "format_type": "video8",
+        "start": None,
+        "end": None,
+        "crop_bottom": 0,
+        "pad_bottom": 0,
+        "denoise": "off",
+        "q": 70,
+        "codec": "hevc",
+        "deint_mode": "send_field",
+        "map_both_audio": False,
+        "log_level": "warning",
+        "assume_yes": True,
+        "output_suffix": "",
+        "originals_dirname": "Originals",
+        "access_dirname": "Access",
+        "logs_dirname": "Logs",
+    }
+    values.update(overrides)
+    return transcode3.Config(**values)
+
+
+class TestParseArgs(unittest.TestCase):
+    def test_parse_args_supports_validate_duration_mode_and_defaults(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--mode",
+            "validate-duration",
+            "--format",
+            "video8",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, input_files = transcode3.parse_args()
+
+        self.assertEqual(cfg.mode, "validate-duration")
+        self.assertTrue(cfg.validate_duration)
+        self.assertEqual(cfg.validate_duration_tolerance, transcode3.DEFAULT_VALIDATE_DURATION_TOLERANCE)
+        self.assertEqual(input_files, [Path("Originals/set/tape/out.dv")])
+
+    def test_parse_args_supports_no_validate_duration(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--no-validate-duration",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertFalse(cfg.validate_duration)
+
+    def test_help_mentions_out_dv_example(self) -> None:
+        argv = ["transcode3.py", "--help"]
+        captured = io.StringIO()
+        with (
+            patch.object(sys, "argv", argv),
+            redirect_stdout(captured),
+            self.assertRaises(SystemExit),
+        ):
+            transcode3.parse_args()
+
+        output = captured.getvalue()
+        self.assertIn("--mode validate-duration", output)
+        self.assertIn("out.dv", output)
+        self.assertNotIn("capture.dv", output)
+
+
+class TestDurationGrouping(unittest.TestCase):
+    def test_infer_logical_original_path_maps_parts_and_plain_names(self) -> None:
+        part = Path("/tmp/Originals/set/tape/out_partA.dv")
+        plain = Path("/tmp/Originals/set/tape/out.dv")
+
+        self.assertEqual(transcode3.infer_logical_original_path(part), plain)
+        self.assertEqual(transcode3.infer_logical_original_path(plain), plain)
+
+    def test_build_duration_validation_groups_handles_split_and_unsplit_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            split_a = root / "Originals" / "set" / "tape1" / "out_partA.dv"
+            split_b = root / "Originals" / "set" / "tape1" / "out_partB.dv"
+            plain = root / "Originals" / "set" / "tape2" / "plain.dv"
+            other = root / "Originals" / "set" / "tape3" / "other_part1.dv"
+            for path in (split_a, split_b, plain, other):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"")
+
+            cfg = make_config()
+            groups = transcode3.build_duration_validation_groups(cfg, [split_b, plain, split_a, other])
+
+        self.assertEqual([group.original_file.name for group in groups], ["out.dv", "plain.dv", "other.dv"])
+        first = groups[0]
+        self.assertEqual([path.name for path in first.input_files], ["out_partA.dv", "out_partB.dv"])
+        self.assertEqual(first.original_file.name, "out.dv")
+        self.assertEqual([path.suffix for path in first.output_files], [".mp4", ".mp4"])
+        self.assertEqual(groups[1].original_file.name, "plain.dv")
+        self.assertEqual([path.name for path in groups[1].input_files], ["plain.dv"])
+
+    def test_build_duration_validation_groups_resolves_single_dated_digital8_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            cfg = make_config(format_type="digital8")
+            expected_output = transcode3.build_paths(cfg, input_file).output_file
+            dated_output = expected_output.parent / f"20260421_{expected_output.name}"
+            dated_output.parent.mkdir(parents=True, exist_ok=True)
+            dated_output.write_bytes(b"")
+
+            groups = transcode3.build_duration_validation_groups(cfg, [input_file])
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].output_files, [dated_output.resolve()])
+        self.assertEqual(groups[0].output_resolution_errors, [None])
+
+
+class TestDurationValidation(unittest.TestCase):
+    def test_validate_duration_group_passes_within_tolerance(self) -> None:
+        group = transcode3.DurationGroup(
+            logical_source=Path("/tmp/out.dv"),
+            original_file=Path("/tmp/out.dv"),
+            input_files=[Path("/tmp/out_partA.dv"), Path("/tmp/out_partB.dv")],
+            output_files=[Path("/tmp/out_partA.mp4"), Path("/tmp/out_partB.mp4")],
+        )
+        durations = {
+            str(group.original_file): 10.0,
+            str(group.input_files[0]): 4.9,
+            str(group.input_files[1]): 5.0,
+            str(group.output_files[0]): 4.8,
+            str(group.output_files[1]): 5.1,
+        }
+
+        with patch.object(transcode3, "probe_media_duration_seconds", side_effect=lambda path: durations[str(path)]):
+            result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertTrue(result.passed)
+        self.assertAlmostEqual(result.delta_input_vs_output or 0.0, 0.0)
+
+    def test_validate_duration_group_fails_when_original_vs_input_exceeds_tolerance(self) -> None:
+        group = transcode3.DurationGroup(
+            logical_source=Path("/tmp/out.dv"),
+            original_file=Path("/tmp/out.dv"),
+            input_files=[Path("/tmp/out_partA.dv"), Path("/tmp/out_partB.dv")],
+            output_files=[Path("/tmp/out_partA.mp4"), Path("/tmp/out_partB.mp4")],
+        )
+        durations = {
+            str(group.original_file): 10.0,
+            str(group.input_files[0]): 4.0,
+            str(group.input_files[1]): 5.0,
+            str(group.output_files[0]): 5.0,
+            str(group.output_files[1]): 5.0,
+        }
+
+        with patch.object(transcode3, "probe_media_duration_seconds", side_effect=lambda path: durations[str(path)]):
+            result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertFalse(result.passed)
+        self.assertIn("input DV total", "\n".join(result.errors))
+
+    def test_validate_duration_group_fails_when_original_vs_mp4_exceeds_tolerance(self) -> None:
+        group = transcode3.DurationGroup(
+            logical_source=Path("/tmp/out.dv"),
+            original_file=Path("/tmp/out.dv"),
+            input_files=[Path("/tmp/out.dv")],
+            output_files=[Path("/tmp/out.mp4")],
+        )
+        durations = {
+            str(group.original_file): 10.0,
+            str(group.input_files[0]): 10.0,
+            str(group.output_files[0]): 11.0,
+        }
+
+        with patch.object(transcode3, "probe_media_duration_seconds", side_effect=lambda path: durations[str(path)]):
+            result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertFalse(result.passed)
+        self.assertAlmostEqual(result.delta_input_vs_output or 0.0, 1.0)
+        self.assertIn("MP4 total", "\n".join(result.errors))
+
+    def test_validate_duration_group_reports_missing_original_and_output(self) -> None:
+        group = transcode3.DurationGroup(
+            logical_source=Path("/tmp/out.dv"),
+            original_file=Path("/tmp/out.dv"),
+            input_files=[Path("/tmp/out_partA.dv")],
+            output_files=[Path("/tmp/out_partA.mp4")],
+        )
+
+        def fake_probe(path: Path) -> float:
+            if path == group.input_files[0]:
+                return 10.0
+            raise RuntimeError(f"missing: {path}")
+
+        with patch.object(transcode3, "probe_media_duration_seconds", side_effect=fake_probe):
+            result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertFalse(result.passed)
+        combined = "\n".join(result.errors)
+        self.assertIn("Original DV probe failed", combined)
+        self.assertIn("Output MP4 probe failed", combined)
+
+    def test_validate_duration_group_uses_resolved_dated_digital8_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            cfg = make_config(format_type="digital8")
+            expected_output = transcode3.build_paths(cfg, input_file).output_file
+            dated_output = expected_output.parent / f"20260421_{expected_output.name}"
+            dated_output.parent.mkdir(parents=True, exist_ok=True)
+            dated_output.write_bytes(b"")
+
+            group = transcode3.build_duration_validation_groups(cfg, [input_file])[0]
+            durations = {
+                str(group.original_file): 10.0,
+                str(group.input_files[0]): 10.0,
+                str(dated_output.resolve()): 10.0,
+            }
+
+            with patch.object(transcode3, "probe_media_duration_seconds", side_effect=lambda path: durations[str(path)]):
+                result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertTrue(result.passed)
+        self.assertEqual([row.path for row in result.output_rows], [dated_output.resolve()])
+
+    def test_validate_duration_group_reports_missing_digital8_output_when_no_dated_match_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            cfg = make_config(format_type="digital8")
+            group = transcode3.build_duration_validation_groups(cfg, [input_file])[0]
+
+            def fake_probe(path: Path) -> float:
+                if path in (group.original_file, group.input_files[0]):
+                    return 10.0
+                raise RuntimeError(f"missing: {path}")
+
+            with patch.object(transcode3, "probe_media_duration_seconds", side_effect=fake_probe):
+                result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertFalse(result.passed)
+        combined = "\n".join(result.errors)
+        self.assertIn("Output MP4 probe failed", combined)
+        self.assertIn("no dated Digital8 match found", combined)
+        self.assertIn("set_tape1_out.mp4", combined)
+
+    def test_validate_duration_group_reports_ambiguous_digital8_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            cfg = make_config(format_type="digital8")
+            expected_output = transcode3.build_paths(cfg, input_file).output_file
+            output_dir = expected_output.parent
+            output_dir.mkdir(parents=True, exist_ok=True)
+            first = output_dir / f"20260421_{expected_output.name}"
+            second = output_dir / f"20260422_{expected_output.name}"
+            first.write_bytes(b"")
+            second.write_bytes(b"")
+
+            group = transcode3.build_duration_validation_groups(cfg, [input_file])[0]
+
+            with patch.object(transcode3, "probe_media_duration_seconds", side_effect=lambda path: 10.0):
+                result = transcode3.validate_duration_group(group, tolerance=0.5)
+
+        self.assertFalse(result.passed)
+        combined = "\n".join(result.errors)
+        self.assertIn("ambiguous dated Digital8 matches", combined)
+        self.assertIn(first.name, combined)
+        self.assertIn(second.name, combined)
+
+    def test_print_duration_validation_result_includes_sections_totals_and_status(self) -> None:
+        result = transcode3.DurationValidationResult(
+            group=transcode3.DurationGroup(
+                logical_source=Path("/tmp/out.dv"),
+                original_file=Path("/tmp/out.dv"),
+                input_files=[Path("/tmp/out_partA.dv"), Path("/tmp/out_partB.dv")],
+                output_files=[Path("/tmp/out_partA.mp4"), Path("/tmp/out_partB.mp4")],
+            ),
+            original_row=transcode3.DurationRow(Path("/tmp/out.dv"), 10.0),
+            input_rows=[
+                transcode3.DurationRow(Path("/tmp/out_partA.dv"), 5.0),
+                transcode3.DurationRow(Path("/tmp/out_partB.dv"), 5.0),
+            ],
+            output_rows=[
+                transcode3.DurationRow(Path("/tmp/out_partA.mp4"), 4.9),
+                transcode3.DurationRow(Path("/tmp/out_partB.mp4"), 5.0),
+            ],
+            original_total=10.0,
+            input_total=10.0,
+            output_total=9.9,
+            delta_original_vs_input=0.0,
+            delta_original_vs_output=0.1,
+            delta_input_vs_output=0.1,
+            tolerance=0.5,
+            errors=[],
+        )
+        captured = io.StringIO()
+
+        with redirect_stdout(captured):
+            transcode3.print_duration_validation_result(result)
+
+        output = captured.getvalue()
+        self.assertIn("Original DV", output)
+        self.assertIn("Input DVs", output)
+        self.assertIn("Output MP4s", output)
+        header_line = next(line for line in output.splitlines() if "Original DV" in line and "Input DVs" in line)
+        self.assertIn("Output MP4s", header_line)
+        self.assertIn("out.dv", output)
+        self.assertIn("out_partA.dv", output)
+        self.assertIn("out_partA.mp4", output)
+        self.assertGreaterEqual(output.count("TOTAL"), 2)
+        self.assertNotIn("Original DV total", output)
+        self.assertNotIn("Input DV total", output)
+        self.assertNotIn("MP4 total", output)
+        self.assertIn("Delta input vs mp4", output)
+        self.assertIn("PASS", output)
+
+
 class TestGenerateDigital8Sidecars(unittest.TestCase):
     def test_dvrescue_uses_dash_merge_and_writes_csv_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,25 +451,7 @@ class TestPreviewArtifactPaths(unittest.TestCase):
             def fake_tempdir(*args, **kwargs):
                 yield str(preview_dir)
 
-            cfg = transcode3.Config(
-                mode="preview",
-                format_type="digital8",
-                start=None,
-                end=None,
-                crop_bottom=0,
-                pad_bottom=0,
-                denoise="off",
-                q=70,
-                codec="hevc",
-                deint_mode="send_field",
-                map_both_audio=False,
-                log_level="warning",
-                assume_yes=False,
-                output_suffix="",
-                originals_dirname="Originals",
-                access_dirname="Access",
-                logs_dirname="Logs",
-            )
+            cfg = make_config(mode="preview", format_type="digital8", assume_yes=False)
 
             captured: dict[str, object] = {}
 
@@ -200,25 +514,7 @@ class TestPreviewArtifactPaths(unittest.TestCase):
             def fake_tempdir(*args, **kwargs):
                 yield str(preview_dir)
 
-            cfg = transcode3.Config(
-                mode="preview",
-                format_type="video8",
-                start=None,
-                end=None,
-                crop_bottom=0,
-                pad_bottom=0,
-                denoise="off",
-                q=70,
-                codec="hevc",
-                deint_mode="send_field",
-                map_both_audio=False,
-                log_level="warning",
-                assume_yes=False,
-                output_suffix="",
-                originals_dirname="Originals",
-                access_dirname="Access",
-                logs_dirname="Logs",
-            )
+            cfg = make_config(mode="preview", format_type="video8", assume_yes=False)
 
             with (
                 patch.object(transcode3, "build_paths", return_value=persistent_paths),
@@ -259,25 +555,7 @@ class TestTranscodeTiming(unittest.TestCase):
                 create_srt_script=root / "create_srt.py",
             )
 
-            cfg = transcode3.Config(
-                mode="transcode",
-                format_type="digital8",
-                start=None,
-                end=None,
-                crop_bottom=0,
-                pad_bottom=0,
-                denoise="off",
-                q=70,
-                codec="hevc",
-                deint_mode="send_field",
-                map_both_audio=False,
-                log_level="warning",
-                assume_yes=False,
-                output_suffix="",
-                originals_dirname="Originals",
-                access_dirname="Access",
-                logs_dirname="Logs",
-            )
+            cfg = make_config(mode="transcode", format_type="digital8", assume_yes=False)
 
             calls: list[str] = []
 
@@ -338,25 +616,7 @@ class TestTranscodeTiming(unittest.TestCase):
                 create_srt_script=root / "create_srt.py",
             )
 
-            cfg = transcode3.Config(
-                mode="transcode",
-                format_type="video8",
-                start=None,
-                end=None,
-                crop_bottom=7,
-                pad_bottom=7,
-                denoise="light",
-                q=70,
-                codec="hevc",
-                deint_mode="send_field",
-                map_both_audio=False,
-                log_level="warning",
-                assume_yes=True,
-                output_suffix="",
-                originals_dirname="Originals",
-                access_dirname="Access",
-                logs_dirname="Logs",
-            )
+            cfg = make_config(mode="transcode", format_type="video8", crop_bottom=7, pad_bottom=7, denoise="light")
 
             with (
                 patch.object(transcode3, "build_paths", return_value=paths),
@@ -373,25 +633,7 @@ class TestTranscodeTiming(unittest.TestCase):
             self.assertEqual(result.crop_bottom, 7)
 
     def test_main_prints_transcode_time_summary(self) -> None:
-        cfg = transcode3.Config(
-            mode="transcode",
-            format_type="video8",
-            start=None,
-            end=None,
-            crop_bottom=0,
-            pad_bottom=0,
-            denoise="off",
-            q=70,
-            codec="hevc",
-            deint_mode="send_field",
-            map_both_audio=False,
-            log_level="warning",
-            assume_yes=True,
-            output_suffix="",
-            originals_dirname="Originals",
-            access_dirname="Access",
-            logs_dirname="Logs",
-        )
+        cfg = make_config(mode="transcode")
         file_a = Path("/tmp/a.dv")
         file_b = Path("/tmp/b.dv")
         results = [
@@ -403,6 +645,7 @@ class TestTranscodeTiming(unittest.TestCase):
         with (
             patch.object(transcode3, "parse_args", return_value=(cfg, [file_a, file_b])),
             patch.object(transcode3, "process_one_file", side_effect=results),
+            patch.object(transcode3, "validate_durations", return_value=[]),
             redirect_stdout(captured),
         ):
             rc = transcode3.main()
@@ -428,25 +671,7 @@ class TestTranscodeTiming(unittest.TestCase):
         self.assertEqual(output.count("End-of-run summary:"), 1)
 
     def test_main_skips_timing_summary_for_preview(self) -> None:
-        cfg = transcode3.Config(
-            mode="preview",
-            format_type="video8",
-            start=None,
-            end=None,
-            crop_bottom=0,
-            pad_bottom=0,
-            denoise="off",
-            q=70,
-            codec="hevc",
-            deint_mode="send_field",
-            map_both_audio=False,
-            log_level="warning",
-            assume_yes=True,
-            output_suffix="",
-            originals_dirname="Originals",
-            access_dirname="Access",
-            logs_dirname="Logs",
-        )
+        cfg = make_config(mode="preview")
         input_file = Path("/tmp/preview.dv")
         captured = io.StringIO()
 
@@ -464,6 +689,125 @@ class TestTranscodeTiming(unittest.TestCase):
         output = captured.getvalue()
         self.assertEqual(rc, 0)
         self.assertNotIn("End-of-run summary:", output)
+
+    def test_main_transcode_auto_runs_validation_by_default(self) -> None:
+        cfg = make_config(mode="transcode", validate_duration=True)
+        input_file = Path("/tmp/input.dv")
+
+        with (
+            patch.object(transcode3, "parse_args", return_value=(cfg, [input_file])),
+            patch.object(
+                transcode3,
+                "process_one_file",
+                return_value=transcode3.ProcessResult(input_file, Path("/tmp/input.mp4"), 0, 1.0, None, "video8", "off", 0),
+            ),
+            patch.object(
+                transcode3,
+                "validate_durations",
+                return_value=[
+                    transcode3.DurationValidationResult(
+                        group=transcode3.DurationGroup(input_file, input_file, [input_file], [Path("/tmp/input.mp4")]),
+                        original_row=transcode3.DurationRow(input_file, 1.0),
+                        input_rows=[transcode3.DurationRow(input_file, 1.0)],
+                        output_rows=[transcode3.DurationRow(Path("/tmp/input.mp4"), 1.0)],
+                        original_total=1.0,
+                        input_total=1.0,
+                        output_total=1.0,
+                        delta_original_vs_input=0.0,
+                        delta_original_vs_output=0.0,
+                        delta_input_vs_output=0.0,
+                        tolerance=0.5,
+                        errors=[],
+                    )
+                ],
+            ) as mock_validate,
+        ):
+            rc = transcode3.main()
+
+        self.assertEqual(rc, 0)
+        mock_validate.assert_called_once_with(cfg, [input_file])
+
+    def test_main_transcode_can_skip_validation(self) -> None:
+        cfg = make_config(mode="transcode", validate_duration=False)
+        input_file = Path("/tmp/input.dv")
+
+        with (
+            patch.object(transcode3, "parse_args", return_value=(cfg, [input_file])),
+            patch.object(
+                transcode3,
+                "process_one_file",
+                return_value=transcode3.ProcessResult(input_file, Path("/tmp/input.mp4"), 0, 1.0, None, "video8", "off", 0),
+            ),
+            patch.object(transcode3, "validate_durations") as mock_validate,
+        ):
+            rc = transcode3.main()
+
+        self.assertEqual(rc, 0)
+        mock_validate.assert_not_called()
+
+    def test_main_validate_duration_mode_runs_validation_only(self) -> None:
+        cfg = make_config(mode="validate-duration")
+        input_file = Path("/tmp/input.dv")
+
+        with (
+            patch.object(transcode3, "parse_args", return_value=(cfg, [input_file])),
+            patch.object(transcode3, "process_one_file") as mock_process,
+            patch.object(transcode3, "validate_durations", return_value=[]) as mock_validate,
+        ):
+            rc = transcode3.main()
+
+        self.assertEqual(rc, 0)
+        mock_process.assert_not_called()
+        mock_validate.assert_called_once_with(cfg, [input_file])
+
+    def test_main_preview_never_validates(self) -> None:
+        cfg = make_config(mode="preview")
+        input_file = Path("/tmp/preview.dv")
+
+        with (
+            patch.object(transcode3, "parse_args", return_value=(cfg, [input_file])),
+            patch.object(
+                transcode3,
+                "process_one_file",
+                return_value=transcode3.ProcessResult(input_file, None, 0, None, None, "video8", "off", 0),
+            ),
+            patch.object(transcode3, "validate_durations") as mock_validate,
+        ):
+            rc = transcode3.main()
+
+        self.assertEqual(rc, 0)
+        mock_validate.assert_not_called()
+
+    def test_main_validation_failure_makes_exit_non_zero(self) -> None:
+        cfg = make_config(mode="validate-duration")
+        input_file = Path("/tmp/input.dv")
+
+        with (
+            patch.object(transcode3, "parse_args", return_value=(cfg, [input_file])),
+            patch.object(
+                transcode3,
+                "validate_durations",
+                return_value=[
+                    transcode3.DurationValidationResult(
+                        group=transcode3.DurationGroup(input_file, input_file, [input_file], [Path("/tmp/input.mp4")]),
+                        original_row=None,
+                        input_rows=[],
+                        output_rows=[],
+                        original_total=None,
+                        input_total=None,
+                        output_total=None,
+                        delta_original_vs_input=None,
+                        delta_original_vs_output=None,
+                        delta_input_vs_output=None,
+                        tolerance=0.5,
+                        errors=["missing output"],
+                    )
+                ],
+            ),
+        ):
+            rc = transcode3.main()
+
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":
