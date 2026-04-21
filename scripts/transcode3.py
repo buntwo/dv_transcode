@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import shlex
 import subprocess
@@ -54,7 +55,6 @@ class Paths:
     create_srt_script: Path
 
 
-# unbuffer stdout/stderr
 try:
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
@@ -66,7 +66,6 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(
         description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in."
     )
-
     parser.add_argument("--mode", choices=["transcode", "preview"], default="transcode")
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8"], required=True)
     parser.add_argument("--start")
@@ -84,17 +83,14 @@ def parse_args() -> Config:
     parser.add_argument("input_file")
     parser.add_argument("access_root")
     parser.add_argument("log_root")
-
     args = parser.parse_args()
 
     crop_bottom = args.crop_bottom
     denoise = args.denoise
-
     if crop_bottom is None:
         crop_bottom = 7 if args.format_type == "video8" else 0
     if denoise is None:
         denoise = "light" if args.format_type == "video8" else "light"
-
     pad_bottom = args.pad_bottom if args.pad_bottom is not None else crop_bottom
 
     return Config(
@@ -118,46 +114,30 @@ def parse_args() -> Config:
     )
 
 
-def require_regular_file(path: Path) -> None:
-    if not path.is_file():
-        raise SystemExit(f"Input is not a regular file: {path}")
+def build_paths(cfg: Config) -> Paths:
+    if not cfg.input_file.is_file():
+        raise SystemExit(f"Input is not a regular file: {cfg.input_file}")
 
-
-def find_rel_dir_under_originals(input_dir_abs: Path) -> Path:
+    input_dir_abs = (cfg.input_file.parent if cfg.input_file.parent != Path("") else Path(".")).resolve()
     dir_str = str(input_dir_abs)
     marker = f"{os.sep}Originals{os.sep}"
     if marker not in dir_str:
         raise SystemExit(f"Input path must be inside a dir under Originals/: {input_dir_abs}")
     rel = dir_str.split(marker, 1)[1]
-    return Path(rel) if rel else Path()
-
-
-def collapse_underscores(value: str) -> str:
-    while "__" in value:
-        value = value.replace("__", "_")
-    return value
-
-
-def build_paths(cfg: Config) -> Paths:
-    require_regular_file(cfg.input_file)
-
-    input_dir_abs = (cfg.input_file.parent if cfg.input_file.parent != Path("") else Path(".")).resolve()
-    stem = cfg.input_file.stem
-    rel_dir = find_rel_dir_under_originals(input_dir_abs)
+    rel_dir = Path(rel) if rel else Path()
 
     out_dir = cfg.access_root / rel_dir
     log_dir = cfg.log_root / rel_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    path_prefix = collapse_underscores(str(rel_dir).replace("/", "_").replace(" ", "_")).strip("_")
-    #suffix = "_access_h264" if cfg.codec == "h264" else "_access_hevc"
-    suffix = "" # let's not add any suffix to avoid confusing less tech savvy people when sharing
+    path_prefix = str(rel_dir).replace("/", "_").replace(" ", "_").strip("_")
+    while "__" in path_prefix:
+        path_prefix = path_prefix.replace("__", "_")
 
-    if path_prefix:
-        output_name = f"{path_prefix}_{stem}{suffix}{cfg.output_suffix}.mp4"
-    else:
-        output_name = f"{stem}_{suffix}{cfg.output_suffix}.mp4"
+    stem = cfg.input_file.stem
+    suffix = ""
+    output_name = f"{path_prefix}_{stem}{suffix}{cfg.output_suffix}.mp4" if path_prefix else f"{stem}_{suffix}{cfg.output_suffix}.mp4"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_dir = Path(__file__).resolve().parent
@@ -206,9 +186,7 @@ def escape_ffmpeg_filter_value(value: str) -> str:
 
 
 def build_vf(cfg: Config, paths: Paths) -> str:
-    filters: list[str] = []
-
-    filters.append(f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all")
+    filters: list[str] = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
     if cfg.crop_bottom > 0:
         filters.append(f"crop=iw:ih-{cfg.crop_bottom}:0:0")
@@ -219,9 +197,11 @@ def build_vf(cfg: Config, paths: Paths) -> str:
     if hqdn3d:
         filters.append(f"hqdn3d={hqdn3d}")
 
-    filters.append("scale='trunc(ih*dar/2)*2:ih'")
-    filters.append("setsar=1")
-    filters.append("setparams=range=limited:color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m")
+    filters.extend([
+        "scale='trunc(ih*dar/2)*2:ih'",
+        "setsar=1",
+        "setparams=range=limited:color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m",
+    ])
 
     if cfg.format_type == "digital8":
         srt_path = escape_ffmpeg_filter_value(str(paths.srt_file))
@@ -243,24 +223,14 @@ def build_vf(cfg: Config, paths: Paths) -> str:
 
 
 def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list[str]:
-    args = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        cfg.log_level,
-        "-stats",
-        "-stats_period",
-        "1",
-    ]
+    args = ["ffmpeg", "-hide_banner", "-loglevel", cfg.log_level, "-stats", "-stats_period", "1"]
 
     if cfg.start:
         args += ["-ss", cfg.start]
     if cfg.end:
         args += ["-to", cfg.end]
 
-    args += ["-i", str(paths.input_file)]
-    args += ["-vf", vf]
-    args += ["-map", "0:v:0"]
+    args += ["-i", str(paths.input_file), "-vf", vf, "-map", "0:v:0"]
 
     if cfg.map_both_audio:
         args += ["-map", "0:a:0?", "-map", "0:a:1?"]
@@ -273,33 +243,19 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
         args += ["-c:v", "hevc_videotoolbox", "-profile:v", "main", "-tag:v", "hvc1"]
 
     args += [
-        "-spatial_aq",
-        "1",
-        "-max_ref_frames",
-        "4",
-        "-q:v",
-        str(cfg.q),
-        "-color_range",
-        "tv",
-        "-color_primaries",
-        "smpte170m",
-        "-color_trc",
-        "smpte170m",
-        "-colorspace",
-        "smpte170m",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
+        "-spatial_aq", "1",
+        "-max_ref_frames", "4",
+        "-q:v", str(cfg.q),
+        "-color_range", "tv",
+        "-color_primaries", "smpte170m",
+        "-color_trc", "smpte170m",
+        "-colorspace", "smpte170m",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
     ]
 
-    if preview:
-        args += ["-f", "matroska", "-"]
-    else:
-        args += [str(paths.output_file)]
-
+    args += ["-f", "matroska", "-"] if preview else [str(paths.output_file)]
     return args
 
 
@@ -307,75 +263,73 @@ def shjoin(args: list[str]) -> str:
     return shlex.join(args)
 
 
-def require_helper(path: Path) -> None:
-    if not path.exists():
-        raise SystemExit(f"Missing script: {path}")
-
-
 def run_checked(args: list[str], stdout_path: Path | None = None) -> None:
     if stdout_path is None:
         subprocess.run(args, check=True)
-        return
+    else:
+        with stdout_path.open("w", encoding="utf-8", newline="\n") as f:
+            subprocess.run(args, check=True, stdout=f)
 
-    with stdout_path.open("w", encoding="utf-8", newline="\n") as f:
-        subprocess.run(args, check=True, stdout=f)
+
+def extract_first_rdt_yyyymmdd(csv_path: Path) -> str | None:
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            raw = (row.get("rdt") or "").strip()
+            if not raw:
+                continue
+            date_part = raw.split(" ", 1)[0]
+            parts = date_part.split("-")
+            if len(parts) == 3 and all(parts):
+                yyyy, mm, dd = parts
+                if len(yyyy) == 4 and len(mm) == 2 and len(dd) == 2:
+                    return f"{yyyy}{mm}{dd}"
+    return None
 
 
 def generate_digital8_sidecars(paths: Paths) -> None:
-    require_helper(paths.add_play_time_script)
-    require_helper(paths.create_srt_script)
+    if not paths.add_play_time_script.exists():
+        raise SystemExit(f"Missing script: {paths.add_play_time_script}")
+    if not paths.create_srt_script.exists():
+        raise SystemExit(f"Missing script: {paths.create_srt_script}")
 
     print("Generating Digital8 CSV/SRT sidecars...")
     run_checked(["dvrescue", "--csv", str(paths.input_file), "-m", "/dev/null"], stdout_path=paths.csv_raw)
     run_checked(["python3", str(paths.add_play_time_script), str(paths.csv_raw), "-o", str(paths.csv_with_play)])
     run_checked(["python3", str(paths.create_srt_script), str(paths.csv_with_play), "-o", str(paths.srt_file)])
 
+    yyyymmdd = extract_first_rdt_yyyymmdd(paths.csv_with_play)
+    if yyyymmdd:
+        paths.output_file = paths.output_file.with_name(f"{yyyymmdd}_{paths.output_file.name}")
+    else:
+        print("Warning: could not find first-frame rdt date; leaving output filename unchanged.")
 
-def print_cmd(ffmpeg_args: list[str]) -> None:
+
+def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bool) -> None:
+    print(f"Mode: {cfg.mode}")
+    print(f"Format: {cfg.format_type}")
+    print(f"Input: {paths.input_file}")
+    print(f"Output dir: {paths.out_dir}")
+    if cfg.start or cfg.end:
+        print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
+    print(f"Codec: {cfg.codec}")
+    print(f"Denoise preset: {cfg.denoise}")
+    print(f"Bottom crop rows: {cfg.crop_bottom}")
+    print(f"Bottom pad rows: {cfg.pad_bottom}")
+    print(f"Deinterlace mode: {cfg.deint_mode}")
+    if cfg.format_type == "digital8":
+        print(f"CSV: {paths.csv_raw}")
+        print(f"CSV w/ play time: {paths.csv_with_play}")
+        print(f"SRT: {paths.srt_file}")
+
+    if preview:
+        print("\nPreview pipeline:\n")
+    else:
+        print(f"Output: {paths.output_file}")
+        print(f"Log: {paths.ffmpeg_log_file}\n")
+        print("Running command:\n")
+
     print(shjoin(ffmpeg_args))
-
-
-def print_summary_transcode(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None:
-    print(f"Mode: {cfg.mode}")
-    print(f"Format: {cfg.format_type}")
-    print(f"Input: {paths.input_file}")
-    print(f"Output dir: {paths.out_dir}")
-    if cfg.start or cfg.end:
-        print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
-    print(f"Codec: {cfg.codec}")
-    print(f"Denoise preset: {cfg.denoise}")
-    print(f"Bottom crop rows: {cfg.crop_bottom}")
-    print(f"Bottom pad rows: {cfg.pad_bottom}")
-    print(f"Deinterlace mode: {cfg.deint_mode}")
-    if cfg.format_type == "digital8":
-        print(f"CSV: {paths.csv_raw}")
-        print(f"CSV w/ play time: {paths.csv_with_play}")
-        print(f"SRT: {paths.srt_file}")
-    print(f"Output: {paths.output_file}")
-    print(f"Log: {paths.ffmpeg_log_file}\n")
-    print("Running command:\n")
-    print_cmd(ffmpeg_args)
-    print()
-
-
-def print_summary_preview(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None:
-    print(f"Mode: {cfg.mode}")
-    print(f"Format: {cfg.format_type}")
-    print(f"Input: {paths.input_file}")
-    print(f"Output dir: {paths.out_dir}")
-    if cfg.start or cfg.end:
-        print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
-    print(f"Codec: {cfg.codec}")
-    print(f"Denoise preset: {cfg.denoise}")
-    print(f"Bottom crop rows: {cfg.crop_bottom}")
-    print(f"Bottom pad rows: {cfg.pad_bottom}")
-    print(f"Deinterlace mode: {cfg.deint_mode}")
-    if cfg.format_type == "digital8":
-        print(f"CSV: {paths.csv_raw}")
-        print(f"CSV w/ play time: {paths.csv_with_play}")
-        print(f"SRT: {paths.srt_file}")
-    print("\nPreview pipeline:\n")
-    print_cmd(ffmpeg_args)
     print()
 
 
@@ -401,12 +355,6 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
     paths.command_log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def wait_for_enter(assume_yes: bool) -> None:
-    if assume_yes:
-        return
-    input("Press Enter to start transcode, or Ctrl-C to cancel...")
-
-
 def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
     try:
         while True:
@@ -423,50 +371,26 @@ def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
         stream.close()
 
 
-def run_transcode(ffmpeg_args: list[str], log_path: Path) -> int:
+def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None = None) -> int:
     with log_path.open("wb") as log_file:
-        proc = subprocess.Popen(
-            ffmpeg_args,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        assert proc.stderr is not None
-        t = threading.Thread(
-            target=tee_stream,
-            args=(proc.stderr, [log_file], True),
-            daemon=True,
-        )
-        t.start()
-        rc = proc.wait()
-        t.join()
-        return rc
+        if preview_stem is None:
+            proc = subprocess.Popen(ffmpeg_args, stderr=subprocess.PIPE, bufsize=0)
+            assert proc.stderr is not None
+            t = threading.Thread(target=tee_stream, args=(proc.stderr, [log_file], True), daemon=True)
+            t.start()
+            rc = proc.wait()
+            t.join()
+            return rc
 
-
-def run_preview(ffmpeg_args: list[str], log_path: Path, stem: str) -> int:
-    ffplay_args = ["ffplay", "-hide_banner", "-window_title", f"{stem} preview", "-"]
-
-    with log_path.open("wb") as log_file:
-        ffmpeg_proc = subprocess.Popen(
-            ffmpeg_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        ffplay_args = ["ffplay", "-hide_banner", "-window_title", f"{preview_stem} preview", "-"]
+        ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         assert ffmpeg_proc.stdout is not None
         assert ffmpeg_proc.stderr is not None
 
-        ffplay_proc = subprocess.Popen(
-            ffplay_args,
-            stdin=ffmpeg_proc.stdout,
-            bufsize=0,
-        )
+        ffplay_proc = subprocess.Popen(ffplay_args, stdin=ffmpeg_proc.stdout, bufsize=0)
         ffmpeg_proc.stdout.close()
 
-        t = threading.Thread(
-            target=tee_stream,
-            args=(ffmpeg_proc.stderr, [log_file], True),
-            daemon=True,
-        )
+        t = threading.Thread(target=tee_stream, args=(ffmpeg_proc.stderr, [log_file], True), daemon=True)
         t.start()
 
         ffplay_rc = ffplay_proc.wait()
@@ -484,17 +408,19 @@ def main() -> int:
         generate_digital8_sidecars(paths)
 
     vf = build_vf(cfg, paths)
-    ffmpeg_args = build_ffmpeg_args(cfg, paths, vf, preview=(cfg.mode == "preview"))
+    preview = cfg.mode == "preview"
+    ffmpeg_args = build_ffmpeg_args(cfg, paths, vf, preview=preview)
 
-    if cfg.mode == "preview":
-        print_summary_preview(cfg, paths, ffmpeg_args)
-        return run_preview(ffmpeg_args, paths.ffmpeg_log_file, paths.stem)
+    print_summary(cfg, paths, ffmpeg_args, preview=preview)
 
-    print_summary_transcode(cfg, paths, ffmpeg_args)
-    wait_for_enter(cfg.assume_yes)
+    if preview:
+        return run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+
+    if not cfg.assume_yes:
+        input("Press Enter to start transcode, or Ctrl-C to cancel...")
+
     write_command_log(cfg, paths, ffmpeg_args)
-
-    rc = run_transcode(ffmpeg_args, paths.ffmpeg_log_file)
+    rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file)
     if rc != 0:
         return rc
 
