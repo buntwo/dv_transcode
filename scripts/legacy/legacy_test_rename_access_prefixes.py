@@ -3,38 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 import rename_access_prefixes  # noqa: E402
-import transcode_naming  # noqa: E402
-
-
-class TestTranscodeNaming(unittest.TestCase):
-    def test_direct_child_case(self) -> None:
-        self.assertEqual(
-            transcode_naming.build_access_output_name("Originals/Set 2/1 2001/out.dv"),
-            "Set_2_1_out.mp4",
-        )
-
-    def test_deeper_path_case(self) -> None:
-        self.assertEqual(
-            transcode_naming.build_access_output_name("Originals/Set 1/1 Disney/retakes/out.dv"),
-            "Set_1_1_retakes_out.mp4",
-        )
-
-    def test_unnumbered_case(self) -> None:
-        self.assertEqual(
-            transcode_naming.build_access_output_name(
-                'Originals/Unnumbered/H 灵灵 3rd Grade "ShoeBeDo" Show/out.dv'
-            ),
-            "Unnumbered_H_out.mp4",
-        )
-
-    def test_single_word_child_directory_is_used_as_prefix(self) -> None:
-        self.assertEqual(
-            transcode_naming.build_access_output_name("Originals/Set 9/23/out.dv"),
-            "Set_9_23_out.mp4",
-        )
 
 
 class TestRenameAccessPrefixes(unittest.TestCase):

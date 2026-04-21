@@ -8,6 +8,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 from transcode_naming import (
     build_access_output_name_from_rel_dir,
     build_legacy_access_output_name_from_rel_dir,
