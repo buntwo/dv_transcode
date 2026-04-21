@@ -94,7 +94,10 @@ def parse_args() -> argparse.Namespace:
         "unsplit",
         help="Merge selected consecutive split parts back into larger DV files",
     )
-    unsplit_p.add_argument("input_dir", help="Directory containing *_partN.dv files")
+    unsplit_p.add_argument(
+        "input_dir",
+        help="Original DV directory containing a split/ subdirectory",
+    )
     unsplit_p.add_argument("spec", help='Grouping spec like "1-3,4,5-9,10"')
     unsplit_p.add_argument(
         "-o",
@@ -104,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     unsplit_p.add_argument(
         "--pattern",
         default="*_part*.dv",
-        help='Glob for input files (default: "*_part*.dv")',
+        help='Glob for input files inside split/ (default: "*_part*.dv")',
     )
     unsplit_p.add_argument(
         "--overwrite",
@@ -299,7 +302,7 @@ def run_split(args: argparse.Namespace) -> int:
     log_dir = auto_sibling_dir_for_path(
         input_dv,
         originals_dirname=args.originals_dirname,
-        logs_dirname=args.logs_dirname,
+        sibling_dirname=args.logs_dirname,
     )
     log_path = write_command_log(log_dir, "split.cmd", cmd, args.dry_run)
 
@@ -323,23 +326,34 @@ def run_split(args: argparse.Namespace) -> int:
 
 def run_unsplit(args: argparse.Namespace) -> int:
     """Unsplit selected consecutive parts into merged or linked outputs and log the command."""
-    input_dir = Path(args.input_dir).resolve()
-    if not input_dir.is_dir():
-        logging.error("input_dir is not a directory: %s", input_dir)
+    base_path = Path(args.input_dir).resolve()
+
+    if base_path.is_file():
+        base_dir = base_path.parent
+    else:
+        base_dir = base_path
+
+    if not base_dir.is_dir():
+        logging.error("input_dir is not a directory: %s", base_dir)
         return 1
 
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else input_dir.parent
+    split_dir = base_dir / "split"
+    if not split_dir.is_dir():
+        logging.error("split directory not found: %s", split_dir)
+        return 1
+
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else base_dir
 
     try:
         groups = parse_spec(args.spec)
-        prefix, part_map = discover_parts(input_dir, args.pattern)
+        prefix, part_map = discover_parts(split_dir, args.pattern)
         existing_parts = sorted(part_map)
         validate_spec(groups, existing_parts)
     except Exception as e:
         logging.error("%s", e)
         return 1
 
-    cmd = [Path(sys.argv[0]).name, "unsplit", str(input_dir), args.spec]
+    cmd = [Path(sys.argv[0]).name, "unsplit", str(base_path), args.spec]
     if args.output_dir:
         cmd += ["-o", str(output_dir)]
     if args.pattern != "*_part*.dv":
@@ -350,9 +364,9 @@ def run_unsplit(args: argparse.Namespace) -> int:
         cmd += ["--dry-run"]
 
     log_dir = auto_sibling_dir_for_path(
-        input_dir,
+        base_dir,
         originals_dirname=args.originals_dirname,
-        logs_dirname=args.logs_dirname,
+        sibling_dirname=args.logs_dirname,
     )
     log_path = write_command_log(log_dir, "unsplit.cmd", cmd, args.dry_run)
 
@@ -372,7 +386,7 @@ def run_unsplit(args: argparse.Namespace) -> int:
             run_dvpackager_unpackage(args.dvpackager_bin, input_files, out_path, args.overwrite)
 
     if args.dry_run:
-        logging.info("Would unsplit from: %s", input_dir)
+        logging.info("Would unsplit from: %s", split_dir)
         logging.info("Would write to: %s", output_dir)
         logging.info("Would log command to: %s", log_path)
         logging.info("Would create:")
@@ -382,7 +396,8 @@ def run_unsplit(args: argparse.Namespace) -> int:
         return 0
 
     logging.info("Unsplit complete.")
-    logging.info("Input dir: %s", input_dir)
+    logging.info("Input dir: %s", base_dir)
+    logging.info("Split dir: %s", split_dir)
     logging.info("Output dir: %s", output_dir)
     logging.info("Command log: %s", log_path)
     logging.info("Created file(s):")

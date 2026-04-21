@@ -6,7 +6,7 @@ def auto_sibling_dir_for_path(
     path: str | Path,
     *,
     originals_dirname: str = "Originals",
-    logs_dirname: str = "Logs",
+    sibling_dirname: str = "Logs",
 ) -> Path:
     """Construct and create the log directory for a file or directory under Originals/."""
 
@@ -33,6 +33,6 @@ def auto_sibling_dir_for_path(
     rel_under_originals = Path(*parts[originals_idx + 1 :])
     base_root = Path(".") if originals_idx == 0 else Path(*parts[:originals_idx])
 
-    log_dir = base_root / logs_dirname / rel_under_originals
+    log_dir = base_root / sibling_dirname / rel_under_originals
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir

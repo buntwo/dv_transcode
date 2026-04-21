@@ -133,8 +133,21 @@ def build_paths(cfg: Config, input_file: Path) -> Paths:
         sibling_dirname=cfg.logs_dirname,
     )
 
+    input_dir = input_file.parent
+    parts = input_dir.parts
+    matches = [i for i, part in enumerate(parts) if part == cfg.originals_dirname]
+    if not matches:
+        raise SystemExit(f"Input path must be inside a dir under {cfg.originals_dirname}/: {input_dir}")
+
+    originals_idx = matches[-1]
+    rel_dir = Path(*parts[originals_idx + 1 :])
+
+    path_prefix = str(rel_dir).replace("/", "_").replace(" ", "_").strip("_")
+    while "__" in path_prefix:
+        path_prefix = path_prefix.replace("__", "_")
+
     stem = input_file.stem
-    output_name = f"{stem}{cfg.output_suffix}.mp4"
+    output_name = f"{path_prefix}_{stem}{cfg.output_suffix}.mp4" if path_prefix else f"{stem}{cfg.output_suffix}.mp4"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_dir = Path(__file__).resolve().parent
@@ -429,6 +442,7 @@ def main() -> int:
     prompted = cfg.assume_yes or cfg.mode == "preview"
 
     for input_file in input_files:
+        print(f'processing {input_file.name}')
         try:
             rc = process_one_file(cfg, input_file, prompt=not prompted)
             prompted = True
