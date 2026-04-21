@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime
@@ -55,6 +56,18 @@ class Paths:
     srt_file: Path
     add_play_time_script: Path
     create_srt_script: Path
+
+
+@dataclass
+class ProcessResult:
+    input_file: Path
+    output_file: Path | None
+    rc: int
+    transcode_seconds: float | None
+    sidecar_seconds: float | None
+    format_type: str
+    denoise: str
+    crop_bottom: int
 
 
 try:
@@ -391,6 +404,63 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
     paths.command_log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def format_duration(seconds: float | None) -> str:
+    """Format an elapsed duration for human-readable summary output."""
+    if seconds is None:
+        return "n/a"
+
+    total_seconds = int(seconds + 0.5)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def build_summary_options(result: ProcessResult) -> str:
+    """Build the compact options string for the end-of-run summary table."""
+    return f"{result.format_type} | denoise={result.denoise} | crop={result.crop_bottom}"
+
+
+def print_transcode_time_summary(results: list[ProcessResult]) -> None:
+    """Print a batch-end summary table of per-file durations and options."""
+    if not results:
+        return
+
+    total_transcode_seconds = sum(result.transcode_seconds or 0.0 for result in results)
+    total_sidecar_seconds = sum(result.sidecar_seconds or 0.0 for result in results)
+    headers = ("Filename", "Transcode", "Sidecar Gen", "Options")
+    rows = [
+        (
+            result.input_file.name,
+            format_duration(result.transcode_seconds),
+            format_duration(result.sidecar_seconds),
+            build_summary_options(result),
+        )
+        for result in results
+    ]
+    rows.append(
+        (
+            "TOTAL",
+            format_duration(total_transcode_seconds),
+            format_duration(total_sidecar_seconds),
+            "",
+        )
+    )
+    widths = [
+        max(len(headers[idx]), *(len(row[idx]) for row in rows))
+        for idx in range(len(headers))
+    ]
+
+    print("\nEnd-of-run summary:")
+    print("  ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers)))
+    print("  ".join("-" * widths[idx] for idx in range(len(headers))))
+    for row in rows:
+        print("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(headers))))
+
+
 def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
     """Tee a binary stream to one or more outputs, optionally mirroring to stderr."""
     try:
@@ -437,7 +507,7 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
         return ffmpeg_rc if ffmpeg_rc != 0 else ffplay_rc
 
 
-def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> int:
+def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
     """Process one input file through the transcode workflow."""
     preview = cfg.mode == "preview"
     if preview:
@@ -448,11 +518,24 @@ def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> int:
                 generate_digital8_sidecars(paths)
             ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
             print_summary(cfg, paths, ffmpeg_args, preview=True)
-            return run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+            rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+            return ProcessResult(
+                input_file=paths.input_file,
+                output_file=None,
+                rc=rc,
+                transcode_seconds=None,
+                sidecar_seconds=None,
+                format_type=cfg.format_type,
+                denoise=cfg.denoise,
+                crop_bottom=cfg.crop_bottom,
+            )
 
     paths = build_paths(cfg, input_file)
+    sidecar_seconds = None
     if cfg.format_type == "digital8":
+        sidecar_start = time.perf_counter()
         generate_digital8_sidecars(paths)
+        sidecar_seconds = time.perf_counter() - sidecar_start
 
     ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=False)
     print_summary(cfg, paths, ffmpeg_args, preview=False)
@@ -460,11 +543,24 @@ def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> int:
     if prompt:
         input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
 
-    write_command_log(cfg, paths, ffmpeg_args)
-    rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file)
+    start = time.perf_counter()
+    try:
+        write_command_log(cfg, paths, ffmpeg_args)
+        rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file)
+    finally:
+        transcode_seconds = time.perf_counter() - start
     if rc == 0:
         print(f"Done: {paths.output_file}")
-    return rc
+    return ProcessResult(
+        input_file=paths.input_file,
+        output_file=paths.output_file,
+        rc=rc,
+        transcode_seconds=transcode_seconds,
+        sidecar_seconds=sidecar_seconds,
+        format_type=cfg.format_type,
+        denoise=cfg.denoise,
+        crop_bottom=cfg.crop_bottom,
+    )
 
 
 def main() -> int:
@@ -473,19 +569,24 @@ def main() -> int:
 
     failures = 0
     prompted = cfg.assume_yes or cfg.mode == "preview"
+    results: list[ProcessResult] = []
 
     for input_file in input_files:
         print(f'processing {input_file.name}')
         try:
-            rc = process_one_file(cfg, input_file, prompt=not prompted)
+            result = process_one_file(cfg, input_file, prompt=not prompted)
+            results.append(result)
             prompted = True
-            if rc != 0:
+            if result.rc != 0:
                 failures += 1
         except KeyboardInterrupt:
             raise
         except Exception as e:
             print(f"ERROR processing {input_file}: {e}", file=sys.stderr)
             failures += 1
+
+    if cfg.mode == "transcode":
+        print_transcode_time_summary(results)
 
     return 0 if failures == 0 else 1
 
