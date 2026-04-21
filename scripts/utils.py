@@ -2,7 +2,7 @@ from pathlib import Path
 import logging
 
 
-def auto_log_dir_for_path(
+def auto_sibling_dir_for_path(
     path: str | Path,
     *,
     originals_dirname: str = "Originals",

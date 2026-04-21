@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import shlex
 import subprocess
 import sys
@@ -15,12 +14,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from utils import auto_sibling_dir_for_path
+
 
 @dataclass
 class Config:
     input_file: Path
-    access_root: Path
-    log_root: Path
     mode: str
     format_type: str
     start: str | None
@@ -35,14 +34,15 @@ class Config:
     log_level: str
     assume_yes: bool
     output_suffix: str
+    originals_dirname: str
+    access_dirname: str
+    logs_dirname: str
 
 
 @dataclass
 class Paths:
     input_file: Path
-    input_dir_abs: Path
     stem: str
-    rel_dir: Path
     out_dir: Path
     log_dir: Path
     output_file: Path
@@ -63,6 +63,7 @@ except Exception:
 
 
 def parse_args() -> Config:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in."
     )
@@ -80,9 +81,10 @@ def parse_args() -> Config:
     parser.add_argument("--log-level", choices=["quiet", "error", "warning", "info"], default="warning")
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--output-suffix", default="")
+    parser.add_argument("--originals-dirname", default="Originals")
+    parser.add_argument("--access-dirname", default="Access")
+    parser.add_argument("--logs-dirname", default="Logs")
     parser.add_argument("input_file")
-    parser.add_argument("access_root")
-    parser.add_argument("log_root")
     args = parser.parse_args()
 
     crop_bottom = args.crop_bottom
@@ -90,19 +92,16 @@ def parse_args() -> Config:
     if crop_bottom is None:
         crop_bottom = 7 if args.format_type == "video8" else 0
     if denoise is None:
-        denoise = "light" if args.format_type == "video8" else "light"
-    pad_bottom = args.pad_bottom if args.pad_bottom is not None else crop_bottom
+        denoise = "light"
 
     return Config(
         input_file=Path(args.input_file),
-        access_root=Path(args.access_root),
-        log_root=Path(args.log_root),
         mode=args.mode,
         format_type=args.format_type,
         start=args.start,
         end=args.end,
         crop_bottom=crop_bottom,
-        pad_bottom=pad_bottom,
+        pad_bottom=args.pad_bottom if args.pad_bottom is not None else crop_bottom,
         denoise=denoise,
         q=args.q,
         codec=args.codec,
@@ -111,42 +110,38 @@ def parse_args() -> Config:
         log_level=args.log_level,
         assume_yes=args.yes,
         output_suffix=args.output_suffix,
+        originals_dirname=args.originals_dirname,
+        access_dirname=args.access_dirname,
+        logs_dirname=args.logs_dirname,
     )
 
 
 def build_paths(cfg: Config) -> Paths:
-    if not cfg.input_file.is_file():
-        raise SystemExit(f"Input is not a regular file: {cfg.input_file}")
+    """Build commonly used input, output, and log paths."""
+    input_file = cfg.input_file.resolve()
+    if not input_file.is_file():
+        raise SystemExit(f"Input is not a regular file: {input_file}")
 
-    input_dir_abs = (cfg.input_file.parent if cfg.input_file.parent != Path("") else Path(".")).resolve()
-    dir_str = str(input_dir_abs)
-    marker = f"{os.sep}Originals{os.sep}"
-    if marker not in dir_str:
-        raise SystemExit(f"Input path must be inside a dir under Originals/: {input_dir_abs}")
-    rel = dir_str.split(marker, 1)[1]
-    rel_dir = Path(rel) if rel else Path()
+    out_dir = auto_sibling_dir_for_path(
+        input_file,
+        originals_dirname=cfg.originals_dirname,
+        sibling_dirname=cfg.access_dirname,
+    )
+    log_dir = auto_sibling_dir_for_path(
+        input_file,
+        originals_dirname=cfg.originals_dirname,
+        sibling_dirname=cfg.logs_dirname,
+    )
 
-    out_dir = cfg.access_root / rel_dir
-    log_dir = cfg.log_root / rel_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    path_prefix = str(rel_dir).replace("/", "_").replace(" ", "_").strip("_")
-    while "__" in path_prefix:
-        path_prefix = path_prefix.replace("__", "_")
-
-    stem = cfg.input_file.stem
-    suffix = ""
-    output_name = f"{path_prefix}_{stem}{suffix}{cfg.output_suffix}.mp4" if path_prefix else f"{stem}_{suffix}{cfg.output_suffix}.mp4"
+    stem = input_file.stem
+    output_name = f"{stem}{cfg.output_suffix}.mp4"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_dir = Path(__file__).resolve().parent
 
     return Paths(
-        input_file=cfg.input_file,
-        input_dir_abs=input_dir_abs,
+        input_file=input_file,
         stem=stem,
-        rel_dir=rel_dir,
         out_dir=out_dir,
         log_dir=log_dir,
         output_file=out_dir / output_name,
@@ -161,6 +156,7 @@ def build_paths(cfg: Config) -> Paths:
 
 
 def get_hqdn3d_args(preset: str) -> str | None:
+    """Return hqdn3d parameters for the named preset."""
     mapping = {
         "off": None,
         "verylight": "1.5:1.125:2.25:1.6875",
@@ -174,37 +170,40 @@ def get_hqdn3d_args(preset: str) -> str | None:
 
 
 def escape_ffmpeg_filter_value(value: str) -> str:
-    value = value.replace("\\", "\\\\")
-    value = value.replace(":", r"\:")
-    value = value.replace(",", r"\,")
-    value = value.replace(";", r"\;")
-    value = value.replace("[", r"\[")
-    value = value.replace("]", r"\]")
-    value = value.replace("=", r"\=")
-    value = value.replace("'", r"\'")
+    """Escape a filename for safe use inside an ffmpeg filter expression."""
+    for a, b in [
+        ("\\", "\\\\"),
+        (":", r"\:"),
+        (",", r"\,"),
+        (";", r"\;"),
+        ("[", r"\["),
+        ("]", r"\]"),
+        ("=", r"\="),
+        ("'", r"\'"),
+    ]:
+        value = value.replace(a, b)
     return value
 
 
 def build_vf(cfg: Config, paths: Paths) -> str:
-    filters: list[str] = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
+    """Build the ffmpeg video filter chain."""
+    filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
     if cfg.crop_bottom > 0:
         filters.append(f"crop=iw:ih-{cfg.crop_bottom}:0:0")
     if cfg.pad_bottom > 0:
         filters.append(f"pad=iw:ih+{cfg.pad_bottom}:0:0:black")
 
-    hqdn3d = get_hqdn3d_args(cfg.denoise)
-    if hqdn3d:
+    if hqdn3d := get_hqdn3d_args(cfg.denoise):
         filters.append(f"hqdn3d={hqdn3d}")
 
-    filters.extend([
+    filters += [
         "scale='trunc(ih*dar/2)*2:ih'",
         "setsar=1",
         "setparams=range=limited:color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m",
-    ])
+    ]
 
     if cfg.format_type == "digital8":
-        srt_path = escape_ffmpeg_filter_value(str(paths.srt_file))
         style = (
             "Alignment=3,"
             "MarginV=3,"
@@ -217,12 +216,15 @@ def build_vf(cfg: Config, paths: Paths) -> str:
             "Outline=0,"
             "Shadow=0"
         )
-        filters.append(f"subtitles=filename={srt_path}:force_style='{style}'")
+        filters.append(
+            f"subtitles=filename={escape_ffmpeg_filter_value(str(paths.srt_file))}:force_style='{style}'"
+        )
 
     return ",".join(filters)
 
 
 def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list[str]:
+    """Build the ffmpeg command-line argument list."""
     args = ["ffmpeg", "-hide_banner", "-loglevel", cfg.log_level, "-stats", "-stats_period", "1"]
 
     if cfg.start:
@@ -231,11 +233,7 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
         args += ["-to", cfg.end]
 
     args += ["-i", str(paths.input_file), "-vf", vf, "-map", "0:v:0"]
-
-    if cfg.map_both_audio:
-        args += ["-map", "0:a:0?", "-map", "0:a:1?"]
-    else:
-        args += ["-map", "0:a:0?"]
+    args += ["-map", "0:a:0?", "-map", "0:a:1?"] if cfg.map_both_audio else ["-map", "0:a:0?"]
 
     if cfg.codec == "h264":
         args += ["-c:v", "h264_videotoolbox", "-profile:v", "high", "-coder", "cabac"]
@@ -255,61 +253,58 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
         "-movflags", "+faststart",
     ]
 
-    args += ["-f", "matroska", "-"] if preview else [str(paths.output_file)]
-    return args
+    return args + (["-f", "matroska", "-"] if preview else [str(paths.output_file)])
 
 
 def shjoin(args: list[str]) -> str:
+    """Return a shell-escaped command string for display/logging."""
     return shlex.join(args)
 
 
 def run_checked(args: list[str], stdout_path: Path | None = None) -> None:
+    """Run a subprocess, optionally redirecting stdout to a file."""
     if stdout_path is None:
         subprocess.run(args, check=True)
-    else:
-        with stdout_path.open("w", encoding="utf-8", newline="\n") as f:
-            subprocess.run(args, check=True, stdout=f)
+        return
+    with stdout_path.open("w", encoding="utf-8", newline="\n") as f:
+        subprocess.run(args, check=True, stdout=f)
 
 
 def extract_first_rdt_yyyymmdd(csv_path: Path) -> str | None:
+    """Extract the first YYYYMMDD date prefix from the Digital8 frameinfo CSV."""
     with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            raw = (row.get("rdt") or "").strip()
-            if not raw:
-                continue
-            date_part = raw.split(" ", 1)[0]
-            parts = date_part.split("-")
-            if len(parts) == 3 and all(parts):
-                yyyy, mm, dd = parts
-                if len(yyyy) == 4 and len(mm) == 2 and len(dd) == 2:
-                    return f"{yyyy}{mm}{dd}"
+        for row in csv.DictReader(f):
+            if raw := (row.get("rdt") or "").strip():
+                parts = raw.split(" ", 1)[0].split("-")
+                if len(parts) == 3 and len(parts[0]) == 4 and len(parts[1]) == 2 and len(parts[2]) == 2:
+                    return "".join(parts)
     return None
 
 
 def generate_digital8_sidecars(paths: Paths) -> None:
-    if not paths.add_play_time_script.exists():
-        raise SystemExit(f"Missing script: {paths.add_play_time_script}")
-    if not paths.create_srt_script.exists():
-        raise SystemExit(f"Missing script: {paths.create_srt_script}")
+    """Generate CSV, play-time CSV, and SRT sidecars for Digital8 inputs."""
+    for script in (paths.add_play_time_script, paths.create_srt_script):
+        if not script.exists():
+            raise SystemExit(f"Missing script: {script}")
 
     print("Generating Digital8 CSV/SRT sidecars...")
     run_checked(["dvrescue", "--csv", str(paths.input_file), "-m", "/dev/null"], stdout_path=paths.csv_raw)
     run_checked(["python3", str(paths.add_play_time_script), str(paths.csv_raw), "-o", str(paths.csv_with_play)])
     run_checked(["python3", str(paths.create_srt_script), str(paths.csv_with_play), "-o", str(paths.srt_file)])
 
-    yyyymmdd = extract_first_rdt_yyyymmdd(paths.csv_with_play)
-    if yyyymmdd:
+    if yyyymmdd := extract_first_rdt_yyyymmdd(paths.csv_with_play):
         paths.output_file = paths.output_file.with_name(f"{yyyymmdd}_{paths.output_file.name}")
     else:
         print("Warning: could not find first-frame rdt date; leaving output filename unchanged.")
 
 
 def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bool) -> None:
+    """Print a summary of the transcode job and ffmpeg command."""
     print(f"Mode: {cfg.mode}")
     print(f"Format: {cfg.format_type}")
     print(f"Input: {paths.input_file}")
     print(f"Output dir: {paths.out_dir}")
+    print(f"Log dir: {paths.log_dir}")
     if cfg.start or cfg.end:
         print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
     print(f"Codec: {cfg.codec}")
@@ -334,6 +329,7 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
 
 
 def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None:
+    """Write a human-readable command log for the transcode."""
     lines = [
         f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Input: {paths.input_file}",
@@ -356,11 +352,9 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
 
 
 def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
+    """Tee a binary stream to one or more outputs, optionally mirroring to stderr."""
     try:
-        while True:
-            chunk = stream.read(8192)
-            if not chunk:
-                break
+        while chunk := stream.read(8192):
             for out in outputs:
                 out.write(chunk)
                 out.flush()
@@ -372,6 +366,7 @@ def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
 
 
 def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None = None) -> int:
+    """Run ffmpeg, optionally piping preview output to ffplay, while teeing stderr to a log."""
     with log_path.open("wb") as log_file:
         if preview_stem is None:
             proc = subprocess.Popen(ffmpeg_args, stderr=subprocess.PIPE, bufsize=0)
@@ -382,17 +377,19 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
             t.join()
             return rc
 
-        ffplay_args = ["ffplay", "-hide_banner", "-window_title", f"{preview_stem} preview", "-"]
         ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         assert ffmpeg_proc.stdout is not None
         assert ffmpeg_proc.stderr is not None
 
-        ffplay_proc = subprocess.Popen(ffplay_args, stdin=ffmpeg_proc.stdout, bufsize=0)
+        ffplay_proc = subprocess.Popen(
+            ["ffplay", "-hide_banner", "-window_title", f"{preview_stem} preview", "-"],
+            stdin=ffmpeg_proc.stdout,
+            bufsize=0,
+        )
         ffmpeg_proc.stdout.close()
 
         t = threading.Thread(target=tee_stream, args=(ffmpeg_proc.stderr, [log_file], True), daemon=True)
         t.start()
-
         ffplay_rc = ffplay_proc.wait()
         ffmpeg_rc = ffmpeg_proc.wait()
         t.join()
@@ -401,16 +398,15 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
 
 
 def main() -> int:
+    """Run the transcode workflow."""
     cfg = parse_args()
     paths = build_paths(cfg)
 
     if cfg.format_type == "digital8":
         generate_digital8_sidecars(paths)
 
-    vf = build_vf(cfg, paths)
     preview = cfg.mode == "preview"
-    ffmpeg_args = build_ffmpeg_args(cfg, paths, vf, preview=preview)
-
+    ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=preview)
     print_summary(cfg, paths, ffmpeg_args, preview=preview)
 
     if preview:

@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from utils import auto_log_dir_for_path
+from utils import auto_sibling_dir_for_path
 
 PART_RE = re.compile(r"^(?P<prefix>.+?)_part(?P<num>\d+)(?:-[0-9]+)?\.dv$", re.IGNORECASE)
 
@@ -296,7 +296,7 @@ def run_split(args: argparse.Namespace) -> int:
         cmd.append("-d")
     cmd += ["-e", "dv", "-o", str(output_dir), str(input_dv)]
 
-    log_dir = auto_log_dir_for_path(
+    log_dir = auto_sibling_dir_for_path(
         input_dv,
         originals_dirname=args.originals_dirname,
         logs_dirname=args.logs_dirname,
@@ -349,7 +349,7 @@ def run_unsplit(args: argparse.Namespace) -> int:
     if args.dry_run:
         cmd += ["--dry-run"]
 
-    log_dir = auto_log_dir_for_path(
+    log_dir = auto_sibling_dir_for_path(
         input_dir,
         originals_dirname=args.originals_dirname,
         logs_dirname=args.logs_dirname,
