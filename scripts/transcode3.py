@@ -19,7 +19,6 @@ from utils import auto_sibling_dir_for_path
 
 @dataclass
 class Config:
-    input_file: Path
     mode: str
     format_type: str
     start: str | None
@@ -62,7 +61,7 @@ except Exception:
     pass
 
 
-def parse_args() -> Config:
+def parse_args() -> tuple[Config, list[Path]]:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in."
@@ -84,7 +83,7 @@ def parse_args() -> Config:
     parser.add_argument("--originals-dirname", default="Originals")
     parser.add_argument("--access-dirname", default="Access")
     parser.add_argument("--logs-dirname", default="Logs")
-    parser.add_argument("input_file")
+    parser.add_argument("input_files", nargs="+")
     args = parser.parse_args()
 
     crop_bottom = args.crop_bottom
@@ -94,8 +93,7 @@ def parse_args() -> Config:
     if denoise is None:
         denoise = "light"
 
-    return Config(
-        input_file=Path(args.input_file),
+    cfg = Config(
         mode=args.mode,
         format_type=args.format_type,
         start=args.start,
@@ -114,11 +112,13 @@ def parse_args() -> Config:
         access_dirname=args.access_dirname,
         logs_dirname=args.logs_dirname,
     )
+    input_files = [Path(p) for p in args.input_files]
+    return cfg, input_files
 
 
-def build_paths(cfg: Config) -> Paths:
+def build_paths(cfg: Config, input_file: Path) -> Paths:
     """Build commonly used input, output, and log paths."""
-    input_file = cfg.input_file.resolve()
+    input_file = input_file.resolve()
     if not input_file.is_file():
         raise SystemExit(f"Input is not a regular file: {input_file}")
 
@@ -397,10 +397,9 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
         return ffmpeg_rc if ffmpeg_rc != 0 else ffplay_rc
 
 
-def main() -> int:
-    """Run the transcode workflow."""
-    cfg = parse_args()
-    paths = build_paths(cfg)
+def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> int:
+    """Process one input file through the transcode workflow."""
+    paths = build_paths(cfg, input_file)
 
     if cfg.format_type == "digital8":
         generate_digital8_sidecars(paths)
@@ -412,16 +411,36 @@ def main() -> int:
     if preview:
         return run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
 
-    if not cfg.assume_yes:
-        input("Press Enter to start transcode, or Ctrl-C to cancel...")
+    if prompt:
+        input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
 
     write_command_log(cfg, paths, ffmpeg_args)
     rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file)
-    if rc != 0:
-        return rc
+    if rc == 0:
+        print(f"Done: {paths.output_file}")
+    return rc
 
-    print(f"Done: {paths.output_file}")
-    return 0
+
+def main() -> int:
+    """Run the transcode workflow for one or more files."""
+    cfg, input_files = parse_args()
+
+    failures = 0
+    prompted = cfg.assume_yes or cfg.mode == "preview"
+
+    for input_file in input_files:
+        try:
+            rc = process_one_file(cfg, input_file, prompt=not prompted)
+            prompted = True
+            if rc != 0:
+                failures += 1
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"ERROR processing {input_file}: {e}", file=sys.stderr)
+            failures += 1
+
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":
