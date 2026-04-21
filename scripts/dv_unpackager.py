@@ -31,7 +31,7 @@ class Group:
         return self.start == self.end
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for split and unsplit modes."""
     parser = argparse.ArgumentParser(
         description="Split a DV file with dvpackager or unsplit selected consecutive parts."
@@ -95,6 +95,50 @@ def parse_args() -> argparse.Namespace:
         help="Print actions without writing files",
     )
 
+    split_unsplit_p = subparsers.add_parser(
+        "split-unsplit",
+        help="Split a DV file, then immediately unsplit selected groups from the generated parts",
+    )
+    split_unsplit_p.add_argument("input_dv", help="Input DV file to split")
+    split_unsplit_p.add_argument(
+        "spec",
+        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...)',
+    )
+    split_unsplit_p.add_argument(
+        "-s",
+        action="store_true",
+        help="Split at recording start markers",
+    )
+    split_unsplit_p.add_argument(
+        "-d",
+        action="store_true",
+        help="Split at non-consecutive recording timestamps",
+    )
+    split_unsplit_p.add_argument(
+        "-t",
+        action="store_true",
+        help="Pass -t through to dvpackager",
+    )
+    split_unsplit_p.add_argument(
+        "--output-dir",
+        help="Output directory for split files (default: sibling 'split' directory)",
+    )
+    split_unsplit_p.add_argument(
+        "--pattern",
+        default="*_part*.dv",
+        help='Glob for input files inside split/ (default: "*_part*.dv")',
+    )
+    split_unsplit_p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing split/output files if they already exist",
+    )
+    split_unsplit_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print actions without writing files",
+    )
+
     unsplit_p = subparsers.add_parser(
         "unsplit",
         help="Merge selected consecutive split parts into group-labeled outputs (_partA, _partB, ...)",
@@ -128,7 +172,7 @@ def parse_args() -> argparse.Namespace:
         help="Validate and print actions without writing files",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def setup_logging(level: str) -> None:
@@ -289,22 +333,37 @@ def run_dvpackager_unpackage(
         shutil.move(str(generated[0]), str(output_file))
 
 
-def run_split(args: argparse.Namespace) -> int:
-    """Split an input DV file into a sibling split directory and log the command."""
-    input_dv = Path(args.input_dv).resolve()
-    if not input_dv.is_file():
-        logging.error("input_dv is not a file: %s", input_dv)
-        return 1
+def resolve_split_options(
+    input_dv_value: str,
+    output_dir_value: str | None,
+    use_s: bool,
+    use_d: bool,
+    use_t: bool,
+) -> tuple[Path, Path, bool, bool, bool]:
+    """Resolve shared split inputs and default segmentation flags."""
+    input_dv = Path(input_dv_value).resolve()
+    output_dir = Path(output_dir_value).resolve() if output_dir_value else input_dv.parent / "split"
 
-    use_s = args.s
-    use_d = args.d
-    use_t = args.t
     if not use_s and not use_d and not use_t:
         use_s = True
         use_d = True
         use_t = True
 
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else input_dv.parent / "split"
+    return input_dv, output_dir, use_s, use_d, use_t
+
+
+def run_split(args: argparse.Namespace) -> int:
+    """Split an input DV file into a sibling split directory and log the command."""
+    input_dv, output_dir, use_s, use_d, use_t = resolve_split_options(
+        args.input_dv,
+        args.output_dir,
+        args.s,
+        args.d,
+        args.t,
+    )
+    if not input_dv.is_file():
+        logging.error("input_dv is not a file: %s", input_dv)
+        return 1
 
     if output_dir.exists() and any(output_dir.iterdir()):
         if not args.overwrite:
@@ -350,20 +409,31 @@ def run_split(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_unsplit_dirs(input_dir_value: str) -> tuple[Path, Path, Path]:
+    """Resolve unsplit base and split directories from either a base dir or split dir path."""
+    input_path = Path(input_dir_value).resolve()
+
+    if input_path.is_file():
+        base_dir = input_path.parent
+        split_dir = base_dir / "split"
+    elif (input_path / "split").is_dir():
+        base_dir = input_path
+        split_dir = base_dir / "split"
+    else:
+        base_dir = input_path.parent
+        split_dir = input_path
+
+    return input_path, base_dir, split_dir
+
+
 def run_unsplit(args: argparse.Namespace) -> int:
     """Unsplit selected consecutive parts into merged or linked letter-labeled outputs and log the command."""
-    base_path = Path(args.input_dir).resolve()
-
-    if base_path.is_file():
-        base_dir = base_path.parent
-    else:
-        base_dir = base_path
+    base_path, base_dir, split_dir = resolve_unsplit_dirs(args.input_dir)
 
     if not base_dir.is_dir():
         logging.error("input_dir is not a directory: %s", base_dir)
         return 1
 
-    split_dir = base_dir / "split"
     if not split_dir.is_dir():
         logging.error("split directory not found: %s", split_dir)
         return 1
@@ -434,8 +504,50 @@ def run_unsplit(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_split_unsplit(args: argparse.Namespace) -> int:
+    """Run split first, then unsplit the generated parts using the provided spec."""
+    input_dv, split_output_dir, _, _, _ = resolve_split_options(
+        args.input_dv,
+        args.output_dir,
+        args.s,
+        args.d,
+        args.t,
+    )
+    base_dir = input_dv.parent
+    unsplit_input_dir = base_dir if split_output_dir == base_dir / "split" else split_output_dir
+
+    split_args = argparse.Namespace(
+        input_dv=args.input_dv,
+        s=args.s,
+        d=args.d,
+        t=args.t,
+        output_dir=args.output_dir,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+        dvpackager_bin=args.dvpackager_bin,
+        originals_dirname=args.originals_dirname,
+        logs_dirname=args.logs_dirname,
+    )
+    unsplit_args = argparse.Namespace(
+        input_dir=str(unsplit_input_dir),
+        spec=args.spec,
+        output_dir=None,
+        pattern=args.pattern,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+        dvpackager_bin=args.dvpackager_bin,
+        originals_dirname=args.originals_dirname,
+        logs_dirname=args.logs_dirname,
+    )
+
+    split_rc = run_split(split_args)
+    if split_rc != 0:
+        return split_rc
+    return run_unsplit(unsplit_args)
+
+
 def main() -> int:
-    """Dispatch to split or unsplit mode."""
+    """Dispatch to split, unsplit, or combined split-unsplit mode."""
     args = parse_args()
     setup_logging(args.log_level)
 
@@ -443,6 +555,8 @@ def main() -> int:
         return run_split(args)
     if args.command == "unsplit":
         return run_unsplit(args)
+    if args.command == "split-unsplit":
+        return run_split_unsplit(args)
 
     logging.error("Unknown command: %s", args.command)
     return 1
