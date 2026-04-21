@@ -92,13 +92,16 @@ def parse_args() -> argparse.Namespace:
 
     unsplit_p = subparsers.add_parser(
         "unsplit",
-        help="Merge selected consecutive split parts back into larger DV files",
+        help="Merge selected consecutive split parts into group-labeled outputs (_partA, _partB, ...)",
     )
     unsplit_p.add_argument(
         "input_dir",
         help="Original DV directory containing a split/ subdirectory",
     )
-    unsplit_p.add_argument("spec", help='Grouping spec like "1-3,4,5-9,10"')
+    unsplit_p.add_argument(
+        "spec",
+        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...)',
+    )
     unsplit_p.add_argument(
         "-o",
         "--output-dir",
@@ -165,6 +168,18 @@ def parse_spec(spec: str) -> list[Group]:
             raise ValueError(f"invalid descending range: {token}")
         groups.append(Group(start, end))
     return groups
+
+
+def index_to_letters(idx: int) -> str:
+    """Convert a 1-based index into spreadsheet-style letters (A, ..., Z, AA, ...)."""
+    if idx <= 0:
+        raise ValueError("index must be a positive integer")
+
+    letters: list[str] = []
+    while idx > 0:
+        idx, remainder = divmod(idx - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
 
 
 def discover_parts(input_dir: Path, pattern: str) -> tuple[str, dict[int, Path]]:
@@ -325,7 +340,7 @@ def run_split(args: argparse.Namespace) -> int:
 
 
 def run_unsplit(args: argparse.Namespace) -> int:
-    """Unsplit selected consecutive parts into merged or linked outputs and log the command."""
+    """Unsplit selected consecutive parts into merged or linked letter-labeled outputs and log the command."""
     base_path = Path(args.input_dir).resolve()
 
     if base_path.is_file():
@@ -372,8 +387,9 @@ def run_unsplit(args: argparse.Namespace) -> int:
 
     created_outputs: list[tuple[Path, int, int]] = []
 
-    for g in groups:
-        out_path = output_dir / f"{prefix}_part{g.start}.dv"
+    for i, g in enumerate(groups, start=1):
+        label = index_to_letters(i)
+        out_path = output_dir / f"{prefix}_part{label}.dv"
         input_files = [part_map[n] for n in range(g.start, g.end + 1)]
         created_outputs.append((out_path, g.start, g.end))
 
