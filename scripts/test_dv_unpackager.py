@@ -59,15 +59,15 @@ class TestUnsplitOutputNaming(unittest.TestCase):
                 ["capture_partA.dv", "capture_partB.dv", "capture_partC.dv", "capture_partD.dv"],
             )
 
-    def test_unsplit_rolls_over_to_double_letters(self) -> None:
+    def test_unsplit_supports_up_to_26_groups(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             base_dir = root / "Originals" / "Tape002"
             split_dir = base_dir / "split"
             split_dir.mkdir(parents=True)
-            self._make_parts(split_dir, 27)
+            self._make_parts(split_dir, 26)
 
-            spec = ",".join(str(n) for n in range(1, 28))
+            spec = ",".join(str(n) for n in range(1, 27))
             args = argparse.Namespace(
                 input_dir=str(base_dir),
                 spec=spec,
@@ -92,8 +92,48 @@ class TestUnsplitOutputNaming(unittest.TestCase):
             self.assertEqual(rc, 0)
             names = sorted(p.name for p in outputs)
             self.assertEqual(names[0], "capture_partA.dv")
-            self.assertIn("capture_partZ.dv", names)
-            self.assertIn("capture_partAA.dv", names)
+            self.assertEqual(names[-1], "capture_partZ.dv")
+
+    def test_unsplit_fails_when_spec_creates_more_than_26_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_dir = root / "Originals" / "Tape003"
+            split_dir = base_dir / "split"
+            split_dir.mkdir(parents=True)
+            self._make_parts(split_dir, 27)
+
+            spec = ",".join(str(n) for n in range(1, 28))
+            args = argparse.Namespace(
+                input_dir=str(base_dir),
+                spec=spec,
+                output_dir=None,
+                pattern="*_part*.dv",
+                overwrite=False,
+                dry_run=False,
+                dvpackager_bin="dvpackager",
+                originals_dirname="Originals",
+                logs_dirname="Logs",
+            )
+
+            def fail_link_or_copy(src: Path, dst: Path, overwrite: bool) -> None:
+                self.fail("link_or_copy should not be called when group limit validation fails")
+
+            def fail_merge(bin_path: str, inputs: list[Path], output: Path, overwrite: bool) -> None:
+                self.fail("run_dvpackager_unpackage should not be called when group limit validation fails")
+
+            with (
+                patch.object(dv_unpackager, "link_or_copy", side_effect=fail_link_or_copy),
+                patch.object(dv_unpackager, "run_dvpackager_unpackage", side_effect=fail_merge),
+                self.assertLogs(level="ERROR") as captured,
+            ):
+                rc = dv_unpackager.run_unsplit(args)
+
+            self.assertEqual(rc, 1)
+            self.assertFalse(any(base_dir.glob("capture_part*.dv")))
+            self.assertIn(
+                "unsplit supports at most 26 output groups (_partA through _partZ); received 27",
+                "\n".join(captured.output),
+            )
 
 
 class TestIndexToLetters(unittest.TestCase):
@@ -112,7 +152,7 @@ class TestSplitFlags(unittest.TestCase):
     def test_split_accepts_t_as_a_segmentation_rule(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            input_dv = root / "Originals" / "Tape003" / "capture.dv"
+            input_dv = root / "Originals" / "Tape004" / "capture.dv"
             input_dv.parent.mkdir(parents=True)
             input_dv.write_bytes(b"")
 
@@ -144,7 +184,7 @@ class TestSplitFlags(unittest.TestCase):
     def test_split_defaults_to_all_segmentation_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            input_dv = root / "Originals" / "Tape004" / "capture.dv"
+            input_dv = root / "Originals" / "Tape005" / "capture.dv"
             input_dv.parent.mkdir(parents=True)
             input_dv.write_bytes(b"")
 
@@ -208,7 +248,7 @@ class TestSplitUnsplitOrchestration(unittest.TestCase):
     def test_split_runs_before_unsplit_and_forwards_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            input_dv = root / "Originals" / "Tape005" / "capture.dv"
+            input_dv = root / "Originals" / "Tape006" / "capture.dv"
             input_dv.parent.mkdir(parents=True)
             input_dv.write_bytes(b"")
 
@@ -257,7 +297,7 @@ class TestSplitUnsplitOrchestration(unittest.TestCase):
     def test_split_unsplit_dry_run_reaches_both_phases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            input_dv = root / "Originals" / "Tape006" / "capture.dv"
+            input_dv = root / "Originals" / "Tape007" / "capture.dv"
             input_dv.parent.mkdir(parents=True)
             input_dv.write_bytes(b"")
 

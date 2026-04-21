@@ -102,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     split_unsplit_p.add_argument("input_dv", help="Input DV file to split")
     split_unsplit_p.add_argument(
         "spec",
-        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...)',
+        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...) with a maximum of 26 groups',
     )
     split_unsplit_p.add_argument(
         "-s",
@@ -149,7 +149,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     unsplit_p.add_argument(
         "spec",
-        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...)',
+        help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...) with a maximum of 26 groups',
     )
     unsplit_p.add_argument(
         "-o",
@@ -287,6 +287,14 @@ def validate_spec(groups: list[Group], existing_parts: list[int]) -> None:
     for g1, g2 in zip(groups, groups[1:]):
         if g2.start != g1.end + 1:
             raise ValueError(f"groups must be adjacent with no gaps: {g1.start}-{g1.end}, {g2.start}-{g2.end}")
+
+
+def validate_output_group_limit(groups: list[Group]) -> None:
+    """Ensure unsplit output labels stay within A-Z for Finder sorting."""
+    if len(groups) > 26:
+        raise ValueError(
+            f"unsplit supports at most 26 output groups (_partA through _partZ); received {len(groups)}"
+        )
 
 
 def ensure_output_path(output_file: Path, overwrite: bool) -> None:
@@ -445,6 +453,7 @@ def run_unsplit(args: argparse.Namespace) -> int:
         prefix, part_map = discover_parts(split_dir, args.pattern)
         existing_parts = sorted(part_map)
         validate_spec(groups, existing_parts)
+        validate_output_group_limit(groups)
     except Exception as e:
         logging.error("%s", e)
         return 1
