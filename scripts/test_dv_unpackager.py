@@ -149,6 +149,39 @@ class TestIndexToLetters(unittest.TestCase):
 
 
 class TestSplitFlags(unittest.TestCase):
+    def test_split_accepts_3_as_a_segmentation_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dv = root / "Originals" / "Tape003A" / "capture.dv"
+            input_dv.parent.mkdir(parents=True)
+            input_dv.write_bytes(b"")
+
+            args = argparse.Namespace(
+                input_dv=str(input_dv),
+                three=True,
+                s=False,
+                d=False,
+                t=False,
+                output_dir=None,
+                overwrite=False,
+                dry_run=False,
+                dvpackager_bin="dvpackager",
+                originals_dirname="Originals",
+                logs_dirname="Logs",
+            )
+
+            seen_cmds: list[list[str]] = []
+
+            def fake_run(cmd: list[str], check: bool) -> None:
+                seen_cmds.append(cmd)
+
+            with patch.object(dv_unpackager.subprocess, "run", side_effect=fake_run):
+                rc = dv_unpackager.run_split(args)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_cmds), 1)
+            self.assertEqual(seen_cmds[0][:2], ["dvpackager", "-3"])
+
     def test_split_accepts_t_as_a_segmentation_rule(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -158,6 +191,7 @@ class TestSplitFlags(unittest.TestCase):
 
             args = argparse.Namespace(
                 input_dv=str(input_dv),
+                three=False,
                 s=False,
                 d=False,
                 t=True,
@@ -190,6 +224,7 @@ class TestSplitFlags(unittest.TestCase):
 
             args = argparse.Namespace(
                 input_dv=str(input_dv),
+                three=False,
                 s=False,
                 d=False,
                 t=False,
@@ -211,7 +246,7 @@ class TestSplitFlags(unittest.TestCase):
 
             self.assertEqual(rc, 0)
             self.assertEqual(len(seen_cmds), 1)
-            self.assertEqual(seen_cmds[0][:4], ["dvpackager", "-s", "-d", "-t"])
+            self.assertEqual(seen_cmds[0][:5], ["dvpackager", "-3", "-s", "-d", "-t"])
 
 
 class TestSplitUnsplitCli(unittest.TestCase):
@@ -221,6 +256,7 @@ class TestSplitUnsplitCli(unittest.TestCase):
                 "split-unsplit",
                 "input.dv",
                 "1-3,4",
+                "-3",
                 "-s",
                 "-t",
                 "--output-dir",
@@ -235,6 +271,7 @@ class TestSplitUnsplitCli(unittest.TestCase):
         self.assertEqual(args.command, "split-unsplit")
         self.assertEqual(args.input_dv, "input.dv")
         self.assertEqual(args.spec, "1-3,4")
+        self.assertTrue(args.three)
         self.assertTrue(args.s)
         self.assertFalse(args.d)
         self.assertTrue(args.t)
@@ -255,6 +292,7 @@ class TestSplitUnsplitOrchestration(unittest.TestCase):
             args = argparse.Namespace(
                 input_dv=str(input_dv),
                 spec="1-3,4",
+                three=True,
                 s=False,
                 d=False,
                 t=True,
@@ -286,6 +324,7 @@ class TestSplitUnsplitOrchestration(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual([name for name, _ in seen], ["split", "unsplit"])
             self.assertEqual(seen[0][1].input_dv, str(input_dv))
+            self.assertTrue(seen[0][1].three)
             self.assertTrue(seen[0][1].t)
             self.assertTrue(seen[0][1].overwrite)
             self.assertEqual(seen[1][1].input_dir, str(input_dv.parent.resolve()))
@@ -304,6 +343,7 @@ class TestSplitUnsplitOrchestration(unittest.TestCase):
             args = argparse.Namespace(
                 input_dv=str(input_dv),
                 spec="1,2",
+                three=False,
                 s=False,
                 d=False,
                 t=False,

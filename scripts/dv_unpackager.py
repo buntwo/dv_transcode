@@ -66,6 +66,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     split_p.add_argument("input_dv", help="Input DV file to split")
     split_p.add_argument(
+        "-3",
+        dest="three",
+        action="store_true",
+        help="Pass -3 through to dvpackager",
+    )
+    split_p.add_argument(
         "-s",
         action="store_true",
         help="Split at recording start markers",
@@ -103,6 +109,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     split_unsplit_p.add_argument(
         "spec",
         help='Grouping spec like "1-3,4,5-9,10"; output names follow group order (_partA, _partB, ...) with a maximum of 26 groups',
+    )
+    split_unsplit_p.add_argument(
+        "-3",
+        dest="three",
+        action="store_true",
+        help="Pass -3 through to dvpackager",
     )
     split_unsplit_p.add_argument(
         "-s",
@@ -344,27 +356,30 @@ def run_dvpackager_unpackage(
 def resolve_split_options(
     input_dv_value: str,
     output_dir_value: str | None,
+    use_three: bool,
     use_s: bool,
     use_d: bool,
     use_t: bool,
-) -> tuple[Path, Path, bool, bool, bool]:
+) -> tuple[Path, Path, bool, bool, bool, bool]:
     """Resolve shared split inputs and default segmentation flags."""
     input_dv = Path(input_dv_value).resolve()
     output_dir = Path(output_dir_value).resolve() if output_dir_value else input_dv.parent / "split"
 
-    if not use_s and not use_d and not use_t:
+    if not use_three and not use_s and not use_d and not use_t:
+        use_three = True
         use_s = True
         use_d = True
         use_t = True
 
-    return input_dv, output_dir, use_s, use_d, use_t
+    return input_dv, output_dir, use_three, use_s, use_d, use_t
 
 
 def run_split(args: argparse.Namespace) -> int:
     """Split an input DV file into a sibling split directory and log the command."""
-    input_dv, output_dir, use_s, use_d, use_t = resolve_split_options(
+    input_dv, output_dir, use_three, use_s, use_d, use_t = resolve_split_options(
         args.input_dv,
         args.output_dir,
+        args.three,
         args.s,
         args.d,
         args.t,
@@ -384,6 +399,8 @@ def run_split(args: argparse.Namespace) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [args.dvpackager_bin]
+    if use_three:
+        cmd.append("-3")
     if use_s:
         cmd.append("-s")
     if use_d:
@@ -515,9 +532,10 @@ def run_unsplit(args: argparse.Namespace) -> int:
 
 def run_split_unsplit(args: argparse.Namespace) -> int:
     """Run split first, then unsplit the generated parts using the provided spec."""
-    input_dv, split_output_dir, _, _, _ = resolve_split_options(
+    input_dv, split_output_dir, _, _, _, _ = resolve_split_options(
         args.input_dv,
         args.output_dir,
+        args.three,
         args.s,
         args.d,
         args.t,
@@ -527,6 +545,7 @@ def run_split_unsplit(args: argparse.Namespace) -> int:
 
     split_args = argparse.Namespace(
         input_dv=args.input_dv,
+        three=args.three,
         s=args.s,
         d=args.d,
         t=args.t,
