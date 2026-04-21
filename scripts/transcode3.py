@@ -221,7 +221,7 @@ def build_vf(cfg: Config, paths: Paths) -> str:
             "PrimaryColour=&H00FFFFFF,"
             "OutlineColour=&H00000000,"
             "BorderStyle=1,"
-            "Outline=0,"
+            "Outline=0.5,"
             "Shadow=0"
         )
         filters.append(
@@ -269,13 +269,27 @@ def shjoin(args: list[str]) -> str:
     return shlex.join(args)
 
 
-def run_checked(args: list[str], stdout_path: Path | None = None) -> None:
-    """Run a subprocess, optionally redirecting stdout to a file."""
-    if stdout_path is None:
-        subprocess.run(args, check=True)
-        return
-    with stdout_path.open("w", encoding="utf-8", newline="\n") as f:
-        subprocess.run(args, check=True, stdout=f)
+def run_checked(
+    args: list[str],
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+    stdout=None,
+) -> None:
+    """Run a subprocess, optionally redirecting stdout/stderr."""
+    stdout_file = None
+    stderr_file = None
+    try:
+        if stdout_path is not None:
+            stdout_file = stdout_path.open("w", encoding="utf-8", newline="\n")
+            stdout = stdout_file
+        if stderr_path is not None:
+            stderr_file = stderr_path.open("w", encoding="utf-8", newline="\n")
+        subprocess.run(args, check=True, stdout=stdout, stderr=stderr_file)
+    finally:
+        if stdout_file is not None:
+            stdout_file.close()
+        if stderr_file is not None:
+            stderr_file.close()
 
 
 def extract_first_rdt_yyyymmdd(csv_path: Path) -> str | None:
@@ -296,7 +310,11 @@ def generate_digital8_sidecars(paths: Paths) -> None:
             raise SystemExit(f"Missing script: {script}")
 
     print("Generating Digital8 CSV/SRT sidecars...")
-    run_checked(["dvrescue", "--csv", str(paths.input_file), "-m", "/dev/null"], stdout_path=paths.csv_raw)
+    run_checked(
+        ["dvrescue", "--csv", str(paths.input_file), "-m", "-"],
+        stderr_path=paths.csv_raw,
+        stdout=subprocess.DEVNULL,
+    )
     run_checked(["python3", str(paths.add_play_time_script), str(paths.csv_raw), "-o", str(paths.csv_with_play)])
     run_checked(["python3", str(paths.create_srt_script), str(paths.csv_with_play), "-o", str(paths.srt_file)])
 

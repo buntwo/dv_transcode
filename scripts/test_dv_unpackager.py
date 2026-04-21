@@ -108,5 +108,71 @@ class TestIndexToLetters(unittest.TestCase):
             dv_unpackager.index_to_letters(0)
 
 
+class TestSplitFlags(unittest.TestCase):
+    def test_split_accepts_t_as_a_segmentation_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dv = root / "Originals" / "Tape003" / "capture.dv"
+            input_dv.parent.mkdir(parents=True)
+            input_dv.write_bytes(b"")
+
+            args = argparse.Namespace(
+                input_dv=str(input_dv),
+                s=False,
+                d=False,
+                t=True,
+                output_dir=None,
+                overwrite=False,
+                dry_run=False,
+                dvpackager_bin="dvpackager",
+                originals_dirname="Originals",
+                logs_dirname="Logs",
+            )
+
+            seen_cmds: list[list[str]] = []
+
+            def fake_run(cmd: list[str], check: bool) -> None:
+                seen_cmds.append(cmd)
+
+            with patch.object(dv_unpackager.subprocess, "run", side_effect=fake_run):
+                rc = dv_unpackager.run_split(args)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_cmds), 1)
+            self.assertEqual(seen_cmds[0][:2], ["dvpackager", "-t"])
+
+    def test_split_defaults_to_all_segmentation_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dv = root / "Originals" / "Tape004" / "capture.dv"
+            input_dv.parent.mkdir(parents=True)
+            input_dv.write_bytes(b"")
+
+            args = argparse.Namespace(
+                input_dv=str(input_dv),
+                s=False,
+                d=False,
+                t=False,
+                output_dir=None,
+                overwrite=False,
+                dry_run=False,
+                dvpackager_bin="dvpackager",
+                originals_dirname="Originals",
+                logs_dirname="Logs",
+            )
+
+            seen_cmds: list[list[str]] = []
+
+            def fake_run(cmd: list[str], check: bool) -> None:
+                seen_cmds.append(cmd)
+
+            with patch.object(dv_unpackager.subprocess, "run", side_effect=fake_run):
+                rc = dv_unpackager.run_split(args)
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_cmds), 1)
+            self.assertEqual(seen_cmds[0][:4], ["dvpackager", "-s", "-d", "-t"])
+
+
 if __name__ == "__main__":
     unittest.main()

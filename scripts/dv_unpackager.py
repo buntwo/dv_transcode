@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         help="Split at non-consecutive recording timestamps",
     )
     split_p.add_argument(
+        "-t",
+        action="store_true",
+        help="Pass -t through to dvpackager",
+    )
+    split_p.add_argument(
         "--output-dir",
         help="Output directory for split files (default: sibling 'split' directory)",
     )
@@ -291,9 +296,13 @@ def run_split(args: argparse.Namespace) -> int:
         logging.error("input_dv is not a file: %s", input_dv)
         return 1
 
-    if not args.s and not args.d:
-        logging.error("split requires at least one segmentation rule: -s and/or -d")
-        return 1
+    use_s = args.s
+    use_d = args.d
+    use_t = args.t
+    if not use_s and not use_d and not use_t:
+        use_s = True
+        use_d = True
+        use_t = True
 
     output_dir = Path(args.output_dir).resolve() if args.output_dir else input_dv.parent / "split"
 
@@ -308,10 +317,12 @@ def run_split(args: argparse.Namespace) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [args.dvpackager_bin]
-    if args.s:
+    if use_s:
         cmd.append("-s")
-    if args.d:
+    if use_d:
         cmd.append("-d")
+    if use_t:
+        cmd.append("-t")
     cmd += ["-e", "dv", "-o", str(output_dir), str(input_dv)]
 
     log_dir = auto_sibling_dir_for_path(
