@@ -9,8 +9,10 @@ import csv
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -160,6 +162,18 @@ def build_paths(cfg: Config, input_file: Path) -> Paths:
         srt_file=log_dir / f"{stem}.record_time_overlay.srt",
         add_play_time_script=script_dir / "add_play_time_columns.py",
         create_srt_script=script_dir / "create_srt.py",
+    )
+
+
+def build_runtime_paths(paths: Paths, artifact_dir: Path) -> Paths:
+    """Return a copy of Paths that writes runtime artifacts under artifact_dir."""
+    return replace(
+        paths,
+        log_dir=artifact_dir,
+        ffmpeg_log_file=artifact_dir / paths.ffmpeg_log_file.name,
+        csv_raw=artifact_dir / paths.csv_raw.name,
+        csv_with_play=artifact_dir / paths.csv_with_play.name,
+        srt_file=artifact_dir / paths.srt_file.name,
     )
 
 
@@ -425,17 +439,23 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
 
 def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> int:
     """Process one input file through the transcode workflow."""
-    paths = build_paths(cfg, input_file)
+    preview = cfg.mode == "preview"
+    if preview:
+        persistent_paths = build_paths(cfg, input_file)
+        with tempfile.TemporaryDirectory(prefix=f"{persistent_paths.stem}_preview_") as tmp:
+            paths = build_runtime_paths(persistent_paths, Path(tmp))
+            if cfg.format_type == "digital8":
+                generate_digital8_sidecars(paths)
+            ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
+            print_summary(cfg, paths, ffmpeg_args, preview=True)
+            return run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
 
+    paths = build_paths(cfg, input_file)
     if cfg.format_type == "digital8":
         generate_digital8_sidecars(paths)
 
-    preview = cfg.mode == "preview"
-    ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=preview)
-    print_summary(cfg, paths, ffmpeg_args, preview=preview)
-
-    if preview:
-        return run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+    ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=False)
+    print_summary(cfg, paths, ffmpeg_args, preview=False)
 
     if prompt:
         input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
