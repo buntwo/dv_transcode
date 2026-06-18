@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import sys
 import tempfile
@@ -10,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import transcode3  # noqa: E402
+import transcode_access  # noqa: E402
 
 
 def make_config(**overrides) -> transcode3.Config:
@@ -68,6 +71,22 @@ class TestParseArgs(unittest.TestCase):
             cfg, _ = transcode3.parse_args()
 
         self.assertFalse(cfg.validate_duration)
+
+    def test_parse_args_supports_vhs_defaults(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, input_files = transcode3.parse_args()
+
+        self.assertEqual(cfg.format_type, "vhs")
+        self.assertEqual(cfg.denoise, "verylight")
+        self.assertEqual(cfg.crop_bottom, 0)
+        self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(input_files, [Path("Originals/set/tape/out.mkv")])
 
     def test_help_mentions_out_dv_example(self) -> None:
         argv = ["transcode3.py", "--help"]
@@ -133,6 +152,20 @@ class TestDurationGrouping(unittest.TestCase):
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0].output_files, [dated_output.resolve()])
         self.assertEqual(groups[0].output_resolution_errors, [None])
+
+    def test_build_paths_preserves_archive_output_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "Set 1" / "1 Disney" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            paths = transcode3.build_paths(make_config(output_suffix="_access"), input_file)
+
+        resolved_root = root.resolve()
+        self.assertEqual(paths.out_dir, resolved_root / "Access" / "Set 1" / "1 Disney")
+        self.assertEqual(paths.log_dir, resolved_root / "Logs" / "Set 1" / "1 Disney")
+        self.assertEqual(paths.output_file, paths.out_dir / "Set_1_1_out_access.mp4")
 
 
 class TestDurationValidation(unittest.TestCase):
@@ -392,6 +425,142 @@ class TestGenerateDigital8Sidecars(unittest.TestCase):
             self.assertIsNone(dvrescue_stdout)
             self.assertEqual(dvrescue_stderr, paths.csv_raw)
             self.assertEqual(dvrescue_stdout_dest, transcode3.subprocess.DEVNULL)
+
+    def test_digital8_sidecar_date_prefix_still_updates_output_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            add_play_time_script = root / "add_play_time_columns.py"
+            create_srt_script = root / "create_srt.py"
+            add_play_time_script.write_text("", encoding="utf-8")
+            create_srt_script.write_text("", encoding="utf-8")
+
+            paths = transcode3.Paths(
+                input_file=root / "input.dv",
+                stem="input",
+                out_dir=root,
+                log_dir=root,
+                output_file=root / "output.mp4",
+                ffmpeg_log_file=root / "ffmpeg.log",
+                command_log_file=root / "cmd.log",
+                csv_raw=root / "input.frameinfo.csv",
+                csv_with_play=root / "input.frameinfo.with_play_time.csv",
+                srt_file=root / "input.record_time_overlay.srt",
+                add_play_time_script=add_play_time_script,
+                create_srt_script=create_srt_script,
+            )
+            paths.input_file.write_bytes(b"")
+
+            with (
+                patch.object(transcode3, "run_checked"),
+                patch.object(transcode3, "extract_first_rdt_yyyymmdd", return_value="20260421"),
+            ):
+                transcode3.generate_digital8_sidecars(paths)
+
+            self.assertEqual(paths.output_file, root / "20260421_output.mp4")
+
+
+class TestFiltersAndArgs(unittest.TestCase):
+    def test_limited_range_tagging_omits_hardcoded_smpte_color_metadata(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+        cfg = make_config(format_type="vhs", denoise="verylight")
+
+        vf = transcode3.build_vf(cfg, paths)
+        args = transcode3.build_ffmpeg_args(cfg, paths, vf, preview=False)
+
+        self.assertIn("bwdif=mode=send_field:parity=auto:deint=all", vf)
+        self.assertIn("setparams=range=limited", vf)
+        self.assertNotIn("color_primaries", vf)
+        self.assertNotIn("color_trc", vf)
+        self.assertNotIn("colorspace", vf)
+        self.assertIn("-color_range", args)
+        self.assertIn("tv", args)
+        self.assertNotIn("-color_primaries", args)
+        self.assertNotIn("-color_trc", args)
+        self.assertNotIn("-colorspace", args)
+
+
+class TestTranscodeAccess(unittest.TestCase):
+    def test_access_parse_args_sets_vhs_defaults_and_access_layout(self) -> None:
+        argv = ["transcode_access.py", "--format", "vhs", "masters/tape/08.mkv"]
+        with patch.object(sys, "argv", argv):
+            cfg, input_files = transcode_access.parse_args()
+
+        self.assertEqual(cfg.layout, "access")
+        self.assertEqual(cfg.format_type, "vhs")
+        self.assertEqual(cfg.denoise, "verylight")
+        self.assertEqual(cfg.crop_bottom, 0)
+        self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(input_files, [Path("masters/tape/08.mkv")])
+
+    def test_access_build_paths_uses_parent_parent_source_root_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "masters" / "tape" / "08.mkv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+            cfg = make_config(
+                format_type="vhs",
+                denoise="verylight",
+                output_suffix="_access",
+                layout="access",
+            )
+
+            paths = transcode3.build_paths(cfg, input_file)
+
+        source_root = (root / "masters").resolve()
+        self.assertEqual(paths.out_dir, source_root / "Access" / "tape")
+        self.assertEqual(paths.log_dir, source_root / "Logs" / "tape")
+        self.assertEqual(paths.output_file, source_root / "Access" / "tape" / "08_access.mp4")
+
+    def test_access_build_paths_honors_explicit_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "masters" / "tape" / "08.mkv"
+            output_dir = root / "mp4s"
+            log_dir = root / "reports"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+            cfg = make_config(
+                format_type="vhs",
+                layout="access",
+                source_root=root / "masters",
+                output_dir=output_dir,
+                log_dir=log_dir,
+            )
+
+            paths = transcode3.build_paths(cfg, input_file)
+
+        self.assertEqual(paths.out_dir, output_dir.resolve())
+        self.assertEqual(paths.log_dir, log_dir.resolve())
+        self.assertEqual(paths.output_file, output_dir.resolve() / "08.mp4")
+
+    def test_access_duration_groups_validate_each_input_against_resolved_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "masters" / "tape" / "08.mkv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+            cfg = make_config(format_type="vhs", layout="access")
+
+            group = transcode3.build_duration_validation_groups(cfg, [input_file])[0]
+
+        self.assertEqual(group.original_file, input_file.resolve())
+        self.assertEqual(group.input_files, [input_file.resolve()])
+        self.assertEqual(group.output_files, [(root / "masters").resolve() / "Access" / "tape" / "08.mp4"])
+        self.assertEqual(group.output_resolution_errors, ["missing exact output " + str(group.output_files[0])])
 
 
 class TestPreviewArtifactPaths(unittest.TestCase):
