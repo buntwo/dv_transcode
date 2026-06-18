@@ -238,6 +238,106 @@ class TestRenameAccessFromMap(unittest.TestCase):
             self.assertEqual(stderr, "")
             self.assertIn("PLAN 01 Birthday_Party.mov -> 08.mov", stdout)
 
+    def test_sidecar_forward_preserves_embedded_media_extension_and_sidecar_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contact_sheet = root / "15.mkv.contact_sheet.png"
+            spectrogram = root / "16.mkv.spectrogram.png"
+            map_file = root / "map.csv"
+            contact_sheet.write_bytes(b"contact")
+            spectrogram.write_bytes(b"spectrogram")
+            write_map(
+                map_file,
+                [
+                    "original_stem,renamed_stem",
+                    "15,Birthday_Party",
+                    "16,Dinner_at_Tu's",
+                ],
+            )
+
+            code, stdout, stderr = self.run_cli(root, map_file)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("PLAN 15.mkv.contact_sheet.png -> 01 Birthday Party.mkv.contact_sheet.png", stdout)
+            self.assertIn("PLAN 16.mkv.spectrogram.png -> 02 Dinner at Tu's.mkv.spectrogram.png", stdout)
+
+    def test_sidecar_reverse_maps_positioned_name_back_to_original_stem(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "01 Birthday Party.mkv.contact_sheet.png"
+            map_file = root / "map.csv"
+            source.write_bytes(b"contact")
+            write_map(map_file, ["original_stem,renamed_stem", "15,Birthday_Party"])
+
+            code, stdout, stderr = self.run_cli(root, map_file, reverse=True)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("PLAN 01 Birthday Party.mkv.contact_sheet.png -> 15.mkv.contact_sheet.png", stdout)
+
+    def test_sidecar_forward_apply_then_reverse_apply_restores_original_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "15.mkv.spectrogram.png"
+            map_file = root / "map.csv"
+            source.write_bytes(b"spectrogram")
+            write_map(map_file, ["original_stem,renamed_stem", "15,Birthday_Party"])
+
+            forward_code, _forward_stdout, forward_stderr = self.run_cli(root, map_file, apply=True)
+            after_forward = sorted(path.name for path in root.iterdir() if path.is_file() and path != map_file)
+            reverse_code, _reverse_stdout, reverse_stderr = self.run_cli(root, map_file, apply=True, reverse=True)
+            after_reverse = sorted(path.name for path in root.iterdir() if path.is_file() and path != map_file)
+
+            self.assertEqual(forward_code, 0)
+            self.assertEqual(forward_stderr, "")
+            self.assertEqual(after_forward, ["01 Birthday Party.mkv.spectrogram.png"])
+            self.assertEqual(reverse_code, 0)
+            self.assertEqual(reverse_stderr, "")
+            self.assertEqual(after_reverse, ["15.mkv.spectrogram.png"])
+
+    def test_multiple_sidecar_suffixes_for_one_stem_are_all_renamed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contact_sheet = root / "08.mkv.contact_sheet.png"
+            spectrogram = root / "08.mkv.spectrogram.png"
+            map_file = root / "map.csv"
+            contact_sheet.write_bytes(b"contact")
+            spectrogram.write_bytes(b"spectrogram")
+            write_map(map_file, ["original_stem,renamed_stem", "08,Birthday_Party"])
+
+            code, stdout, stderr = self.run_cli(root, map_file, apply=True)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("RENAME 08.mkv.contact_sheet.png -> 01 Birthday Party.mkv.contact_sheet.png", stdout)
+            self.assertIn("RENAME 08.mkv.spectrogram.png -> 01 Birthday Party.mkv.spectrogram.png", stdout)
+            self.assertFalse(contact_sheet.exists())
+            self.assertFalse(spectrogram.exists())
+            self.assertTrue((root / "01 Birthday Party.mkv.contact_sheet.png").exists())
+            self.assertTrue((root / "01 Birthday Party.mkv.spectrogram.png").exists())
+
+    def test_multiple_sidecar_suffixes_reverse_restore_original_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            contact_sheet = root / "01 Birthday Party.mkv.contact_sheet.png"
+            spectrogram = root / "01 Birthday Party.mkv.spectrogram.png"
+            map_file = root / "map.csv"
+            contact_sheet.write_bytes(b"contact")
+            spectrogram.write_bytes(b"spectrogram")
+            write_map(map_file, ["original_stem,renamed_stem", "08,Birthday_Party"])
+
+            code, stdout, stderr = self.run_cli(root, map_file, apply=True, reverse=True)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("RENAME 01 Birthday Party.mkv.contact_sheet.png -> 08.mkv.contact_sheet.png", stdout)
+            self.assertIn("RENAME 01 Birthday Party.mkv.spectrogram.png -> 08.mkv.spectrogram.png", stdout)
+            self.assertFalse(contact_sheet.exists())
+            self.assertFalse(spectrogram.exists())
+            self.assertTrue((root / "08.mkv.contact_sheet.png").exists())
+            self.assertTrue((root / "08.mkv.spectrogram.png").exists())
+
     def test_forward_apply_then_reverse_apply_restores_original_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -273,7 +373,7 @@ class TestRenameAccessFromMap(unittest.TestCase):
                 ],
             )
 
-    def test_missing_source_and_multiple_extension_matches_return_errors(self) -> None:
+    def test_missing_source_returns_error_while_multiple_extension_matches_are_planned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             map_file = root / "map.csv"
@@ -281,10 +381,11 @@ class TestRenameAccessFromMap(unittest.TestCase):
             (root / "08.mov").write_bytes(b"video")
             write_map(map_file, ["original_stem,renamed_stem", "08,Birthday", "09,Missing"])
 
-            code, _stdout, stderr = self.run_cli(root, map_file)
+            code, stdout, stderr = self.run_cli(root, map_file)
 
             self.assertEqual(code, 1)
-            self.assertIn("multiple source files found for stem 08", stderr)
+            self.assertIn("PLAN 08.mov -> 01 Birthday.mov", stdout)
+            self.assertIn("PLAN 08.mp4 -> 01 Birthday.mp4", stdout)
             self.assertIn("no source file found for stem 09", stderr)
 
     def test_existing_target_and_duplicate_planned_targets_return_errors_and_prevent_apply(self) -> None:

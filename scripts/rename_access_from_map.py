@@ -112,8 +112,17 @@ def mapped_stem(row: MappingRow, preserve_underscores: bool) -> str:
     return f"{padded_sequence_number(row.sequence_number)} {normalized_stem}"
 
 
+def split_logical_suffix(filename: str, stem: str) -> str | None:
+    prefix = f"{stem}."
+    if not filename.startswith(prefix):
+        return None
+    return filename[len(stem) :]
+
+
 def find_matching_files(file_dir: Path, stem: str) -> list[Path]:
-    return sorted(path for path in file_dir.iterdir() if path.is_file() and path.stem == stem)
+    return sorted(
+        path for path in file_dir.iterdir() if path.is_file() and split_logical_suffix(path.name, stem) is not None
+    )
 
 
 def build_preflight(
@@ -139,14 +148,15 @@ def build_preflight(
         if not matches:
             errors.append(f"Row {row.row_number}: no source file found for stem {source_stem}")
             continue
-        if len(matches) > 1:
-            names = ", ".join(path.name for path in matches)
-            errors.append(f"Row {row.row_number}: multiple source files found for stem {source_stem}: {names}")
-            continue
 
-        source = matches[0]
-        target_name = f"{target_stem}{source.suffix}"
-        plans.append(RenamePlan(source=source, target=source.with_name(target_name)))
+        for source in matches:
+            source_suffix = split_logical_suffix(source.name, source_stem)
+            if source_suffix is None:
+                errors.append(f"Row {row.row_number}: no suffix found for source file {source.name}")
+                continue
+
+            target_name = f"{target_stem}{source_suffix}"
+            plans.append(RenamePlan(source=source, target=source.with_name(target_name)))
 
     target_to_source: dict[Path, Path] = {}
     for plan in plans:
