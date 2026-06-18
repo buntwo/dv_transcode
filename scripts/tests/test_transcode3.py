@@ -157,6 +157,19 @@ class TestDurationGrouping(unittest.TestCase):
         self.assertEqual(groups[0].output_files, [dated_output.resolve()])
         self.assertEqual(groups[0].output_resolution_errors, [None])
 
+    def test_build_duration_validation_groups_does_not_create_output_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+
+            cfg = make_config()
+            transcode3.build_duration_validation_groups(cfg, [input_file])
+
+            self.assertFalse((root / "Access").exists())
+            self.assertFalse((root / "Logs").exists())
+
     def test_build_paths_preserves_archive_output_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -281,6 +294,32 @@ class TestDurationValidation(unittest.TestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual([row.path for row in result.output_rows], [dated_output.resolve()])
+
+    def test_validate_durations_caches_duplicate_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "set" / "tape1" / "out.dv"
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            input_file.write_bytes(b"")
+            output_file = root / "Access" / "set" / "tape1" / "set_tape1_out.mp4"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_bytes(b"")
+            cfg = make_config()
+            calls: list[Path] = []
+
+            def fake_probe(path: Path) -> float:
+                calls.append(path)
+                return 10.0
+
+            with (
+                patch.object(transcode3, "probe_media_duration_seconds", side_effect=fake_probe),
+                redirect_stdout(io.StringIO()),
+            ):
+                results = transcode3.validate_durations(cfg, [input_file])
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].passed)
+        self.assertEqual(len(calls), 2)
 
     def test_validate_duration_group_reports_missing_digital8_output_when_no_dated_match_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -415,20 +454,21 @@ class TestGenerateDigital8Sidecars(unittest.TestCase):
                 stdout=None,
             ) -> None:
                 calls.append((args, stdout_path, stderr_path, stdout))
+                if stderr_path is not None:
+                    stderr_path.write_text("FramePos,rdt\n0,2026-04-21 12:00:00.000\n", encoding="utf-8")
 
-            with (
-                patch.object(transcode3, "run_checked", side_effect=fake_run_checked),
-                patch.object(transcode3, "extract_first_rdt_yyyymmdd", return_value=None),
-            ):
+            with patch.object(transcode3, "run_checked", side_effect=fake_run_checked):
                 transcode3.generate_digital8_sidecars(paths)
 
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 1)
             dvrescue_args, dvrescue_stdout, dvrescue_stderr, dvrescue_stdout_dest = calls[0]
             self.assertEqual(dvrescue_args[:2], ["dvrescue", "--csv"])
             self.assertEqual(dvrescue_args[-2:], ["-m", "-"])
             self.assertIsNone(dvrescue_stdout)
             self.assertEqual(dvrescue_stderr, paths.csv_raw)
             self.assertEqual(dvrescue_stdout_dest, transcode3.subprocess.DEVNULL)
+            self.assertIn("play_time_seconds", paths.csv_with_play.read_text(encoding="utf-8"))
+            self.assertIn("2026-04-21 12:00:00", paths.srt_file.read_text(encoding="utf-8"))
 
     def test_digital8_sidecar_date_prefix_still_updates_output_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -454,10 +494,10 @@ class TestGenerateDigital8Sidecars(unittest.TestCase):
             )
             paths.input_file.write_bytes(b"")
 
-            with (
-                patch.object(transcode3, "run_checked"),
-                patch.object(transcode3, "extract_first_rdt_yyyymmdd", return_value="20260421"),
-            ):
+            def fake_run_checked(*args, **kwargs) -> None:
+                paths.csv_raw.write_text("FramePos,rdt\n0,2026-04-21 12:00:00.000\n", encoding="utf-8")
+
+            with patch.object(transcode3, "run_checked", side_effect=fake_run_checked):
                 transcode3.generate_digital8_sidecars(paths)
 
             self.assertEqual(paths.output_file, root / "20260421_output.mp4")

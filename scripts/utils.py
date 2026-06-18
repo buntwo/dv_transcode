@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
 import logging
+from pathlib import Path
 
 
-def auto_sibling_dir_for_path(
+def sibling_dir_for_path(
     path: str | Path,
     *,
     originals_dirname: str = "Originals",
     sibling_dirname: str = "Logs",
 ) -> Path:
-    """Construct and create the log directory for a file or directory under Originals/."""
+    """Construct a sibling directory path for a file or directory under Originals/."""
 
     path = Path(path)
 
@@ -35,6 +35,21 @@ def auto_sibling_dir_for_path(
     rel_under_originals = Path(*parts[originals_idx + 1 :])
     base_root = Path(".") if originals_idx == 0 else Path(*parts[:originals_idx])
 
-    log_dir = base_root / sibling_dirname / rel_under_originals
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir
+    return base_root / sibling_dirname / rel_under_originals
+
+
+def auto_sibling_dir_for_path(
+    path: str | Path,
+    *,
+    originals_dirname: str = "Originals",
+    sibling_dirname: str = "Logs",
+) -> Path:
+    """Construct and create a sibling directory for a file or directory under Originals/."""
+
+    sibling_dir = sibling_dir_for_path(
+        path,
+        originals_dirname=originals_dirname,
+        sibling_dirname=sibling_dirname,
+    )
+    sibling_dir.mkdir(parents=True, exist_ok=True)
+    return sibling_dir

@@ -21,8 +21,10 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+import add_play_time_columns
+import create_srt
 from transcode_naming import build_access_output_name
-from utils import auto_sibling_dir_for_path
+from utils import sibling_dir_for_path
 
 DEFAULT_VALIDATE_DURATION_TOLERANCE = 0.17  # 5 NTSC DV frames at 29.97 fps.
 
@@ -143,19 +145,8 @@ def default_denoise(format_type: str) -> str:
     return "verylight" if format_type == "vhs" else "light"
 
 
-def parse_archive_args() -> tuple[Config, list[Path]]:
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in.",
-        epilog=(
-            "Examples:\n"
-            "  transcode3.py --mode transcode --format video8 Originals/set/tape/out.dv\n"
-            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out.dv\n"
-            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out_partA.dv "
-            "Originals/set/tape/out_partB.dv"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
+    """Add transcode options shared by archive and generic access CLIs."""
     parser.add_argument("--mode", choices=["transcode", "preview", "validate-duration"], default="transcode")
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8", "vhs"], required=True)
     parser.add_argument("--start")
@@ -174,23 +165,15 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--vhs-notch", choices=["auto", "ntsc", "pal", "off"], default="auto")
     parser.add_argument("--audio-channel", choices=["keep", "left", "right"], default="keep")
     parser.add_argument("--output-suffix", default="")
-    parser.add_argument("--originals-dirname", default="Originals")
-    parser.add_argument("--access-dirname", default="Access")
-    parser.add_argument("--logs-dirname", default="Logs")
-    parser.add_argument("input_files", nargs="+")
-    args = parser.parse_args()
 
-    mask_bottom = args.mask_bottom
-    mask_top = args.mask_top
-    denoise = args.denoise
-    if mask_top is None:
-        mask_top = default_mask_top(args.format_type)
-    if mask_bottom is None:
-        mask_bottom = default_mask_bottom(args.format_type)
-    if denoise is None:
-        denoise = default_denoise(args.format_type)
 
-    cfg = Config(
+def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
+    """Build a Config from parsed CLI args."""
+    mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
+    mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
+    denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
+
+    return Config(
         mode=args.mode,
         validate_duration=not args.no_validate_duration,
         validate_duration_tolerance=args.validate_duration_tolerance,
@@ -207,33 +190,62 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
         log_level=args.log_level,
         assume_yes=args.yes,
         output_suffix=args.output_suffix,
-        originals_dirname=args.originals_dirname,
+        originals_dirname=getattr(args, "originals_dirname", "Originals"),
         access_dirname=args.access_dirname,
         logs_dirname=args.logs_dirname,
         vhs_notch=args.vhs_notch,
         audio_channel=args.audio_channel,
-        layout="archive",
+        layout=layout,
+        source_root=getattr(args, "source_root", None),
+        output_dir=getattr(args, "output_dir", None),
+        log_dir=getattr(args, "log_dir", None),
     )
+
+
+def parse_archive_args() -> tuple[Config, list[Path]]:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Transcode DV with VideoToolbox, with optional Digital8 DVRescue subtitle burn-in.",
+        epilog=(
+            "Examples:\n"
+            "  transcode3.py --mode transcode --format video8 Originals/set/tape/out.dv\n"
+            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out.dv\n"
+            "  transcode3.py --mode validate-duration --format video8 Originals/set/tape/out_partA.dv "
+            "Originals/set/tape/out_partB.dv"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_common_transcode_args(parser)
+    parser.add_argument("--originals-dirname", default="Originals")
+    parser.add_argument("--access-dirname", default="Access")
+    parser.add_argument("--logs-dirname", default="Logs")
+    parser.add_argument("input_files", nargs="+")
+    args = parser.parse_args()
+
+    cfg = config_from_args(args, layout="archive")
     input_files = [Path(p) for p in args.input_files]
     return cfg, input_files
 
 
-def build_archive_paths(cfg: Config, input_file: Path) -> Paths:
+def build_archive_paths(cfg: Config, input_file: Path, *, create_dirs: bool = True) -> Paths:
     """Build input, output, and log paths for an Originals/Access/Logs archive."""
     input_file = input_file.resolve()
     if not input_file.is_file():
         raise SystemExit(f"Input is not a regular file: {input_file}")
 
-    out_dir = auto_sibling_dir_for_path(
+    out_dir = sibling_dir_for_path(
         input_file,
         originals_dirname=cfg.originals_dirname,
         sibling_dirname=cfg.access_dirname,
     )
-    log_dir = auto_sibling_dir_for_path(
+    log_dir = sibling_dir_for_path(
         input_file,
         originals_dirname=cfg.originals_dirname,
         sibling_dirname=cfg.logs_dirname,
     )
+    if create_dirs:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     stem = input_file.stem
     try:
@@ -264,7 +276,7 @@ def build_archive_paths(cfg: Config, input_file: Path) -> Paths:
     )
 
 
-def build_generic_access_paths(cfg: Config, input_file: Path) -> Paths:
+def build_generic_access_paths(cfg: Config, input_file: Path, *, create_dirs: bool = True) -> Paths:
     """Build input, output, and log paths for flat/non-Originals access copies."""
     input_file = input_file.resolve()
     if not input_file.is_file():
@@ -278,8 +290,9 @@ def build_generic_access_paths(cfg: Config, input_file: Path) -> Paths:
 
     out_dir = cfg.output_dir.resolve() if cfg.output_dir is not None else source_root / cfg.access_dirname / rel_parent
     log_dir = cfg.log_dir.resolve() if cfg.log_dir is not None else source_root / cfg.logs_dirname / rel_parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    if create_dirs:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
 
     stem = input_file.stem
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -301,11 +314,11 @@ def build_generic_access_paths(cfg: Config, input_file: Path) -> Paths:
     )
 
 
-def build_paths(cfg: Config, input_file: Path) -> Paths:
+def build_paths(cfg: Config, input_file: Path, *, create_dirs: bool = True) -> Paths:
     """Build commonly used input, output, and log paths."""
     if cfg.layout == "access":
-        return build_generic_access_paths(cfg, input_file)
-    return build_archive_paths(cfg, input_file)
+        return build_generic_access_paths(cfg, input_file, create_dirs=create_dirs)
+    return build_archive_paths(cfg, input_file, create_dirs=create_dirs)
 
 
 def build_runtime_paths(paths: Paths, artifact_dir: Path) -> Paths:
@@ -333,7 +346,7 @@ def infer_logical_original_path(input_file: Path) -> Path:
 
 def resolve_validation_output_path(cfg: Config, input_file: Path) -> tuple[Path, str | None]:
     """Resolve the MP4 path to probe during validation."""
-    expected_output = build_paths(cfg, input_file).output_file
+    expected_output = build_paths(cfg, input_file, create_dirs=False).output_file
     if expected_output.exists():
         return expected_output, None
 
@@ -434,25 +447,43 @@ def format_seconds_precise(seconds: float | None) -> str:
     return "n/a" if seconds is None else f"{seconds:.3f}"
 
 
-def build_duration_rows(paths: list[Path]) -> list[DurationRow]:
+def cached_probe_media_duration_seconds(path: Path, cache: dict[Path, float]) -> float:
+    """Return a probed media duration, caching by resolved path."""
+    key = path.resolve()
+    if key not in cache:
+        cache[key] = probe_media_duration_seconds(path)
+    return cache[key]
+
+
+def build_duration_rows(paths: list[Path], cache: dict[Path, float] | None = None) -> list[DurationRow]:
     """Probe all paths and return rows in order."""
-    return [DurationRow(path=path, duration_seconds=probe_media_duration_seconds(path)) for path in paths]
+    if cache is None:
+        return [DurationRow(path=path, duration_seconds=probe_media_duration_seconds(path)) for path in paths]
+    return [DurationRow(path=path, duration_seconds=cached_probe_media_duration_seconds(path, cache)) for path in paths]
 
 
-def validate_duration_group(group: DurationGroup, tolerance: float) -> DurationValidationResult:
+def validate_duration_group(
+    group: DurationGroup,
+    tolerance: float,
+    cache: dict[Path, float] | None = None,
+) -> DurationValidationResult:
     """Validate one logical source against its input DV parts and output MP4s."""
+    duration_cache: dict[Path, float] = {} if cache is None else cache
     errors: list[str] = []
     original_row: DurationRow | None = None
     input_rows: list[DurationRow] = []
     output_rows: list[DurationRow] = []
 
     try:
-        original_row = DurationRow(group.original_file, probe_media_duration_seconds(group.original_file))
+        original_row = DurationRow(
+            group.original_file,
+            cached_probe_media_duration_seconds(group.original_file, duration_cache),
+        )
     except Exception as exc:
         errors.append(f"Original DV probe failed: {exc}")
 
     try:
-        input_rows = build_duration_rows(group.input_files)
+        input_rows = build_duration_rows(group.input_files, duration_cache)
     except Exception as exc:
         errors.append(f"Input DV probe failed: {exc}")
 
@@ -464,7 +495,12 @@ def validate_duration_group(group: DurationGroup, tolerance: float) -> DurationV
             errors.append(f"Output MP4 probe failed: {resolution_error}")
             continue
         try:
-            output_rows.append(DurationRow(path=output_file, duration_seconds=probe_media_duration_seconds(output_file)))
+            output_rows.append(
+                DurationRow(
+                    path=output_file,
+                    duration_seconds=cached_probe_media_duration_seconds(output_file, duration_cache),
+                )
+            )
         except Exception as exc:
             if resolution_error is not None:
                 errors.append(f"Output MP4 probe failed: {resolution_error}; {exc}")
@@ -561,8 +597,9 @@ def print_duration_validation_result(result: DurationValidationResult) -> None:
 
 def validate_durations(cfg: Config, input_files: list[Path]) -> list[DurationValidationResult]:
     """Run duration validation for the batch and print a report."""
+    duration_cache: dict[Path, float] = {}
     results = [
-        validate_duration_group(group, cfg.validate_duration_tolerance)
+        validate_duration_group(group, cfg.validate_duration_tolerance, duration_cache)
         for group in build_duration_validation_groups(cfg, input_files)
     ]
     for result in results:
@@ -820,18 +857,28 @@ def extract_first_rdt_yyyymmdd(csv_path: Path) -> str | None:
 
 def generate_digital8_sidecars(paths: Paths) -> None:
     """Generate CSV, play-time CSV, and SRT sidecars for Digital8 inputs."""
-    for script in (paths.add_play_time_script, paths.create_srt_script):
-        if not script.exists():
-            raise SystemExit(f"Missing script: {script}")
-
     print("Generating Digital8 CSV/SRT sidecars...")
     run_checked(
         ["dvrescue", "--csv", str(paths.input_file), "-m", "-"],
         stderr_path=paths.csv_raw,
         stdout=subprocess.DEVNULL,
     )
-    run_checked(["python3", str(paths.add_play_time_script), str(paths.csv_raw), "-o", str(paths.csv_with_play)])
-    run_checked(["python3", str(paths.create_srt_script), str(paths.csv_with_play), "-o", str(paths.srt_file)])
+
+    rows, fieldnames = add_play_time_columns.load_csv(paths.csv_raw, "FramePos")
+    output_fields = add_play_time_columns.ensure_output_columns(fieldnames)
+    rows, _, _ = add_play_time_columns.add_play_time_columns(rows, "FramePos")
+    add_play_time_columns.write_csv(paths.csv_with_play, rows, output_fields)
+
+    srt_rows = create_srt.load_rows(paths.csv_with_play)
+    if srt_rows:
+        header = srt_rows[0].keys()
+        if "play_time_seconds" not in header:
+            raise ValueError("Column 'play_time_seconds' not found")
+        if "rdt" not in header:
+            raise ValueError("Column 'rdt' not found")
+    second_map = create_srt.collect_second_buckets(srt_rows, "play_time_seconds", "rdt")
+    cues = create_srt.build_cues(second_map)
+    create_srt.write_srt(paths.srt_file, cues)
 
     if yyyymmdd := extract_first_rdt_yyyymmdd(paths.csv_with_play):
         paths.output_file = paths.output_file.with_name(f"{yyyymmdd}_{paths.output_file.name}")
@@ -1001,35 +1048,61 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
         return ffmpeg_rc if ffmpeg_rc != 0 else ffplay_rc
 
 
-def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
-    """Process one input file through the transcode workflow."""
-    preview = cfg.mode == "preview"
-    if preview:
-        persistent_paths = build_paths(cfg, input_file)
-        with tempfile.TemporaryDirectory(prefix=f"{persistent_paths.stem}_preview_") as tmp:
-            paths = build_runtime_paths(persistent_paths, Path(tmp))
-            if cfg.format_type == "digital8":
-                generate_digital8_sidecars(paths)
-            ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
-            print_summary(cfg, paths, ffmpeg_args, preview=True)
-            rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
-            return ProcessResult(
-                input_file=paths.input_file,
-                output_file=None,
-                rc=rc,
-                transcode_seconds=None,
-                sidecar_seconds=None,
-                format_type=cfg.format_type,
-                denoise=cfg.denoise,
-                mask_bottom=cfg.mask_bottom,
-            )
+def build_process_result(
+    paths: Paths,
+    *,
+    output_file: Path | None,
+    rc: int,
+    transcode_seconds: float | None,
+    sidecar_seconds: float | None,
+    cfg: Config,
+) -> ProcessResult:
+    """Build a ProcessResult from the completed per-file workflow."""
+    return ProcessResult(
+        input_file=paths.input_file,
+        output_file=output_file,
+        rc=rc,
+        transcode_seconds=transcode_seconds,
+        sidecar_seconds=sidecar_seconds,
+        format_type=cfg.format_type,
+        denoise=cfg.denoise,
+        mask_bottom=cfg.mask_bottom,
+    )
 
+
+def prepare_digital8_sidecars(cfg: Config, paths: Paths) -> float | None:
+    """Generate Digital8 sidecars when needed and return elapsed seconds."""
+    if cfg.format_type != "digital8":
+        return None
+
+    sidecar_start = time.perf_counter()
+    generate_digital8_sidecars(paths)
+    return time.perf_counter() - sidecar_start
+
+
+def process_preview_file(cfg: Config, input_file: Path) -> ProcessResult:
+    """Process one input file in preview mode."""
+    persistent_paths = build_paths(cfg, input_file)
+    with tempfile.TemporaryDirectory(prefix=f"{persistent_paths.stem}_preview_") as tmp:
+        paths = build_runtime_paths(persistent_paths, Path(tmp))
+        prepare_digital8_sidecars(cfg, paths)
+        ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
+        print_summary(cfg, paths, ffmpeg_args, preview=True)
+        rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+        return build_process_result(
+            paths,
+            output_file=None,
+            rc=rc,
+            transcode_seconds=None,
+            sidecar_seconds=None,
+            cfg=cfg,
+        )
+
+
+def process_transcode_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
+    """Process one input file in normal transcode mode."""
     paths = build_paths(cfg, input_file)
-    sidecar_seconds = None
-    if cfg.format_type == "digital8":
-        sidecar_start = time.perf_counter()
-        generate_digital8_sidecars(paths)
-        sidecar_seconds = time.perf_counter() - sidecar_start
+    sidecar_seconds = prepare_digital8_sidecars(cfg, paths)
 
     ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=False)
     print_summary(cfg, paths, ffmpeg_args, preview=False)
@@ -1045,16 +1118,21 @@ def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResu
         transcode_seconds = time.perf_counter() - start
     if rc == 0:
         print(f"Done: {paths.output_file}")
-    return ProcessResult(
-        input_file=paths.input_file,
+    return build_process_result(
+        paths,
         output_file=paths.output_file,
         rc=rc,
         transcode_seconds=transcode_seconds,
         sidecar_seconds=sidecar_seconds,
-        format_type=cfg.format_type,
-        denoise=cfg.denoise,
-        mask_bottom=cfg.mask_bottom,
+        cfg=cfg,
     )
+
+
+def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
+    """Process one input file through the transcode workflow."""
+    if cfg.mode == "preview":
+        return process_preview_file(cfg, input_file)
+    return process_transcode_file(cfg, input_file, prompt)
 
 
 def run_transcode_workflow(cfg: Config, input_files: list[Path]) -> int:
