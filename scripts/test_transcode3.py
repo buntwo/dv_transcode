@@ -36,6 +36,8 @@ def make_config(**overrides) -> transcode3.Config:
         "originals_dirname": "Originals",
         "access_dirname": "Access",
         "logs_dirname": "Logs",
+        "vhs_notch": "auto",
+        "audio_channel": "keep",
     }
     values.update(overrides)
     return transcode3.Config(**values)
@@ -86,6 +88,8 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.denoise, "verylight")
         self.assertEqual(cfg.crop_bottom, 0)
         self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(cfg.vhs_notch, "auto")
+        self.assertEqual(cfg.audio_channel, "keep")
         self.assertEqual(input_files, [Path("Originals/set/tape/out.mkv")])
 
     def test_help_mentions_out_dv_example(self) -> None:
@@ -478,7 +482,8 @@ class TestFiltersAndArgs(unittest.TestCase):
         cfg = make_config(format_type="vhs", denoise="verylight")
 
         vf = transcode3.build_vf(cfg, paths)
-        args = transcode3.build_ffmpeg_args(cfg, paths, vf, preview=False)
+        with patch.object(transcode3, "probe_video_standard", return_value="ntsc"):
+            args = transcode3.build_ffmpeg_args(cfg, paths, vf, preview=False)
 
         self.assertIn("bwdif=mode=send_field:parity=auto:deint=all", vf)
         self.assertIn("setparams=range=limited", vf)
@@ -490,6 +495,117 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("-color_primaries", args)
         self.assertNotIn("-color_trc", args)
         self.assertNotIn("-colorspace", args)
+
+    def test_vhs_audio_notch_auto_uses_detected_ntsc_frequency(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+        cfg = make_config(format_type="vhs", vhs_notch="auto")
+
+        with patch.object(transcode3, "probe_video_standard", return_value="ntsc") as mock_probe:
+            args = transcode3.build_ffmpeg_args(cfg, paths, "null", preview=False)
+
+        mock_probe.assert_called_once_with(paths.input_file)
+        self.assertIn("-af", args)
+        self.assertIn("highpass=f=60:p=1,equalizer=f=15734:width_type=q:width=30:g=-24", args)
+
+    def test_audio_channel_can_copy_left_or_right_to_stereo(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        left_args = transcode3.build_ffmpeg_args(
+            make_config(format_type="video8", audio_channel="left"),
+            paths,
+            "null",
+            preview=False,
+        )
+        right_args = transcode3.build_ffmpeg_args(
+            make_config(format_type="video8", audio_channel="right"),
+            paths,
+            "null",
+            preview=False,
+        )
+
+        self.assertIn("pan=stereo|c0=c0|c1=c0", left_args)
+        self.assertIn("pan=stereo|c0=c1|c1=c1", right_args)
+
+    def test_audio_channel_copy_composes_with_vhs_notch_filter(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(
+            make_config(format_type="vhs", vhs_notch="ntsc", audio_channel="left"),
+            paths,
+            "null",
+            preview=False,
+        )
+
+        self.assertIn(
+            "highpass=f=60:p=1,equalizer=f=15734:width_type=q:width=30:g=-24,pan=stereo|c0=c0|c1=c0",
+            args,
+        )
+
+    def test_vhs_audio_notch_can_force_pal_frequency_or_disable(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        pal_args = transcode3.build_ffmpeg_args(make_config(format_type="vhs", vhs_notch="pal"), paths, "null", preview=False)
+        off_args = transcode3.build_ffmpeg_args(make_config(format_type="vhs", vhs_notch="off"), paths, "null", preview=False)
+
+        self.assertIn("highpass=f=60:p=1,equalizer=f=15625:width_type=q:width=30:g=-24", pal_args)
+        self.assertNotIn("-af", off_args)
+
+    def test_probe_video_standard_classifies_ntsc_and_pal_metadata(self) -> None:
+        self.assertEqual(transcode3.classify_video_standard(720, 480, 29.97002997002997), "ntsc")
+        self.assertEqual(transcode3.classify_video_standard(720, 576, 25.0), "pal")
+        self.assertAlmostEqual(transcode3.parse_frame_rate("30000/1001") or 0.0, 29.97002997002997)
 
 
 class TestTranscodeAccess(unittest.TestCase):
@@ -503,7 +619,23 @@ class TestTranscodeAccess(unittest.TestCase):
         self.assertEqual(cfg.denoise, "verylight")
         self.assertEqual(cfg.crop_bottom, 0)
         self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(cfg.vhs_notch, "auto")
+        self.assertEqual(cfg.audio_channel, "keep")
         self.assertEqual(input_files, [Path("masters/tape/08.mkv")])
+
+    def test_access_parse_args_supports_audio_channel_copy(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--audio-channel",
+            "right",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertEqual(cfg.audio_channel, "right")
 
     def test_access_build_paths_uses_parent_parent_source_root_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

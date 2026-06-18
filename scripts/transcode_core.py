@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import re
 import shlex
@@ -47,6 +48,8 @@ class Config:
     originals_dirname: str
     access_dirname: str
     logs_dirname: str
+    vhs_notch: str = "auto"
+    audio_channel: str = "keep"
     layout: str = "archive"
     source_root: Path | None = None
     output_dir: Path | None = None
@@ -161,6 +164,8 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-validate-duration", action="store_true")
     parser.add_argument("--validate-duration-tolerance", type=float, default=DEFAULT_VALIDATE_DURATION_TOLERANCE)
+    parser.add_argument("--vhs-notch", choices=["auto", "ntsc", "pal", "off"], default="auto")
+    parser.add_argument("--audio-channel", choices=["keep", "left", "right"], default="keep")
     parser.add_argument("--output-suffix", default="")
     parser.add_argument("--originals-dirname", default="Originals")
     parser.add_argument("--access-dirname", default="Access")
@@ -195,6 +200,8 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
         originals_dirname=args.originals_dirname,
         access_dirname=args.access_dirname,
         logs_dirname=args.logs_dirname,
+        vhs_notch=args.vhs_notch,
+        audio_channel=args.audio_channel,
         layout="archive",
     )
     input_files = [Path(p) for p in args.input_files]
@@ -583,6 +590,115 @@ def escape_ffmpeg_filter_value(value: str) -> str:
     return value
 
 
+def parse_frame_rate(rate: str | None) -> float | None:
+    """Parse an ffprobe rational frame rate into a float."""
+    if not rate or rate == "0/0":
+        return None
+    if "/" in rate:
+        numerator, denominator = rate.split("/", 1)
+        try:
+            denominator_float = float(denominator)
+            if denominator_float == 0:
+                return None
+            return float(numerator) / denominator_float
+        except ValueError:
+            return None
+    try:
+        return float(rate)
+    except ValueError:
+        return None
+
+
+def classify_video_standard(width: int | None, height: int | None, frame_rate: float | None) -> str | None:
+    """Classify a VHS capture as NTSC or PAL from stream metadata."""
+    if height is not None:
+        if height >= 560:
+            return "pal"
+        if height <= 500:
+            return "ntsc"
+    if frame_rate is not None:
+        if 24.5 <= frame_rate <= 25.5:
+            return "pal"
+        if 29.0 <= frame_rate <= 30.5:
+            return "ntsc"
+    if width is not None and width >= 700 and height is not None:
+        return "pal" if height > 520 else "ntsc"
+    return None
+
+
+def probe_video_standard(input_file: Path) -> str:
+    """Probe the first video stream and classify it as NTSC or PAL."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,avg_frame_rate,r_frame_rate",
+                "-of",
+                "json",
+                str(input_file),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else str(exc)
+        raise RuntimeError(f"ffprobe failed for {input_file}: {stderr}") from exc
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ffprobe returned invalid JSON for {input_file}") from exc
+
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError(f"ffprobe found no video stream in {input_file}")
+
+    stream = streams[0]
+    frame_rate = parse_frame_rate(stream.get("avg_frame_rate")) or parse_frame_rate(stream.get("r_frame_rate"))
+    standard = classify_video_standard(stream.get("width"), stream.get("height"), frame_rate)
+    if standard is None:
+        raise RuntimeError(f"could not auto-detect NTSC/PAL video standard for {input_file}")
+    return standard
+
+
+def build_vhs_audio_filter(cfg: Config, input_file: Path) -> str | None:
+    """Build the default VHS hum/scan-frequency audio cleanup filter."""
+    if cfg.format_type != "vhs" or cfg.vhs_notch == "off":
+        return None
+
+    standard = probe_video_standard(input_file) if cfg.vhs_notch == "auto" else cfg.vhs_notch
+    center_frequency = {"ntsc": 15734, "pal": 15625}[standard]
+    return f"highpass=f=60:p=1,equalizer=f={center_frequency}:width_type=q:width=30:g=-24"
+
+
+def build_channel_copy_audio_filter(cfg: Config) -> str | None:
+    """Build a stereo pan filter that duplicates one source channel to both channels."""
+    if cfg.audio_channel == "left":
+        return "pan=stereo|c0=c0|c1=c0"
+    if cfg.audio_channel == "right":
+        return "pan=stereo|c0=c1|c1=c1"
+    return None
+
+
+def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
+    """Build the complete audio filter chain."""
+    filters = [
+        audio_filter
+        for audio_filter in (
+            build_vhs_audio_filter(cfg, input_file),
+            build_channel_copy_audio_filter(cfg),
+        )
+        if audio_filter is not None
+    ]
+    return ",".join(filters) if filters else None
+
+
 def build_vf(cfg: Config, paths: Paths) -> str:
     """Build the ffmpeg video filter chain."""
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
@@ -632,6 +748,8 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
 
     args += ["-i", str(paths.input_file), "-vf", vf, "-map", "0:v:0"]
     args += ["-map", "0:a:0?", "-map", "0:a:1?"] if cfg.map_both_audio else ["-map", "0:a:0?"]
+    if audio_filter := build_audio_filter(cfg, paths.input_file):
+        args += ["-af", audio_filter]
 
     if cfg.codec == "h264":
         args += ["-c:v", "h264_videotoolbox", "-profile:v", "high", "-coder", "cabac"]
@@ -724,6 +842,9 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
     print(f"Denoise preset: {cfg.denoise}")
     print(f"Bottom crop rows: {cfg.crop_bottom}")
     print(f"Bottom pad rows: {cfg.pad_bottom}")
+    if cfg.format_type == "vhs":
+        print(f"VHS audio notch: {cfg.vhs_notch}")
+    print(f"Audio channel: {cfg.audio_channel}")
     print(f"Deinterlace mode: {cfg.deint_mode}")
     if cfg.format_type == "digital8":
         print(f"CSV: {paths.csv_raw}")
@@ -754,6 +875,9 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
         f"Crop bottom: {cfg.crop_bottom}",
         f"Pad bottom: {cfg.pad_bottom}",
     ]
+    if cfg.format_type == "vhs":
+        lines.append(f"VHS audio notch: {cfg.vhs_notch}")
+    lines.append(f"Audio channel: {cfg.audio_channel}")
     if cfg.format_type == "digital8":
         lines += [
             f"CSV: {paths.csv_raw}",

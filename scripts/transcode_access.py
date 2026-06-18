@@ -40,6 +40,8 @@ def parse_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-validate-duration", action="store_true")
     parser.add_argument("--validate-duration-tolerance", type=float, default=DEFAULT_VALIDATE_DURATION_TOLERANCE)
+    parser.add_argument("--vhs-notch", choices=["auto", "ntsc", "pal", "off"], default="auto")
+    parser.add_argument("--audio-channel", choices=["keep", "left", "right"], default="keep")
     parser.add_argument("--output-suffix", default="")
     parser.add_argument("--access-dirname", default="Access")
     parser.add_argument("--logs-dirname", default="Logs")
@@ -72,6 +74,8 @@ def parse_args() -> tuple[Config, list[Path]]:
         originals_dirname="Originals",
         access_dirname=args.access_dirname,
         logs_dirname=args.logs_dirname,
+        vhs_notch=args.vhs_notch,
+        audio_channel=args.audio_channel,
         layout="access",
         source_root=args.source_root,
         output_dir=args.output_dir,
