@@ -23,8 +23,8 @@ def make_config(**overrides) -> transcode3.Config:
         "format_type": "video8",
         "start": None,
         "end": None,
-        "crop_bottom": 0,
-        "pad_bottom": 0,
+        "mask_top": 0,
+        "mask_bottom": 0,
         "denoise": "off",
         "q": 70,
         "codec": "hevc",
@@ -86,8 +86,8 @@ class TestParseArgs(unittest.TestCase):
 
         self.assertEqual(cfg.format_type, "vhs")
         self.assertEqual(cfg.denoise, "verylight")
-        self.assertEqual(cfg.crop_bottom, 0)
-        self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(cfg.mask_top, 3)
+        self.assertEqual(cfg.mask_bottom, 12)
         self.assertEqual(cfg.vhs_notch, "auto")
         self.assertEqual(cfg.audio_channel, "keep")
         self.assertEqual(input_files, [Path("Originals/set/tape/out.mkv")])
@@ -607,6 +607,29 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertEqual(transcode3.classify_video_standard(720, 576, 25.0), "pal")
         self.assertAlmostEqual(transcode3.parse_frame_rate("30000/1001") or 0.0, 29.97002997002997)
 
+    def test_mask_top_and_bottom_draw_black_boxes_without_changing_geometry(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        vf = transcode3.build_vf(make_config(mask_top=6, mask_bottom=8), paths)
+
+        self.assertIn("drawbox=x=0:y=0:w=iw:h=6:color=black:t=fill", vf)
+        self.assertIn("drawbox=x=0:y=ih-8:w=iw:h=8:color=black:t=fill", vf)
+        self.assertNotIn("crop=", vf)
+        self.assertNotIn("pad=", vf)
+
 
 class TestTranscodeAccess(unittest.TestCase):
     def test_access_parse_args_sets_vhs_defaults_and_access_layout(self) -> None:
@@ -617,11 +640,28 @@ class TestTranscodeAccess(unittest.TestCase):
         self.assertEqual(cfg.layout, "access")
         self.assertEqual(cfg.format_type, "vhs")
         self.assertEqual(cfg.denoise, "verylight")
-        self.assertEqual(cfg.crop_bottom, 0)
-        self.assertEqual(cfg.pad_bottom, 0)
+        self.assertEqual(cfg.mask_top, 3)
+        self.assertEqual(cfg.mask_bottom, 12)
         self.assertEqual(cfg.vhs_notch, "auto")
         self.assertEqual(cfg.audio_channel, "keep")
         self.assertEqual(input_files, [Path("masters/tape/08.mkv")])
+
+    def test_access_parse_args_can_override_vhs_mask_defaults(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--mask-top",
+            "0",
+            "--mask-bottom",
+            "0",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertEqual(cfg.mask_top, 0)
+        self.assertEqual(cfg.mask_bottom, 0)
 
     def test_access_parse_args_supports_audio_channel_copy(self) -> None:
         argv = [
@@ -893,7 +933,7 @@ class TestTranscodeTiming(unittest.TestCase):
             self.assertAlmostEqual(result.transcode_seconds or 0.0, 7.4)
             self.assertEqual(result.format_type, "digital8")
             self.assertEqual(result.denoise, "off")
-            self.assertEqual(result.crop_bottom, 0)
+            self.assertEqual(result.mask_bottom, 0)
 
     def test_process_one_file_uses_na_sidecar_time_for_non_digital8(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -917,7 +957,7 @@ class TestTranscodeTiming(unittest.TestCase):
                 create_srt_script=root / "create_srt.py",
             )
 
-            cfg = make_config(mode="transcode", format_type="video8", crop_bottom=7, pad_bottom=7, denoise="light")
+            cfg = make_config(mode="transcode", format_type="video8", mask_bottom=7, denoise="light")
 
             with (
                 patch.object(transcode3, "build_paths", return_value=paths),
@@ -931,7 +971,7 @@ class TestTranscodeTiming(unittest.TestCase):
             self.assertAlmostEqual(result.transcode_seconds or 0.0, 4.2)
             self.assertEqual(result.format_type, "video8")
             self.assertEqual(result.denoise, "light")
-            self.assertEqual(result.crop_bottom, 7)
+            self.assertEqual(result.mask_bottom, 7)
 
     def test_main_prints_transcode_time_summary(self) -> None:
         cfg = make_config(mode="transcode")
@@ -961,11 +1001,11 @@ class TestTranscodeTiming(unittest.TestCase):
         self.assertIn("a.dv", output)
         self.assertIn("1m 05s", output)
         self.assertIn("n/a", output)
-        self.assertIn("video8 | denoise=off | crop=0", output)
+        self.assertIn("video8 | denoise=off | mask_bottom=0", output)
         self.assertIn("b.dv", output)
         self.assertIn("5s", output)
         self.assertIn("8s", output)
-        self.assertIn("digital8 | denoise=light | crop=7", output)
+        self.assertIn("digital8 | denoise=light | mask_bottom=7", output)
         self.assertIn("TOTAL", output)
         self.assertIn("1m 10s", output)
         self.assertEqual(output.count("8s"), 2)

@@ -8,7 +8,8 @@ from pathlib import Path
 
 from transcode_core import DEFAULT_VALIDATE_DURATION_TOLERANCE
 from transcode_core import Config
-from transcode_core import default_crop_bottom
+from transcode_core import default_mask_bottom
+from transcode_core import default_mask_top
 from transcode_core import default_denoise
 from transcode_core import run_transcode_workflow
 
@@ -29,8 +30,8 @@ def parse_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8", "vhs"], required=True)
     parser.add_argument("--start")
     parser.add_argument("--end")
-    parser.add_argument("--crop-bottom", type=int)
-    parser.add_argument("--pad-bottom", type=int)
+    parser.add_argument("--mask-top", type=int)
+    parser.add_argument("--mask-bottom", type=int)
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
     parser.add_argument("--q", type=int, default=70)
     parser.add_argument("--codec", choices=["h264", "hevc"], default="hevc")
@@ -51,7 +52,8 @@ def parse_args() -> tuple[Config, list[Path]]:
     parser.add_argument("input_files", nargs="+")
     args = parser.parse_args()
 
-    crop_bottom = args.crop_bottom if args.crop_bottom is not None else default_crop_bottom(args.format_type)
+    mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
+    mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
 
     cfg = Config(
@@ -61,8 +63,8 @@ def parse_args() -> tuple[Config, list[Path]]:
         format_type=args.format_type,
         start=args.start,
         end=args.end,
-        crop_bottom=crop_bottom,
-        pad_bottom=args.pad_bottom if args.pad_bottom is not None else crop_bottom,
+        mask_top=mask_top,
+        mask_bottom=mask_bottom,
         denoise=denoise,
         q=args.q,
         codec=args.codec,

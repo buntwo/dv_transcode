@@ -35,8 +35,8 @@ class Config:
     format_type: str
     start: str | None
     end: str | None
-    crop_bottom: int
-    pad_bottom: int
+    mask_top: int
+    mask_bottom: int
     denoise: str
     q: int
     codec: str
@@ -81,7 +81,7 @@ class ProcessResult:
     sidecar_seconds: float | None
     format_type: str
     denoise: str
-    crop_bottom: int
+    mask_bottom: int
 
 
 @dataclass
@@ -126,8 +126,15 @@ except Exception:
     pass
 
 
-def default_crop_bottom(format_type: str) -> int:
-    """Return the default bottom crop for a source format."""
+def default_mask_top(format_type: str) -> int:
+    """Return the default top mask for a source format."""
+    return 3 if format_type == "vhs" else 0
+
+
+def default_mask_bottom(format_type: str) -> int:
+    """Return the default bottom mask for a source format."""
+    if format_type == "vhs":
+        return 12
     return 7 if format_type == "video8" else 0
 
 
@@ -153,8 +160,8 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8", "vhs"], required=True)
     parser.add_argument("--start")
     parser.add_argument("--end")
-    parser.add_argument("--crop-bottom", type=int)
-    parser.add_argument("--pad-bottom", type=int)
+    parser.add_argument("--mask-top", type=int)
+    parser.add_argument("--mask-bottom", type=int)
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
     parser.add_argument("--q", type=int, default=70)
     parser.add_argument("--codec", choices=["h264", "hevc"], default="hevc")
@@ -173,10 +180,13 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
     parser.add_argument("input_files", nargs="+")
     args = parser.parse_args()
 
-    crop_bottom = args.crop_bottom
+    mask_bottom = args.mask_bottom
+    mask_top = args.mask_top
     denoise = args.denoise
-    if crop_bottom is None:
-        crop_bottom = default_crop_bottom(args.format_type)
+    if mask_top is None:
+        mask_top = default_mask_top(args.format_type)
+    if mask_bottom is None:
+        mask_bottom = default_mask_bottom(args.format_type)
     if denoise is None:
         denoise = default_denoise(args.format_type)
 
@@ -187,8 +197,8 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
         format_type=args.format_type,
         start=args.start,
         end=args.end,
-        crop_bottom=crop_bottom,
-        pad_bottom=args.pad_bottom if args.pad_bottom is not None else crop_bottom,
+        mask_top=mask_top,
+        mask_bottom=mask_bottom,
         denoise=denoise,
         q=args.q,
         codec=args.codec,
@@ -703,10 +713,10 @@ def build_vf(cfg: Config, paths: Paths) -> str:
     """Build the ffmpeg video filter chain."""
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
-    if cfg.crop_bottom > 0:
-        filters.append(f"crop=iw:ih-{cfg.crop_bottom}:0:0")
-    if cfg.pad_bottom > 0:
-        filters.append(f"pad=iw:ih+{cfg.pad_bottom}:0:0:black")
+    if cfg.mask_top > 0:
+        filters.append(f"drawbox=x=0:y=0:w=iw:h={cfg.mask_top}:color=black:t=fill")
+    if cfg.mask_bottom > 0:
+        filters.append(f"drawbox=x=0:y=ih-{cfg.mask_bottom}:w=iw:h={cfg.mask_bottom}:color=black:t=fill")
 
     if hqdn3d := get_hqdn3d_args(cfg.denoise):
         filters.append(f"hqdn3d={hqdn3d}")
@@ -840,8 +850,8 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
         print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
     print(f"Codec: {cfg.codec}")
     print(f"Denoise preset: {cfg.denoise}")
-    print(f"Bottom crop rows: {cfg.crop_bottom}")
-    print(f"Bottom pad rows: {cfg.pad_bottom}")
+    print(f"Top mask rows: {cfg.mask_top}")
+    print(f"Bottom mask rows: {cfg.mask_bottom}")
     if cfg.format_type == "vhs":
         print(f"VHS audio notch: {cfg.vhs_notch}")
     print(f"Audio channel: {cfg.audio_channel}")
@@ -872,8 +882,8 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
         f"Format: {cfg.format_type}",
         f"Codec: {cfg.codec}",
         f"Denoise: {cfg.denoise}",
-        f"Crop bottom: {cfg.crop_bottom}",
-        f"Pad bottom: {cfg.pad_bottom}",
+        f"Mask top: {cfg.mask_top}",
+        f"Mask bottom: {cfg.mask_bottom}",
     ]
     if cfg.format_type == "vhs":
         lines.append(f"VHS audio notch: {cfg.vhs_notch}")
@@ -905,7 +915,7 @@ def format_duration(seconds: float | None) -> str:
 
 def build_summary_options(result: ProcessResult) -> str:
     """Build the compact options string for the end-of-run summary table."""
-    return f"{result.format_type} | denoise={result.denoise} | crop={result.crop_bottom}"
+    return f"{result.format_type} | denoise={result.denoise} | mask_bottom={result.mask_bottom}"
 
 
 def print_transcode_time_summary(results: list[ProcessResult]) -> None:
@@ -1011,7 +1021,7 @@ def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResu
                 sidecar_seconds=None,
                 format_type=cfg.format_type,
                 denoise=cfg.denoise,
-                crop_bottom=cfg.crop_bottom,
+                mask_bottom=cfg.mask_bottom,
             )
 
     paths = build_paths(cfg, input_file)
@@ -1043,7 +1053,7 @@ def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResu
         sidecar_seconds=sidecar_seconds,
         format_type=cfg.format_type,
         denoise=cfg.denoise,
-        crop_bottom=cfg.crop_bottom,
+        mask_bottom=cfg.mask_bottom,
     )
 
 
