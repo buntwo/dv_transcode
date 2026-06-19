@@ -532,22 +532,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         validate_args(args)
         config = config_from_args(args)
-        outputs: list[tuple[Path, VideoMetadata]] = []
         show_progress = len(args.inputs) > 1
         total = len(args.inputs)
         for index, input_path in enumerate(args.inputs, start=1):
             if show_progress:
                 print(format_progress(index, total, input_path), flush=True)
             output_path = resolve_output_path(input_path, args.output, args.output_dir)
-            metadata = create_contact_sheet(input_path, output_path, config)
-            outputs.append((output_path, metadata))
+            create_contact_sheet(input_path, output_path, config)
+            if not show_progress:
+                print(f"Wrote {output_path}")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"contact_sheet.py: error: {exc}")
         return 1
 
-    for output_path, metadata in outputs:
-        print(f"Wrote {output_path}")
-        print(metadata.detail_text)
     return 0
 
 

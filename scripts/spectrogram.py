@@ -227,19 +227,17 @@ def main(argv: list[str] | None = None) -> int:
         config = config_from_args(args)
         show_progress = len(args.inputs) > 1
         total = len(args.inputs)
-        outputs: list[Path] = []
         for index, input_path in enumerate(args.inputs, start=1):
             if show_progress:
                 print(format_progress(index, total, input_path), flush=True)
             output_path = resolve_output_path(input_path, args.output, args.output_dir)
             create_spectrogram(input_path, output_path, config)
-            outputs.append(output_path)
+            if not show_progress:
+                print(f"Wrote {output_path}")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"spectrogram.py: error: {exc}")
         return 1
 
-    for output_path in outputs:
-        print(f"Wrote {output_path}")
     return 0
 
 
