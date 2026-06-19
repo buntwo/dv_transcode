@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import select
 import shutil
@@ -42,7 +43,18 @@ MAX_SELECT_TIMEOUT_SECONDS = 0.1
 PLAYER_READY_TIMEOUT_SECONDS = 10.0
 IPC_CONNECT_ATTEMPTS = 10
 IPC_CONNECT_RETRY_SECONDS = 0.02
-SEEK_KEYS = frozenset({"seek_back", "seek_forward", "seek_back_large", "seek_forward_large"})
+SEEK_KEYS = frozenset(
+    {
+        "seek_all_back_xs",
+        "seek_all_forward_xs",
+        "seek_all_back_s",
+        "seek_all_forward_s",
+        "seek_all_back_m",
+        "seek_all_forward_m",
+        "seek_all_back_l",
+        "seek_all_forward_l",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,9 @@ class MpvClient:
 
     def seek(self, seconds: float) -> None:
         self.command("seek", seconds, "relative", "exact")
+
+    def seek_absolute(self, seconds: float) -> None:
+        self.command("seek", seconds, "absolute", "exact")
 
     def set_volume(self, volume: int) -> None:
         self.command("set_property", "volume", volume)
@@ -177,9 +192,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seek-large", type=positive_float, default=DEFAULT_SEEK_LARGE)
     parser.add_argument("--nudge-small", type=positive_float, default=DEFAULT_NUDGE_SMALL)
     parser.add_argument("--nudge-large", type=positive_float, default=DEFAULT_NUDGE_LARGE)
+    for index in range(1, MAX_VIDEOS + 1):
+        parser.add_argument(
+            f"-ss{index}",
+            dest=f"ss{index}",
+            type=parse_timestamp,
+            metavar="TIMESTAMP",
+            help=(
+                f"Pre-seek video {index} before playback. "
+                "Accepts seconds, MM:SS, or HH:MM:SS with optional decimals."
+            ),
+        )
     args = parser.parse_args(argv)
     if not MIN_VIDEOS <= len(args.videos) <= MAX_VIDEOS:
         parser.error(f"expected {MIN_VIDEOS} to {MAX_VIDEOS} videos")
+    for index in range(len(args.videos) + 1, MAX_VIDEOS + 1):
+        if getattr(args, f"ss{index}") is not None:
+            parser.error(f"-ss{index} was supplied but video {index} is not loaded")
     return args
 
 
@@ -202,6 +231,32 @@ def positive_float(value: str) -> float:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
     return parsed
+
+
+def parse_timestamp(value: str) -> float:
+    parts = value.split(":")
+    if len(parts) > 3:
+        raise argparse.ArgumentTypeError("must be seconds, MM:SS, or HH:MM:SS")
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+        else:
+            if any(part == "" for part in parts):
+                raise ValueError
+            seconds = float(parts[-1])
+            for multiplier, part in zip((60, 3600), reversed(parts[:-1]), strict=False):
+                if "." in part:
+                    raise ValueError
+                seconds += int(part) * multiplier
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be seconds, MM:SS, or HH:MM:SS") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return seconds
+
+
+def collect_start_times(args: argparse.Namespace) -> list[float]:
+    return [getattr(args, f"ss{index}") or 0.0 for index in range(1, len(args.videos) + 1)]
 
 
 def validate_inputs(args: argparse.Namespace) -> None:
@@ -252,20 +307,46 @@ def wait_for_socket(path: Path, timeout: float = 5.0) -> None:
 def normalize_key(sequence: bytes) -> str | None:
     if sequence == b" ":
         return "space"
+    if sequence in (b"\r", b"\n"):
+        return "selected_pause"
     if sequence in (b"q", b"\x03"):
         return "quit"
     if sequence == b"m":
         return "mute"
     if sequence == b"d":
         return "display"
+    if sequence == b"z":
+        return "seek_all_back_xs"
+    if sequence == b"x":
+        return "seek_all_forward_xs"
+    if sequence == b"Z":
+        return "seek_all_back_s"
+    if sequence == b"X":
+        return "seek_all_forward_s"
+    if sequence == b"a":
+        return "seek_all_back_m"
+    if sequence == b"s":
+        return "seek_all_forward_m"
+    if sequence == b"A":
+        return "seek_all_back_l"
+    if sequence == b"S":
+        return "seek_all_forward_l"
     if sequence == b",":
-        return "nudge_back"
+        return "nudge_back_xs"
     if sequence == b".":
-        return "nudge_forward"
+        return "nudge_forward_xs"
     if sequence == b"<":
-        return "nudge_back_large"
+        return "nudge_back_s"
     if sequence == b">":
-        return "nudge_forward_large"
+        return "nudge_forward_s"
+    if sequence == b"k":
+        return "nudge_back_m"
+    if sequence == b"l":
+        return "nudge_forward_m"
+    if sequence == b"K":
+        return "nudge_back_l"
+    if sequence == b"L":
+        return "nudge_forward_l"
     if sequence in (b"1", b"2", b"3", b"4"):
         return f"select_{sequence.decode('ascii')}"
     if sequence == b"!":
@@ -276,14 +357,6 @@ def normalize_key(sequence: bytes) -> str | None:
         return "audio_3"
     if sequence == b"$":
         return "audio_4"
-    if sequence in (b"\x1b[D", b"\x1bOD"):
-        return "seek_back"
-    if sequence in (b"\x1b[C", b"\x1bOC"):
-        return "seek_forward"
-    if sequence in (b"\x1b[1;2D", b"\x1b[2D"):
-        return "seek_back_large"
-    if sequence in (b"\x1b[1;2C", b"\x1b[2C"):
-        return "seek_forward_large"
     return None
 
 
@@ -298,7 +371,7 @@ def read_key() -> str | None:
         if not readable:
             break
         sequence.extend(os.read(sys.stdin.fileno(), 1))
-        if sequence.endswith((b"C", b"D")):
+        if sequence.endswith((b"A", b"B", b"C", b"D", b"u", b" ")):
             break
     return normalize_key(bytes(sequence))
 
@@ -313,10 +386,15 @@ def print_help() -> None:
             [
                 "Controls:",
                 "  space             play/pause all",
-                "  left/right        seek all backward/forward",
-                "  shift+left/right  seek all backward/forward by larger step",
-                "  ,/.               nudge selected video backward/forward",
-                "  </>               nudge selected video backward/forward by larger amount",
+                "  enter             play/pause selected video",
+                "  z/x               seek all backward/forward by xs step",
+                "  Z/X               seek all backward/forward by s step",
+                "  a/s               seek all backward/forward by m step",
+                "  A/S               seek all backward/forward by l step",
+                "  ,/.               nudge selected video backward/forward by xs step",
+                "  </>               nudge selected video backward/forward by s step",
+                "  k/l               nudge selected video backward/forward by m step",
+                "  K/L               nudge selected video backward/forward by l step",
                 "  1/2/3/4           select video for nudging",
                 "  !/@/#/$           activate audio for video 1/2/3/4",
                 "  m                 toggle mute for all",
@@ -516,10 +594,30 @@ def set_all_pause(players: list[Player], state: ControllerState) -> None:
     render_status(players, state, "paused" if next_pause else "playing")
 
 
+def toggle_selected_pause(players: list[Player], state: ControllerState) -> None:
+    player = get_player(players, state.selected_index)
+    if player is None:
+        render_status(players, state, f"video {state.selected_index} is not loaded")
+        return
+    next_pause = not live_client(player).get_pause()
+    live_client(player).set_pause(next_pause)
+    show_temporary_osd(player, "PAUSED" if next_pause else "PLAYING", ACTION_OSD_MS)
+    render_status(players, state, f"{'paused' if next_pause else 'playing'} {player.title_name}")
+
+
 def start_all_playback(players: list[Player], state: ControllerState) -> None:
     for player in players:
         live_client(player).set_pause(False)
     render_status(players, state, "started")
+
+
+def preseek_players(players: list[Player], start_times: list[float], state: ControllerState) -> None:
+    for player, start_time in zip(players, start_times, strict=True):
+        if start_time > 0:
+            live_client(player).seek_absolute(start_time)
+        refresh_position(player)
+    if any(start_time > 0 for start_time in start_times):
+        render_status(players, state, "pre-seeked")
 
 
 def seek_all(players: list[Player], state: ControllerState, seconds: float) -> None:
@@ -574,22 +672,40 @@ def handle_key(
         return False
     if key == "space":
         set_all_pause(players, state)
-    elif key == "seek_back":
+    elif key == "selected_pause":
+        toggle_selected_pause(players, state)
+    elif key == "seek_all_back_xs":
+        seek_all(players, state, -args.nudge_small)
+    elif key == "seek_all_forward_xs":
+        seek_all(players, state, args.nudge_small)
+    elif key == "seek_all_back_s":
+        seek_all(players, state, -args.nudge_large)
+    elif key == "seek_all_forward_s":
+        seek_all(players, state, args.nudge_large)
+    elif key == "seek_all_back_m":
         seek_all(players, state, -args.seek_small)
-    elif key == "seek_forward":
+    elif key == "seek_all_forward_m":
         seek_all(players, state, args.seek_small)
-    elif key == "seek_back_large":
+    elif key == "seek_all_back_l":
         seek_all(players, state, -args.seek_large)
-    elif key == "seek_forward_large":
+    elif key == "seek_all_forward_l":
         seek_all(players, state, args.seek_large)
-    elif key == "nudge_back":
+    elif key == "nudge_back_xs":
         nudge_selected(players, state, -args.nudge_small)
-    elif key == "nudge_forward":
+    elif key == "nudge_forward_xs":
         nudge_selected(players, state, args.nudge_small)
-    elif key == "nudge_back_large":
+    elif key == "nudge_back_s":
         nudge_selected(players, state, -args.nudge_large)
-    elif key == "nudge_forward_large":
+    elif key == "nudge_forward_s":
         nudge_selected(players, state, args.nudge_large)
+    elif key == "nudge_back_m":
+        nudge_selected(players, state, -args.seek_small)
+    elif key == "nudge_forward_m":
+        nudge_selected(players, state, args.seek_small)
+    elif key == "nudge_back_l":
+        nudge_selected(players, state, -args.seek_large)
+    elif key == "nudge_forward_l":
+        nudge_selected(players, state, args.seek_large)
     elif key.startswith("select_"):
         select_player(players, state, int(key[-1]))
     elif key.startswith("audio_"):
@@ -615,6 +731,7 @@ def terminate_process(process: subprocess.Popen[bytes]) -> None:
 def run(args: argparse.Namespace) -> int:
     validate_inputs(args)
     geometries = calculate_geometry(len(args.videos), args.width, args.height, args.gap, args.x, args.y)
+    start_times = collect_start_times(args)
     screen = args.monitor - 1 if args.monitor is not None else None
     state = ControllerState()
     players: list[Player] = []
@@ -647,6 +764,7 @@ def run(args: argparse.Namespace) -> int:
                 player.client = MpvClient(player.socket_path)
             for player in players:
                 wait_for_player_ready(player)
+            preseek_players(players, start_times, state)
             update_titles(players, state)
             activate_audio(players, state, state.audio_index, flash=False)
             print_help()
