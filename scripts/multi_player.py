@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Side-by-side synchronized multi-player video control using mpv."""
+"""Synchronized multi-player video control using mpv."""
 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import select
@@ -23,14 +24,25 @@ from typing import Any
 
 DEFAULT_WIDTH = 960
 DEFAULT_HEIGHT = 540
-DEFAULT_GAP = 24
+DEFAULT_GAP = 0
 DEFAULT_X = 40
 DEFAULT_Y = 80
 DEFAULT_SEEK_SMALL = 5.0
 DEFAULT_SEEK_LARGE = 30.0
 DEFAULT_NUDGE_SMALL = 0.0333667
 DEFAULT_NUDGE_LARGE = 0.5
-DEFAULT_AUDIO_STEP = 0.05
+MIN_VIDEOS = 2
+MAX_VIDEOS = 4
+SELECTED_OSD_MS = 500
+AUDIO_OSD_MS = 500
+ACTION_OSD_MS = 500
+PERSISTENT_OSD_MS = 3_600_000
+STATUS_REFRESH_SECONDS = 0.5
+MAX_SELECT_TIMEOUT_SECONDS = 0.1
+PLAYER_READY_TIMEOUT_SECONDS = 10.0
+IPC_CONNECT_ATTEMPTS = 10
+IPC_CONNECT_RETRY_SECONDS = 0.02
+SEEK_KEYS = frozenset({"seek_back", "seek_forward", "seek_back_large", "seek_forward_large"})
 
 
 @dataclass(frozen=True)
@@ -44,61 +56,14 @@ class WindowGeometry:
         return f"{self.width}x{self.height}+{self.x}+{self.y}"
 
 
-@dataclass(frozen=True)
-class SideBySideGeometry:
-    left: WindowGeometry
-    right: WindowGeometry
-
-
-@dataclass
-class OffsetState:
-    left_seconds: float = 0.0
-    right_seconds: float = 0.0
-
-    @property
-    def relative_seconds(self) -> float:
-        return self.right_seconds - self.left_seconds
-
-    def nudge_left(self, seconds: float) -> None:
-        self.left_seconds += seconds
-
-    def nudge_right(self, seconds: float) -> None:
-        self.right_seconds += seconds
-
-
-@dataclass
-class AudioMix:
-    pan: float = 0.5
-    step: float = DEFAULT_AUDIO_STEP
-
-    def move_left(self) -> None:
-        self.pan = clamp(self.pan - self.step, 0.0, 1.0)
-
-    def move_right(self) -> None:
-        self.pan = clamp(self.pan + self.step, 0.0, 1.0)
-
-    @property
-    def left_volume(self) -> int:
-        return round((1.0 - self.pan) * 100)
-
-    @property
-    def right_volume(self) -> int:
-        return round(self.pan * 100)
-
-
 class MpvClient:
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = socket_path
 
     def command(self, *parts: Any) -> dict[str, Any]:
         payload = json.dumps({"command": list(parts)}).encode("utf-8") + b"\n"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(str(self.socket_path))
-            sock.sendall(payload)
-            response = sock.recv(65536)
-        if not response:
-            return {}
-        return json.loads(response.decode("utf-8"))
+        response = send_ipc_payload(self.socket_path, payload)
+        return parse_mpv_response(response)
 
     def seek(self, seconds: float) -> None:
         self.command("seek", seconds, "relative", "exact")
@@ -106,41 +71,116 @@ class MpvClient:
     def set_volume(self, volume: int) -> None:
         self.command("set_property", "volume", volume)
 
+    def set_title(self, title: str) -> None:
+        self.command("set_property", "title", title)
+
     def get_pause(self) -> bool:
         response = self.command("get_property", "pause")
         return bool(response.get("data"))
 
+    def get_time_pos(self) -> float | None:
+        response = self.command("get_property", "time-pos")
+        data = response.get("data")
+        if isinstance(data, int | float):
+            return float(data)
+        return None
+
     def set_pause(self, pause: bool) -> None:
         self.command("set_property", "pause", pause)
 
+    def show_text(self, text: str, duration_ms: int) -> None:
+        self.command("show-text", text, duration_ms)
 
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(maximum, value))
+
+def send_ipc_payload(socket_path: Path, payload: bytes) -> bytes:
+    for attempt in range(IPC_CONNECT_ATTEMPTS):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(str(socket_path))
+                sock.sendall(payload)
+                return sock.recv(65536)
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED or attempt == IPC_CONNECT_ATTEMPTS - 1:
+                raise
+            time.sleep(IPC_CONNECT_RETRY_SECONDS)
+    return b""
 
 
-def calculate_geometry(width: int, height: int, gap: int, x: int, y: int) -> SideBySideGeometry:
-    left = WindowGeometry(width=width, height=height, x=x, y=y)
-    right = WindowGeometry(width=width, height=height, x=x + width + gap, y=y)
-    return SideBySideGeometry(left=left, right=right)
+def parse_mpv_response(response: bytes) -> dict[str, Any]:
+    if not response:
+        return {}
+
+    fallback: dict[str, Any] | None = None
+    for line in response.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        parsed = json.loads(line)
+        if not isinstance(parsed, dict):
+            continue
+        if fallback is None:
+            fallback = parsed
+        if "event" not in parsed:
+            return parsed
+    return fallback or {}
+
+
+@dataclass
+class Player:
+    index: int
+    video: Path
+    geometry: WindowGeometry
+    socket_path: Path
+    process: subprocess.Popen[bytes] | None = None
+    client: MpvClient | None = None
+    offset_seconds: float = 0.0
+    position_seconds: float | None = None
+    osd_block_until: float = 0.0
+
+    @property
+    def title_name(self) -> str:
+        return f"{self.index}: {self.video.name}"
+
+
+@dataclass
+class ControllerState:
+    selected_index: int = 1
+    audio_index: int = 1
+    muted: bool = False
+    display_enabled: bool = True
+    last_action: str = "ready"
+
+
+def calculate_geometry(count: int, width: int, height: int, gap: int, x: int, y: int) -> list[WindowGeometry]:
+    return [
+        WindowGeometry(
+            width=width,
+            height=height,
+            x=x + ((index - 1) % 2) * (width + gap),
+            y=y + ((index - 1) // 2) * (height + gap),
+        )
+        for index in range(1, count + 1)
+    ]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Open two videos side by side in mpv and control them together.",
+        description="Open 2 to 4 videos in mpv and control them together.",
     )
-    parser.add_argument("left_video", type=Path)
-    parser.add_argument("right_video", type=Path)
+    parser.add_argument("videos", nargs="+", type=Path)
     parser.add_argument("--width", type=positive_int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=positive_int, default=DEFAULT_HEIGHT)
     parser.add_argument("--gap", type=non_negative_int, default=DEFAULT_GAP)
-    parser.add_argument("--x", type=non_negative_int, default=DEFAULT_X)
-    parser.add_argument("--y", type=non_negative_int, default=DEFAULT_Y)
+    parser.add_argument("-x", type=non_negative_int, default=DEFAULT_X)
+    parser.add_argument("-y", type=non_negative_int, default=DEFAULT_Y)
+    parser.add_argument("--monitor", type=positive_int)
     parser.add_argument("--seek-small", type=positive_float, default=DEFAULT_SEEK_SMALL)
     parser.add_argument("--seek-large", type=positive_float, default=DEFAULT_SEEK_LARGE)
     parser.add_argument("--nudge-small", type=positive_float, default=DEFAULT_NUDGE_SMALL)
     parser.add_argument("--nudge-large", type=positive_float, default=DEFAULT_NUDGE_LARGE)
-    parser.add_argument("--audio-step", type=positive_float, default=DEFAULT_AUDIO_STEP)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not MIN_VIDEOS <= len(args.videos) <= MAX_VIDEOS:
+        parser.error(f"expected {MIN_VIDEOS} to {MAX_VIDEOS} videos")
+    return args
 
 
 def positive_int(value: str) -> int:
@@ -165,25 +205,38 @@ def positive_float(value: str) -> float:
 
 
 def validate_inputs(args: argparse.Namespace) -> None:
-    for label, path in (("left", args.left_video), ("right", args.right_video)):
+    for index, path in enumerate(args.videos, start=1):
         if not path.exists():
-            raise ValueError(f"{label} video does not exist: {path}")
+            raise ValueError(f"video {index} does not exist: {path}")
         if not path.is_file():
-            raise ValueError(f"{label} video is not a file: {path}")
+            raise ValueError(f"video {index} is not a file: {path}")
     if shutil.which("mpv") is None:
         raise ValueError("mpv is required; install with: brew install mpv")
 
 
-def launch_mpv(video: Path, title: str, geometry: WindowGeometry, ipc_socket: Path, volume: int) -> subprocess.Popen[bytes]:
+def launch_mpv(
+    video: Path,
+    title: str,
+    geometry: WindowGeometry,
+    ipc_socket: Path,
+    volume: int,
+    screen: int | None = None,
+) -> subprocess.Popen[bytes]:
     cmd = [
         "mpv",
         "--no-terminal",
+        "--pause",
+        "--osd-align-x=left",
+        "--osd-align-y=top",
+        "--osd-font=monospace",
         f"--input-ipc-server={ipc_socket}",
         f"--geometry={geometry.mpv_value()}",
         f"--title={title}",
         f"--volume={volume}",
-        str(video),
     ]
+    if screen is not None:
+        cmd.append(f"--screen={screen}")
+    cmd.append(str(video))
     return subprocess.Popen(cmd)
 
 
@@ -201,28 +254,28 @@ def normalize_key(sequence: bytes) -> str | None:
         return "space"
     if sequence in (b"q", b"\x03"):
         return "quit"
-    if sequence == b"c":
-        return "left_nudge_back"
-    if sequence == b"v":
-        return "left_nudge_forward"
-    if sequence == b"C":
-        return "left_nudge_back_large"
-    if sequence == b"V":
-        return "left_nudge_forward_large"
     if sequence == b"m":
-        return "right_nudge_back"
-    if sequence == b",":
-        return "right_nudge_forward"
-    if sequence == b"M":
-        return "right_nudge_back_large"
-    if sequence == b"<":
-        return "right_nudge_forward_large"
-    if sequence == b"g":
-        return "audio_left"
-    if sequence == b"h":
-        return "audio_right"
-    if sequence == b"0":
         return "mute"
+    if sequence == b"d":
+        return "display"
+    if sequence == b",":
+        return "nudge_back"
+    if sequence == b".":
+        return "nudge_forward"
+    if sequence == b"<":
+        return "nudge_back_large"
+    if sequence == b">":
+        return "nudge_forward_large"
+    if sequence in (b"1", b"2", b"3", b"4"):
+        return f"select_{sequence.decode('ascii')}"
+    if sequence == b"!":
+        return "audio_1"
+    if sequence == b"@":
+        return "audio_2"
+    if sequence == b"#":
+        return "audio_3"
+    if sequence == b"$":
+        return "audio_4"
     if sequence in (b"\x1b[D", b"\x1bOD"):
         return "seek_back"
     if sequence in (b"\x1b[C", b"\x1bOC"):
@@ -250,119 +303,301 @@ def read_key() -> str | None:
     return normalize_key(bytes(sequence))
 
 
+def flush_pending_input() -> None:
+    termios.tcflush(sys.stdin, termios.TCIFLUSH)
+
+
 def print_help() -> None:
     print(
         "\n".join(
             [
                 "Controls:",
-                "  space        play/pause both",
-                "  arrows       seek both backward/forward",
-                "  shift+arrows seek both backward/forward by larger step",
-                "  c/v          nudge left backward/forward",
-                "  C/V          nudge left backward/forward by larger amount",
-                "  m/,          nudge right backward/forward",
-                "  M/<          nudge right backward/forward by larger amount",
-                "  g/h          pan audio mix left/right",
-                "  0            toggle mute for both",
-                "  q            quit",
+                "  space             play/pause all",
+                "  left/right        seek all backward/forward",
+                "  shift+left/right  seek all backward/forward by larger step",
+                "  ,/.               nudge selected video backward/forward",
+                "  </>               nudge selected video backward/forward by larger amount",
+                "  1/2/3/4           select video for nudging",
+                "  !/@/#/$           activate audio for video 1/2/3/4",
+                "  m                 toggle mute for all",
+                "  d                 toggle persistent timestamp/nudge display",
+                "  q                 quit",
                 "",
             ]
         )
     )
 
 
-def print_offset_summary(offsets: OffsetState) -> None:
+def print_offset_summary(players: list[Player]) -> None:
     print("Final offset:")
-    print(f"  left nudged:     {offsets.left_seconds:+.3f}s")
-    print(f"  right nudged:    {offsets.right_seconds:+.3f}s")
-    print(f"  right - left:    {offsets.relative_seconds:+.3f}s")
+    for player in players:
+        print(f"  {player.index}: {player.offset_seconds:+.3f}s")
 
 
-def set_both_pause(left: MpvClient, right: MpvClient) -> None:
-    next_pause = not left.get_pause()
-    left.set_pause(next_pause)
-    right.set_pause(next_pause)
-    print("paused" if next_pause else "playing")
+def print_status(message: str) -> None:
+    sys.stdout.write(f"\r\033[K{message}")
+    sys.stdout.flush()
 
 
-def seek_both(left: MpvClient, right: MpvClient, seconds: float) -> None:
-    left.seek(seconds)
-    right.seek(seconds)
-    print(f"seek both {seconds:+.3f}s")
+def format_timestamp(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--:--.---"
+
+    sign = "-" if seconds < 0 else ""
+    total_ms = round(abs(seconds) * 1000)
+    total_seconds, milliseconds = divmod(total_ms, 1000)
+    minutes_total, seconds_part = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes_total, 60)
+    return f"{sign}{hours:02}:{minutes:02}:{seconds_part:02}.{milliseconds:03}"
 
 
-def set_mix(left: MpvClient, right: MpvClient, mix: AudioMix) -> None:
-    left.set_volume(mix.left_volume)
-    right.set_volume(mix.right_volume)
-    print(f"audio mix left {mix.left_volume}% / right {mix.right_volume}%")
+def format_status(players: list[Player], state: ControllerState) -> str:
+    mute_state = "on" if state.muted else "off"
+    positions = " ".join(f"{player.index}:{format_timestamp(player.position_seconds)}" for player in players)
+    offsets = " ".join(f"{player.index}:{player.offset_seconds:+.3f}s" for player in players)
+    return (
+        f"selected {state.selected_index} | audio {state.audio_index} | mute {mute_state} | "
+        f"pos {positions} | offsets {offsets} | {state.last_action}"
+    )
 
 
-def toggle_mute(left: MpvClient, right: MpvClient) -> None:
-    left.command("cycle", "mute")
-    right.command("cycle", "mute")
-    print("toggled mute")
+def render_status(players: list[Player], state: ControllerState, message: str) -> None:
+    state.last_action = message
+    print_status(format_status(players, state))
+
+
+def player_title(player: Player, state: ControllerState) -> str:
+    selected_marker = "*" if player.index == state.selected_index else " "
+    audio_marker = "[A]" if player.index == state.audio_index else "   "
+    return f"{selected_marker} {audio_marker} {player.title_name}"
+
+
+def live_client(player: Player) -> MpvClient:
+    if player.client is None:
+        raise RuntimeError(f"video {player.index} is not connected")
+    return player.client
+
+
+def refresh_position(player: Player) -> None:
+    player.position_seconds = live_client(player).get_time_pos()
+
+
+def refresh_positions(players: list[Player]) -> None:
+    for player in players:
+        refresh_position(player)
+
+
+def wait_for_player_ready(player: Player, timeout: float = PLAYER_READY_TIMEOUT_SECONDS) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if player.process is not None and player.process.poll() is not None:
+            raise RuntimeError(f"video {player.index} exited before it was ready")
+        refresh_position(player)
+        if player.position_seconds is not None:
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"timed out waiting for video {player.index} to become ready")
+
+
+def persistent_osd_text(player: Player, state: ControllerState) -> str:
+    return format_osd_state(player, state)
+
+
+def format_osd_state(player: Player, state: ControllerState, action: str | None = None) -> str:
+    selected_marker = "[V]" if player.index == state.selected_index else "   "
+    audio_marker = "[A]" if player.index == state.audio_index else "   "
+    lines = [
+        f"time  {format_timestamp(player.position_seconds)}",
+        f"nudge {player.offset_seconds:+.3f}s",
+        f"{selected_marker} {audio_marker}",
+    ]
+    if action is not None:
+        lines.append(action)
+    return "\n".join(lines)
+
+
+def show_temporary_osd(player: Player, text: str, duration_ms: int) -> None:
+    player.osd_block_until = time.monotonic() + duration_ms / 1000
+    live_client(player).show_text(text, duration_ms)
+
+
+def update_persistent_display(player: Player, state: ControllerState, now: float | None = None, force: bool = False) -> None:
+    if not state.display_enabled:
+        return
+    current_time = time.monotonic() if now is None else now
+    if force or current_time >= player.osd_block_until:
+        live_client(player).show_text(persistent_osd_text(player, state), PERSISTENT_OSD_MS)
+        player.osd_block_until = 0.0
+
+
+def update_persistent_displays(players: list[Player], state: ControllerState, force: bool = False) -> None:
+    for player in players:
+        update_persistent_display(player, state, force=force)
+
+
+def restore_due_persistent_displays(players: list[Player], state: ControllerState, now: float) -> None:
+    if not state.display_enabled:
+        return
+    for player in players:
+        if player.osd_block_until and now >= player.osd_block_until:
+            update_persistent_display(player, state, now=now)
+
+
+def next_persistent_restore_time(players: list[Player], state: ControllerState) -> float | None:
+    if not state.display_enabled:
+        return None
+    pending = [player.osd_block_until for player in players if player.osd_block_until]
+    if not pending:
+        return None
+    return min(pending)
+
+
+def next_loop_timeout(now: float, next_status_refresh: float, next_osd_restore: float | None) -> float:
+    next_deadline = next_status_refresh
+    if next_osd_restore is not None:
+        next_deadline = min(next_deadline, next_osd_restore)
+    return max(0.0, min(MAX_SELECT_TIMEOUT_SECONDS, next_deadline - now))
+
+
+def clear_persistent_displays(players: list[Player]) -> None:
+    for player in players:
+        player.osd_block_until = 0.0
+        live_client(player).show_text("", 1)
+
+
+def update_titles(players: list[Player], state: ControllerState) -> None:
+    for player in players:
+        live_client(player).set_title(player_title(player, state))
+
+
+def get_player(players: list[Player], index: int) -> Player | None:
+    for player in players:
+        if player.index == index:
+            return player
+    return None
+
+
+def select_player(players: list[Player], state: ControllerState, index: int) -> None:
+    player = get_player(players, index)
+    if player is None:
+        render_status(players, state, f"video {index} is not loaded")
+        return
+    state.selected_index = index
+    update_titles(players, state)
+    if state.display_enabled:
+        update_persistent_displays(players, state, force=True)
+    else:
+        show_temporary_osd(player, f"SELECTED {index}", SELECTED_OSD_MS)
+    render_status(players, state, f"selected {player.title_name}")
+
+
+def activate_audio(players: list[Player], state: ControllerState, index: int, flash: bool = True) -> None:
+    player = get_player(players, index)
+    if player is None:
+        render_status(players, state, f"video {index} is not loaded")
+        return
+    state.audio_index = index
+    for current in players:
+        live_client(current).set_volume(100 if current.index == index else 0)
+    update_titles(players, state)
+    if flash:
+        if state.display_enabled:
+            update_persistent_displays(players, state, force=True)
+        else:
+            show_temporary_osd(player, f"AUDIO {index}", AUDIO_OSD_MS)
+        render_status(players, state, f"audio {player.title_name}")
+
+
+def set_all_pause(players: list[Player], state: ControllerState) -> None:
+    next_pause = not live_client(players[0]).get_pause()
+    for player in players:
+        live_client(player).set_pause(next_pause)
+        show_temporary_osd(player, "PAUSED" if next_pause else "PLAYING", ACTION_OSD_MS)
+    render_status(players, state, "paused" if next_pause else "playing")
+
+
+def start_all_playback(players: list[Player], state: ControllerState) -> None:
+    for player in players:
+        live_client(player).set_pause(False)
+    render_status(players, state, "started")
+
+
+def seek_all(players: list[Player], state: ControllerState, seconds: float) -> None:
+    for player in players:
+        live_client(player).seek(seconds)
+        refresh_position(player)
+        show_temporary_osd(player, format_osd_state(player, state, f"seek  {seconds:+.3f}s"), ACTION_OSD_MS)
+    render_status(players, state, f"seek all {seconds:+.3f}s")
+
+
+def nudge_selected(players: list[Player], state: ControllerState, seconds: float) -> None:
+    player = get_player(players, state.selected_index)
+    if player is None:
+        render_status(players, state, f"video {state.selected_index} is not loaded")
+        return
+    live_client(player).seek(seconds)
+    player.offset_seconds += seconds
+    refresh_position(player)
+    show_temporary_osd(
+        player,
+        format_osd_state(player, state, f"delta {seconds:+.3f}s"),
+        ACTION_OSD_MS,
+    )
+    render_status(players, state, f"video {player.index} offset {player.offset_seconds:+.3f}s")
+
+
+def toggle_mute(players: list[Player], state: ControllerState) -> None:
+    state.muted = not state.muted
+    for player in players:
+        live_client(player).command("cycle", "mute")
+        show_temporary_osd(player, "MUTED" if state.muted else "UNMUTED", ACTION_OSD_MS)
+    render_status(players, state, "muted" if state.muted else "unmuted")
+
+
+def toggle_display(players: list[Player], state: ControllerState) -> None:
+    state.display_enabled = not state.display_enabled
+    if state.display_enabled:
+        refresh_positions(players)
+        update_persistent_displays(players, state, force=True)
+    else:
+        clear_persistent_displays(players)
+    render_status(players, state, state.last_action)
 
 
 def handle_key(
     key: str,
-    left: MpvClient,
-    right: MpvClient,
-    offsets: OffsetState,
-    mix: AudioMix,
+    players: list[Player],
+    state: ControllerState,
     args: argparse.Namespace,
 ) -> bool:
     if key == "quit":
         return False
     if key == "space":
-        set_both_pause(left, right)
+        set_all_pause(players, state)
     elif key == "seek_back":
-        seek_both(left, right, -args.seek_small)
+        seek_all(players, state, -args.seek_small)
     elif key == "seek_forward":
-        seek_both(left, right, args.seek_small)
+        seek_all(players, state, args.seek_small)
     elif key == "seek_back_large":
-        seek_both(left, right, -args.seek_large)
+        seek_all(players, state, -args.seek_large)
     elif key == "seek_forward_large":
-        seek_both(left, right, args.seek_large)
-    elif key == "left_nudge_back":
-        left.seek(-args.nudge_small)
-        offsets.nudge_left(-args.nudge_small)
-        print(f"left offset {offsets.left_seconds:+.3f}s")
-    elif key == "left_nudge_forward":
-        left.seek(args.nudge_small)
-        offsets.nudge_left(args.nudge_small)
-        print(f"left offset {offsets.left_seconds:+.3f}s")
-    elif key == "left_nudge_back_large":
-        left.seek(-args.nudge_large)
-        offsets.nudge_left(-args.nudge_large)
-        print(f"left offset {offsets.left_seconds:+.3f}s")
-    elif key == "left_nudge_forward_large":
-        left.seek(args.nudge_large)
-        offsets.nudge_left(args.nudge_large)
-        print(f"left offset {offsets.left_seconds:+.3f}s")
-    elif key == "right_nudge_back":
-        right.seek(-args.nudge_small)
-        offsets.nudge_right(-args.nudge_small)
-        print(f"right offset {offsets.right_seconds:+.3f}s")
-    elif key == "right_nudge_forward":
-        right.seek(args.nudge_small)
-        offsets.nudge_right(args.nudge_small)
-        print(f"right offset {offsets.right_seconds:+.3f}s")
-    elif key == "right_nudge_back_large":
-        right.seek(-args.nudge_large)
-        offsets.nudge_right(-args.nudge_large)
-        print(f"right offset {offsets.right_seconds:+.3f}s")
-    elif key == "right_nudge_forward_large":
-        right.seek(args.nudge_large)
-        offsets.nudge_right(args.nudge_large)
-        print(f"right offset {offsets.right_seconds:+.3f}s")
-    elif key == "audio_left":
-        mix.move_left()
-        set_mix(left, right, mix)
-    elif key == "audio_right":
-        mix.move_right()
-        set_mix(left, right, mix)
+        seek_all(players, state, args.seek_large)
+    elif key == "nudge_back":
+        nudge_selected(players, state, -args.nudge_small)
+    elif key == "nudge_forward":
+        nudge_selected(players, state, args.nudge_small)
+    elif key == "nudge_back_large":
+        nudge_selected(players, state, -args.nudge_large)
+    elif key == "nudge_forward_large":
+        nudge_selected(players, state, args.nudge_large)
+    elif key.startswith("select_"):
+        select_player(players, state, int(key[-1]))
+    elif key.startswith("audio_"):
+        activate_audio(players, state, int(key[-1]))
     elif key == "mute":
-        toggle_mute(left, right)
+        toggle_mute(players, state)
+    elif key == "display":
+        toggle_display(players, state)
     return True
 
 
@@ -379,44 +614,76 @@ def terminate_process(process: subprocess.Popen[bytes]) -> None:
 
 def run(args: argparse.Namespace) -> int:
     validate_inputs(args)
-    geometry = calculate_geometry(args.width, args.height, args.gap, args.x, args.y)
-    offsets = OffsetState()
-    mix = AudioMix(step=args.audio_step)
-    children: list[subprocess.Popen[bytes]] = []
+    geometries = calculate_geometry(len(args.videos), args.width, args.height, args.gap, args.x, args.y)
+    screen = args.monitor - 1 if args.monitor is not None else None
+    state = ControllerState()
+    players: list[Player] = []
 
     with tempfile.TemporaryDirectory(prefix="multi_player_") as tmp:
         tmp_path = Path(tmp)
-        left_socket = tmp_path / "left.sock"
-        right_socket = tmp_path / "right.sock"
-        children = [
-            launch_mpv(args.left_video, f"LEFT: {args.left_video.name}", geometry.left, left_socket, mix.left_volume),
-            launch_mpv(args.right_video, f"RIGHT: {args.right_video.name}", geometry.right, right_socket, mix.right_volume),
+        players = [
+            Player(
+                index=index,
+                video=video,
+                geometry=geometry,
+                socket_path=tmp_path / f"player-{index}.sock",
+            )
+            for index, (video, geometry) in enumerate(zip(args.videos, geometries, strict=True), start=1)
         ]
 
+        for player in players:
+            player.process = launch_mpv(
+                player.video,
+                player_title(player, state),
+                player.geometry,
+                player.socket_path,
+                100 if player.index == state.audio_index else 0,
+                screen,
+            )
+
         try:
-            wait_for_socket(left_socket)
-            wait_for_socket(right_socket)
-            left = MpvClient(left_socket)
-            right = MpvClient(right_socket)
+            for player in players:
+                wait_for_socket(player.socket_path)
+                player.client = MpvClient(player.socket_path)
+            for player in players:
+                wait_for_player_ready(player)
+            update_titles(players, state)
+            activate_audio(players, state, state.audio_index, flash=False)
             print_help()
+            start_all_playback(players, state)
 
             old_term = termios.tcgetattr(sys.stdin)
             try:
                 tty.setraw(sys.stdin.fileno())
-                while all(child.poll() is None for child in children):
-                    readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                next_status_refresh = time.monotonic() + STATUS_REFRESH_SECONDS
+                while all(player.process is not None and player.process.poll() is None for player in players):
+                    now = time.monotonic()
+                    timeout = next_loop_timeout(now, next_status_refresh, next_persistent_restore_time(players, state))
+                    readable, _, _ = select.select([sys.stdin], [], [], timeout)
+                    now = time.monotonic()
+                    restore_due_persistent_displays(players, state, now)
+                    if now >= next_status_refresh:
+                        refresh_positions(players)
+                        update_persistent_displays(players, state)
+                        print_status(format_status(players, state))
+                        next_status_refresh = now + STATUS_REFRESH_SECONDS
                     if not readable:
                         continue
                     key = read_key()
-                    if key is not None and not handle_key(key, left, right, offsets, mix, args):
+                    if key is None:
+                        continue
+                    if not handle_key(key, players, state, args):
                         break
+                    if key in SEEK_KEYS:
+                        flush_pending_input()
             finally:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
                 print()
         finally:
-            for child in children:
-                terminate_process(child)
-            print_offset_summary(offsets)
+            for player in players:
+                if player.process is not None:
+                    terminate_process(player.process)
+            print_offset_summary(players)
 
     return 0
 
