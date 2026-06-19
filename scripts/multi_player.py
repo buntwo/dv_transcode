@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Side-by-side synchronized video comparison using mpv."""
+"""Side-by-side synchronized multi-player video control using mpv."""
 
 from __future__ import annotations
 
@@ -384,7 +384,7 @@ def run(args: argparse.Namespace) -> int:
     mix = AudioMix(step=args.audio_step)
     children: list[subprocess.Popen[bytes]] = []
 
-    with tempfile.TemporaryDirectory(prefix="sync_compare_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="multi_player_") as tmp:
         tmp_path = Path(tmp)
         left_socket = tmp_path / "left.sock"
         right_socket = tmp_path / "right.sock"

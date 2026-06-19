@@ -1,7 +1,94 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
+
+
+def format_progress(current: int, total: int, label: str | Path, width: int = 20) -> str:
+    """Format a simple file-level progress bar."""
+
+    filled = round(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {current}/{total} {label}"
+
+
+def needs_cjk_font(char: str) -> bool:
+    codepoint = ord(char)
+    return (
+        0x3040 <= codepoint <= 0x30FF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xAC00 <= codepoint <= 0xD7AF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2FA1F
+    )
+
+
+def split_text_runs(text: str, primary_font: str, cjk_font: str) -> list[tuple[str, str]]:
+    if not text:
+        return []
+    runs: list[tuple[str, str]] = []
+    current_font = cjk_font if needs_cjk_font(text[0]) else primary_font
+    current_chars = [text[0]]
+    for char in text[1:]:
+        font = cjk_font if needs_cjk_font(char) else primary_font
+        if font == current_font:
+            current_chars.append(char)
+        else:
+            runs.append(("".join(current_chars), current_font))
+            current_chars = [char]
+            current_font = font
+    runs.append(("".join(current_chars), current_font))
+    return runs
+
+
+def measure_text_width(text: str, font: str, point_size: int) -> int:
+    if not text:
+        return 0
+    cmd = [
+        "magick",
+        "-background",
+        "none",
+        "-fill",
+        "black",
+        "-font",
+        font,
+        "-pointsize",
+        str(point_size),
+        f"label:{text}",
+        "-format",
+        "%w",
+        "info:",
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return int(result.stdout.strip())
+
+
+def scaled_point_size(point_size: int, scale: float) -> int:
+    return max(1, round(point_size * scale))
+
+
+def build_text_annotations(
+    text: str,
+    *,
+    primary_font: str,
+    cjk_font: str,
+    cjk_font_scale: float,
+    point_size: int,
+    x: int,
+    y: int,
+    cjk_y_offset: int = 0,
+) -> list[str]:
+    args: list[str] = []
+    current_x = x
+    for run_text, run_font in split_text_runs(text, primary_font, cjk_font):
+        is_cjk_run = run_font == cjk_font
+        run_point_size = scaled_point_size(point_size, cjk_font_scale) if is_cjk_run else point_size
+        run_y = y + cjk_y_offset if is_cjk_run else y
+        args.extend(["-font", run_font, "-pointsize", str(run_point_size), "-annotate", f"+{current_x}+{run_y}", run_text])
+        current_x += measure_text_width(run_text, run_font, run_point_size)
+    return args
 
 
 def sibling_dir_for_path(

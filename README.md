@@ -148,6 +148,43 @@ Digital8 validation behavior:
 - Keeps the first observed `rdt` per whole playback second and writes one-second SRT cues.
 - Truncates fractional `rdt` values to whole seconds before writing subtitles.
 
+`scripts/contact_sheet.py`
+
+- Generates timestamped PNG contact sheets for one or more videos.
+- Defaults to a 5x4 grid, a 2340px sheet width, and a header with filename, size, duration, dimensions, frame rate, video codec, and audio details.
+- Derives thumbnail tile dimensions from the sheet width, grid columns, spacing, and each video's display aspect ratio.
+- Samples frames at evenly spaced interior timestamps using fast ffmpeg input seeks.
+- Requires `ffmpeg` with the `drawtext` filter and ImageMagick `magick`.
+- Writes `<input>.contact_sheet.png` unless `--output` is supplied.
+- Use `-o`/`--output-dir` to write that auto-generated filename into a separate directory.
+- `--output` is only valid with one input.
+
+Example:
+
+```bash
+uv run python scripts/contact_sheet.py Access/example.mp4
+uv run python scripts/contact_sheet.py --output-dir visualizations Access/example.mp4
+uv run python scripts/contact_sheet.py --output-dir visualizations Access/*.mp4
+```
+
+`scripts/spectrogram.py`
+
+- Generates audio spectrogram PNGs for one or more media files.
+- Uses ffmpeg `showspectrumpic` with separate channels, log amplitude scale, linear frequency scale, and legend enabled.
+- Defaults to the full input duration and a 1920x1080 PNG.
+- Adds the source filename at the upper-left using the same mixed-language font fallback as contact sheets.
+- Covers the lower-left libavfilter credit after rendering.
+- Writes `<input>.spectrogram.png` unless `--output` is supplied.
+- Use `-o`/`--output-dir` to write auto-generated filenames into a separate directory.
+- `--output` is only valid with one input.
+
+Example:
+
+```bash
+uv run python scripts/spectrogram.py -o visualizations Access/example.mp4
+uv run python scripts/spectrogram.py -o visualizations Access/*.mp4
+```
+
 Internal helpers:
 
 - `scripts/transcode_naming.py`: access filename construction from `Originals/...` relative paths
