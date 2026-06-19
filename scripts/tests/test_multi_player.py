@@ -59,6 +59,9 @@ class FakeClient:
     def seek(self, seconds: float) -> None:
         self.commands.append(("seek", seconds))
 
+    def seek_absolute(self, seconds: float) -> None:
+        self.commands.append(("seek_absolute", seconds))
+
     def set_volume(self, volume: int) -> None:
         self.commands.append(("volume", volume))
 
@@ -109,9 +112,34 @@ class TestMultiPlayerArgs(unittest.TestCase):
         self.assertEqual(args.gap, 0)
         self.assertEqual(args.seek_small, multi_player.DEFAULT_SEEK_SMALL)
         self.assertEqual(args.nudge_small, multi_player.DEFAULT_NUDGE_SMALL)
+        self.assertIsNone(args.ss1)
+        self.assertIsNone(args.ss2)
+        self.assertIsNone(args.ss3)
+        self.assertIsNone(args.ss4)
 
         self.assertEqual(len(multi_player.parse_args(["1.mp4", "2.mp4", "3.mp4"]).videos), 3)
         self.assertEqual(len(multi_player.parse_args(["1.mp4", "2.mp4", "3.mp4", "4.mp4"]).videos), 4)
+
+    def test_parse_args_accepts_numbered_start_seeks(self) -> None:
+        args = multi_player.parse_args(["-ss1", "01:02.5", "-ss2", "1:02:03.5", "one.mp4", "two.mp4"])
+
+        self.assertEqual(args.ss1, 62.5)
+        self.assertEqual(args.ss2, 3723.5)
+
+    def test_parse_args_rejects_start_seek_for_unloaded_video(self) -> None:
+        with self.assertRaises(SystemExit):
+            multi_player.parse_args(["-ss3", "10", "one.mp4", "two.mp4"])
+
+    def test_parse_timestamp_rejects_invalid_values(self) -> None:
+        for value in ("-1", "nan", "inf", "1:2:3:4", "01:", "1.5:02", "abc"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    multi_player.parse_timestamp(value)
+
+    def test_collect_start_times_uses_zero_for_unspecified_videos(self) -> None:
+        args = multi_player.parse_args(["-ss2", "12.5", "one.mp4", "two.mp4", "three.mp4"])
+
+        self.assertEqual(multi_player.collect_start_times(args), [0.0, 12.5, 0.0])
 
     def test_parse_args_accepts_short_position_flags_and_monitor(self) -> None:
         args = multi_player.parse_args(["-x", "10", "-y", "20", "--monitor", "2", "one.mp4", "two.mp4"])
@@ -242,14 +270,24 @@ class TestMultiPlayerKeys(unittest.TestCase):
     def test_normalize_key_maps_requested_shortcuts(self) -> None:
         cases = {
             b" ": "space",
-            b"\x1b[D": "seek_back",
-            b"\x1b[C": "seek_forward",
-            b"\x1b[1;2D": "seek_back_large",
-            b"\x1b[1;2C": "seek_forward_large",
-            b",": "nudge_back",
-            b".": "nudge_forward",
-            b"<": "nudge_back_large",
-            b">": "nudge_forward_large",
+            b"\r": "selected_pause",
+            b"\n": "selected_pause",
+            b"z": "seek_all_back_xs",
+            b"x": "seek_all_forward_xs",
+            b"Z": "seek_all_back_s",
+            b"X": "seek_all_forward_s",
+            b"a": "seek_all_back_m",
+            b"s": "seek_all_forward_m",
+            b"A": "seek_all_back_l",
+            b"S": "seek_all_forward_l",
+            b",": "nudge_back_xs",
+            b".": "nudge_forward_xs",
+            b"<": "nudge_back_s",
+            b">": "nudge_forward_s",
+            b"k": "nudge_back_m",
+            b"l": "nudge_forward_m",
+            b"K": "nudge_back_l",
+            b"L": "nudge_forward_l",
             b"1": "select_1",
             b"2": "select_2",
             b"3": "select_3",
@@ -268,12 +306,24 @@ class TestMultiPlayerKeys(unittest.TestCase):
                 self.assertEqual(multi_player.normalize_key(sequence), expected)
 
     def test_normalize_key_ignores_removed_shortcuts(self) -> None:
-        for sequence in (b"c", b"v", b"C", b"V", b"g", b"h", b"0"):
+        for sequence in (b"\x1b[D", b"\x1b[C", b"\x1b[1;2D", b"\x1b[1;2C", b"c", b"v", b"C", b"V", b"g", b"h", b"0"):
             with self.subTest(sequence=sequence):
                 self.assertIsNone(multi_player.normalize_key(sequence))
 
     def test_seek_keys_are_marked_for_input_flush(self) -> None:
-        self.assertEqual(multi_player.SEEK_KEYS, {"seek_back", "seek_forward", "seek_back_large", "seek_forward_large"})
+        self.assertEqual(
+            multi_player.SEEK_KEYS,
+            {
+                "seek_all_back_xs",
+                "seek_all_forward_xs",
+                "seek_all_back_s",
+                "seek_all_forward_s",
+                "seek_all_back_m",
+                "seek_all_forward_m",
+                "seek_all_back_l",
+                "seek_all_forward_l",
+            },
+        )
 
 
 class TestMultiPlayerControls(unittest.TestCase):
@@ -309,6 +359,19 @@ class TestMultiPlayerControls(unittest.TestCase):
             self.assertIn(("pause", False), player.client.commands)
             self.assertNotIn(("show_text", "PLAYING", multi_player.ACTION_OSD_MS), player.client.commands)
         self.assertEqual(state.last_action, "started")
+
+    def test_preseek_players_moves_requested_players_before_playback(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState()
+
+        multi_player.preseek_players(players, [0.0, 12.5, 62.0], state)
+
+        self.assertNotIn(("seek_absolute", 0.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 12.5), players[1].client.commands)
+        self.assertIn(("seek_absolute", 62.0), players[2].client.commands)
+        for player in players:
+            self.assertIn(("time_pos",), player.client.commands)
+        self.assertEqual(state.last_action, "pre-seeked")
 
     def test_controller_state_starts_with_persistent_display_enabled(self) -> None:
         self.assertTrue(multi_player.ControllerState().display_enabled)
