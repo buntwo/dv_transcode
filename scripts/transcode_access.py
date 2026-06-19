@@ -10,6 +10,7 @@ from transcode_core import Config
 from transcode_core import add_common_transcode_args
 from transcode_core import config_from_args
 from transcode_core import run_transcode_workflow
+from transcode_core import validate_common_transcode_args
 
 
 def parse_args() -> tuple[Config, list[Path]]:
@@ -32,6 +33,7 @@ def parse_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--log-dir", type=Path)
     parser.add_argument("input_files", nargs="+")
     args = parser.parse_args()
+    validate_common_transcode_args(parser, args)
 
     cfg = config_from_args(args, layout="access")
     return cfg, [Path(p) for p in args.input_files]

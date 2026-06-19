@@ -42,10 +42,14 @@ class Config:
     denoise: str
     q: int
     codec: str
+    encoder: str
+    preset: str | None
+    crf: float | None
     deint_mode: str
     map_both_audio: bool
     log_level: str
     assume_yes: bool
+    no_logs: bool
     output_suffix: str
     originals_dirname: str
     access_dirname: str
@@ -156,10 +160,18 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
     parser.add_argument("--q", type=int, default=70)
     parser.add_argument("--codec", choices=["h264", "hevc"], default="hevc")
+    parser.add_argument("--encoder", choices=["videotoolbox", "libx265"], default="videotoolbox")
+    parser.add_argument(
+        "--preset",
+        choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+        help="libx265 preset; only valid with --encoder libx265 (default: medium)",
+    )
+    parser.add_argument("--crf", type=float, help="libx265 CRF; only valid with --encoder libx265 (default: 20)")
     parser.add_argument("--deint-mode", choices=["send_frame", "send_field"], default="send_field")
     parser.add_argument("--map-both-audio", action="store_true")
     parser.add_argument("--log-level", choices=["quiet", "error", "warning", "info"], default="warning")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--no-logs", action="store_true", help="Do not write persistent ffmpeg or command logs")
     parser.add_argument("--no-validate-duration", action="store_true")
     parser.add_argument("--validate-duration-tolerance", type=float, default=DEFAULT_VALIDATE_DURATION_TOLERANCE)
     parser.add_argument("--vhs-notch", choices=["auto", "ntsc", "pal", "off"], default="auto")
@@ -167,11 +179,24 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-suffix", default="")
 
 
+def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Validate cross-option constraints for shared transcode arguments."""
+    if args.encoder == "videotoolbox":
+        if args.preset is not None:
+            parser.error("--preset is only valid with --encoder libx265")
+        if args.crf is not None:
+            parser.error("--crf is only valid with --encoder libx265")
+    elif args.codec != "hevc":
+        parser.error("--encoder libx265 requires --codec hevc")
+
+
 def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
     """Build a Config from parsed CLI args."""
     mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
     mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
+    preset = args.preset if args.preset is not None else ("medium" if args.encoder == "libx265" else None)
+    crf = args.crf if args.crf is not None else (20.0 if args.encoder == "libx265" else None)
 
     return Config(
         mode=args.mode,
@@ -185,10 +210,14 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         denoise=denoise,
         q=args.q,
         codec=args.codec,
+        encoder=args.encoder,
+        preset=preset,
+        crf=crf,
         deint_mode=args.deint_mode,
         map_both_audio=args.map_both_audio,
         log_level=args.log_level,
         assume_yes=args.yes,
+        no_logs=args.no_logs,
         output_suffix=args.output_suffix,
         originals_dirname=getattr(args, "originals_dirname", "Originals"),
         access_dirname=args.access_dirname,
@@ -221,6 +250,7 @@ def parse_archive_args() -> tuple[Config, list[Path]]:
     parser.add_argument("--logs-dirname", default="Logs")
     parser.add_argument("input_files", nargs="+")
     args = parser.parse_args()
+    validate_common_transcode_args(parser, args)
 
     cfg = config_from_args(args, layout="archive")
     input_files = [Path(p) for p in args.input_files]
@@ -798,20 +828,34 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
     if audio_filter := build_audio_filter(cfg, paths.input_file):
         args += ["-af", audio_filter]
 
-    if cfg.codec == "h264":
+    if cfg.encoder == "libx265":
+        args += [
+            "-c:v",
+            "libx265",
+            "-preset",
+            cfg.preset or "medium",
+            "-crf",
+            f"{cfg.crf if cfg.crf is not None else 20:g}",
+            "-profile:v",
+            "main",
+            "-pix_fmt",
+            "yuv420p",
+            "-tag:v",
+            "hvc1",
+        ]
+    elif cfg.codec == "h264":
         args += ["-c:v", "h264_videotoolbox", "-profile:v", "high", "-coder", "cabac"]
     else:
         args += ["-c:v", "hevc_videotoolbox", "-profile:v", "main", "-tag:v", "hvc1"]
 
-    args += [
-        "-spatial_aq", "1",
-        "-max_ref_frames", "4",
-        "-q:v", str(cfg.q),
-        "-color_range", "tv",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-    ]
+    if cfg.encoder == "videotoolbox":
+        args += [
+            "-spatial_aq", "1",
+            "-max_ref_frames", "4",
+            "-q:v", str(cfg.q),
+        ]
+
+    args += ["-g", "60", "-color_range", "tv", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
 
     return args + (["-f", "matroska", "-"] if preview else [str(paths.output_file)])
 
@@ -892,7 +936,10 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
     print(f"Format: {cfg.format_type}")
     print(f"Input: {paths.input_file}")
     print(f"Output dir: {paths.out_dir}")
-    print(f"Log dir: {paths.log_dir}")
+    if cfg.no_logs:
+        print("Logs: disabled")
+    else:
+        print(f"Log dir: {paths.log_dir}")
     if cfg.start or cfg.end:
         print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
     print(f"Codec: {cfg.codec}")
@@ -912,7 +959,9 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
         print("\nPreview pipeline:\n")
     else:
         print(f"Output: {paths.output_file}")
-        print(f"Log: {paths.ffmpeg_log_file}\n")
+        if not cfg.no_logs:
+            print(f"Log: {paths.ffmpeg_log_file}")
+        print()
         print("Running command:\n")
 
     print(shjoin(ffmpeg_args))
@@ -1016,10 +1065,14 @@ def tee_stream(stream, outputs: list, mirror_to_stderr: bool = False) -> None:
         stream.close()
 
 
-def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None = None) -> int:
+def run_ffmpeg(ffmpeg_args: list[str], log_path: Path | None, preview_stem: str | None = None) -> int:
     """Run ffmpeg, optionally piping preview output to ffplay, while teeing stderr to a log."""
-    with log_path.open("wb") as log_file:
+    log_file = log_path.open("wb") if log_path is not None else None
+    try:
         if preview_stem is None:
+            if log_file is None:
+                proc = subprocess.Popen(ffmpeg_args, bufsize=0)
+                return proc.wait()
             proc = subprocess.Popen(ffmpeg_args, stderr=subprocess.PIPE, bufsize=0)
             assert proc.stderr is not None
             t = threading.Thread(target=tee_stream, args=(proc.stderr, [log_file], True), daemon=True)
@@ -1028,9 +1081,9 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
             t.join()
             return rc
 
-        ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        ffmpeg_stderr = None if log_file is None else subprocess.PIPE
+        ffmpeg_proc = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=ffmpeg_stderr, bufsize=0)
         assert ffmpeg_proc.stdout is not None
-        assert ffmpeg_proc.stderr is not None
 
         ffplay_proc = subprocess.Popen(
             ["ffplay", "-hide_banner", "-window_title", f"{preview_stem} preview", "-"],
@@ -1039,13 +1092,20 @@ def run_ffmpeg(ffmpeg_args: list[str], log_path: Path, preview_stem: str | None 
         )
         ffmpeg_proc.stdout.close()
 
-        t = threading.Thread(target=tee_stream, args=(ffmpeg_proc.stderr, [log_file], True), daemon=True)
-        t.start()
+        t = None
+        if log_file is not None:
+            assert ffmpeg_proc.stderr is not None
+            t = threading.Thread(target=tee_stream, args=(ffmpeg_proc.stderr, [log_file], True), daemon=True)
+            t.start()
         ffplay_rc = ffplay_proc.wait()
         ffmpeg_rc = ffmpeg_proc.wait()
-        t.join()
+        if t is not None:
+            t.join()
 
         return ffmpeg_rc if ffmpeg_rc != 0 else ffplay_rc
+    finally:
+        if log_file is not None:
+            log_file.close()
 
 
 def build_process_result(
@@ -1082,13 +1142,14 @@ def prepare_digital8_sidecars(cfg: Config, paths: Paths) -> float | None:
 
 def process_preview_file(cfg: Config, input_file: Path) -> ProcessResult:
     """Process one input file in preview mode."""
-    persistent_paths = build_paths(cfg, input_file)
+    persistent_paths = build_paths(cfg, input_file, create_dirs=not cfg.no_logs)
     with tempfile.TemporaryDirectory(prefix=f"{persistent_paths.stem}_preview_") as tmp:
         paths = build_runtime_paths(persistent_paths, Path(tmp))
         prepare_digital8_sidecars(cfg, paths)
         ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
         print_summary(cfg, paths, ffmpeg_args, preview=True)
-        rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file, preview_stem=paths.stem)
+        log_path = None if cfg.no_logs else paths.ffmpeg_log_file
+        rc = run_ffmpeg(ffmpeg_args, log_path, preview_stem=paths.stem)
         return build_process_result(
             paths,
             output_file=None,
@@ -1101,21 +1162,34 @@ def process_preview_file(cfg: Config, input_file: Path) -> ProcessResult:
 
 def process_transcode_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
     """Process one input file in normal transcode mode."""
-    paths = build_paths(cfg, input_file)
-    sidecar_seconds = prepare_digital8_sidecars(cfg, paths)
+    paths = build_paths(cfg, input_file, create_dirs=not cfg.no_logs)
+    if cfg.no_logs:
+        paths.out_dir.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=False)
-    print_summary(cfg, paths, ffmpeg_args, preview=False)
-
-    if prompt:
-        input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
-
-    start = time.perf_counter()
+    runtime_context = tempfile.TemporaryDirectory(prefix=f"{paths.stem}_transcode_") if cfg.no_logs else None
     try:
-        write_command_log(cfg, paths, ffmpeg_args)
-        rc = run_ffmpeg(ffmpeg_args, paths.ffmpeg_log_file)
+        runtime_paths = build_runtime_paths(paths, Path(runtime_context.name)) if runtime_context is not None else paths
+        sidecar_seconds = prepare_digital8_sidecars(cfg, runtime_paths)
+        if runtime_paths.output_file != paths.output_file:
+            paths.output_file = runtime_paths.output_file
+
+        ffmpeg_args = build_ffmpeg_args(cfg, runtime_paths, build_vf(cfg, runtime_paths), preview=False)
+        print_summary(cfg, paths, ffmpeg_args, preview=False)
+
+        if prompt:
+            input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
+
+        start = time.perf_counter()
+        try:
+            if not cfg.no_logs:
+                write_command_log(cfg, paths, ffmpeg_args)
+            log_path = None if cfg.no_logs else paths.ffmpeg_log_file
+            rc = run_ffmpeg(ffmpeg_args, log_path)
+        finally:
+            transcode_seconds = time.perf_counter() - start
     finally:
-        transcode_seconds = time.perf_counter() - start
+        if runtime_context is not None:
+            runtime_context.cleanup()
     if rc == 0:
         print(f"Done: {paths.output_file}")
     return build_process_result(

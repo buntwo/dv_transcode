@@ -28,10 +28,14 @@ def make_config(**overrides) -> transcode3.Config:
         "denoise": "off",
         "q": 70,
         "codec": "hevc",
+        "encoder": "videotoolbox",
+        "preset": None,
+        "crf": None,
         "deint_mode": "send_field",
         "map_both_audio": False,
         "log_level": "warning",
         "assume_yes": True,
+        "no_logs": False,
         "output_suffix": "",
         "originals_dirname": "Originals",
         "access_dirname": "Access",
@@ -74,6 +78,19 @@ class TestParseArgs(unittest.TestCase):
 
         self.assertFalse(cfg.validate_duration)
 
+    def test_parse_args_supports_no_logs(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--no-logs",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertTrue(cfg.no_logs)
+
     def test_parse_args_supports_vhs_defaults(self) -> None:
         argv = [
             "transcode3.py",
@@ -90,7 +107,72 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.mask_bottom, 12)
         self.assertEqual(cfg.vhs_notch, "auto")
         self.assertEqual(cfg.audio_channel, "keep")
+        self.assertEqual(cfg.encoder, "videotoolbox")
+        self.assertIsNone(cfg.preset)
+        self.assertIsNone(cfg.crf)
         self.assertEqual(input_files, [Path("Originals/set/tape/out.mkv")])
+
+    def test_parse_args_supports_libx265_defaults(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "--encoder",
+            "libx265",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.codec, "hevc")
+        self.assertEqual(cfg.preset, "medium")
+        self.assertEqual(cfg.crf, 20.0)
+
+    def test_parse_args_supports_libx265_preset_and_crf(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "--encoder",
+            "libx265",
+            "--preset",
+            "slow",
+            "--crf",
+            "22",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 22.0)
+
+    def test_parse_args_rejects_libx265_options_with_videotoolbox(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "--preset",
+            "slow",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
+
+    def test_parse_args_rejects_libx265_with_h264_codec(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "--encoder",
+            "libx265",
+            "--codec",
+            "h264",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
 
     def test_help_mentions_out_dv_example(self) -> None:
         argv = ["transcode3.py", "--help"]
@@ -536,6 +618,74 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("-color_trc", args)
         self.assertNotIn("-colorspace", args)
 
+    def test_videotoolbox_args_use_quality_options(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(make_config(codec="hevc"), paths, "null", preview=False)
+
+        self.assertIn("hevc_videotoolbox", args)
+        self.assertIn("-spatial_aq", args)
+        self.assertIn("-max_ref_frames", args)
+        self.assertIn("-q:v", args)
+        self.assertIn("-g", args)
+        self.assertIn("60", args)
+        self.assertNotIn("libx265", args)
+        self.assertNotIn("-crf", args)
+        self.assertNotIn("-preset", args)
+
+    def test_libx265_args_use_preset_crf_and_apple_hevc_tag(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(
+            make_config(encoder="libx265", preset="slow", crf=22.0),
+            paths,
+            "null",
+            preview=False,
+        )
+
+        self.assertIn("libx265", args)
+        self.assertIn("-preset", args)
+        self.assertIn("slow", args)
+        self.assertIn("-crf", args)
+        self.assertIn("22", args)
+        self.assertIn("-pix_fmt", args)
+        self.assertIn("yuv420p", args)
+        self.assertIn("-tag:v", args)
+        self.assertIn("hvc1", args)
+        self.assertIn("-g", args)
+        self.assertIn("60", args)
+        self.assertIn("-movflags", args)
+        self.assertIn("+faststart", args)
+        self.assertNotIn("-spatial_aq", args)
+        self.assertNotIn("-max_ref_frames", args)
+        self.assertNotIn("-q:v", args)
+
     def test_vhs_audio_notch_auto_uses_detected_ntsc_frequency(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),
@@ -716,6 +866,47 @@ class TestTranscodeAccess(unittest.TestCase):
             cfg, _ = transcode_access.parse_args()
 
         self.assertEqual(cfg.audio_channel, "right")
+
+    def test_access_parse_args_supports_no_logs(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--no-logs",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertTrue(cfg.no_logs)
+
+    def test_access_parse_args_supports_libx265_defaults(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--encoder",
+            "libx265",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.preset, "medium")
+        self.assertEqual(cfg.crf, 20.0)
+
+    def test_access_parse_args_rejects_libx265_options_with_videotoolbox(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--crf",
+            "20",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode_access.parse_args()
 
     def test_access_build_paths_uses_parent_parent_source_root_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1012,6 +1203,106 @@ class TestTranscodeTiming(unittest.TestCase):
             self.assertEqual(result.format_type, "video8")
             self.assertEqual(result.denoise, "light")
             self.assertEqual(result.mask_bottom, 7)
+
+    def test_process_one_file_no_logs_skips_command_log_and_ffmpeg_log_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "input.dv"
+            input_file.parent.mkdir()
+            input_file.write_bytes(b"")
+
+            paths = transcode3.Paths(
+                input_file=input_file,
+                stem="input",
+                out_dir=root / "Access",
+                log_dir=root / "Logs",
+                output_file=root / "Access" / "output.mkv",
+                ffmpeg_log_file=root / "Logs" / "input_access_20260421_120000.log",
+                command_log_file=root / "Logs" / "input_transcode_cmd_20260421_120000.log",
+                csv_raw=root / "Logs" / "input.frameinfo.csv",
+                csv_with_play=root / "Logs" / "input.frameinfo.with_play_time.csv",
+                srt_file=root / "Logs" / "input.record_time_overlay.srt",
+                add_play_time_script=root / "add_play_time_columns.py",
+                create_srt_script=root / "create_srt.py",
+            )
+
+            cfg = make_config(mode="transcode", format_type="video8", no_logs=True)
+
+            with (
+                patch.object(transcode3, "build_paths", return_value=paths) as mock_build_paths,
+                patch.object(transcode3, "write_command_log") as mock_write_command_log,
+                patch.object(transcode3, "run_ffmpeg", return_value=0) as mock_run_ffmpeg,
+                patch.object(transcode3.time, "perf_counter", side_effect=[100.0, 104.2]),
+            ):
+                result = transcode3.process_one_file(cfg, input_file, prompt=False)
+
+            mock_build_paths.assert_called_once_with(cfg, input_file, create_dirs=False)
+            mock_write_command_log.assert_not_called()
+            _, log_path = mock_run_ffmpeg.call_args.args[:2]
+            self.assertIsNone(log_path)
+            self.assertTrue(paths.out_dir.is_dir())
+            self.assertFalse(paths.log_dir.exists())
+            self.assertEqual(result.rc, 0)
+
+    def test_process_one_file_no_logs_uses_temp_digital8_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "Originals" / "input.dv"
+            input_file.parent.mkdir()
+            input_file.write_bytes(b"")
+
+            paths = transcode3.Paths(
+                input_file=input_file,
+                stem="input",
+                out_dir=root / "Access",
+                log_dir=root / "Logs",
+                output_file=root / "Access" / "output.mp4",
+                ffmpeg_log_file=root / "Logs" / "input_access_20260421_120000.log",
+                command_log_file=root / "Logs" / "input_transcode_cmd_20260421_120000.log",
+                csv_raw=root / "Logs" / "input.frameinfo.csv",
+                csv_with_play=root / "Logs" / "input.frameinfo.with_play_time.csv",
+                srt_file=root / "Logs" / "input.record_time_overlay.srt",
+                add_play_time_script=root / "add_play_time_columns.py",
+                create_srt_script=root / "create_srt.py",
+            )
+            runtime_dir = root / "runtime"
+            runtime_dir.mkdir()
+            captured: dict[str, object] = {}
+
+            class FakeTempDir:
+                name = str(runtime_dir)
+
+                def cleanup(self) -> None:
+                    pass
+
+            def fake_sidecars(arg_paths: transcode3.Paths) -> None:
+                captured["sidecar_paths"] = arg_paths
+                arg_paths.output_file = arg_paths.output_file.with_name(f"20260421_{arg_paths.output_file.name}")
+
+            cfg = make_config(mode="transcode", format_type="digital8", no_logs=True)
+
+            with (
+                patch.object(transcode3, "build_paths", return_value=paths),
+                patch.object(transcode3.tempfile, "TemporaryDirectory", return_value=FakeTempDir()),
+                patch.object(transcode3, "generate_digital8_sidecars", side_effect=fake_sidecars),
+                patch.object(transcode3, "write_command_log") as mock_write_command_log,
+                patch.object(transcode3, "run_ffmpeg", return_value=0) as mock_run_ffmpeg,
+                patch.object(transcode3.time, "perf_counter", side_effect=[10.0, 12.0, 100.0, 104.0]),
+            ):
+                result = transcode3.process_one_file(cfg, input_file, prompt=False)
+
+            sidecar_paths = captured["sidecar_paths"]
+            assert isinstance(sidecar_paths, transcode3.Paths)
+            self.assertEqual(sidecar_paths.csv_raw.parent, runtime_dir)
+            self.assertEqual(sidecar_paths.csv_with_play.parent, runtime_dir)
+            self.assertEqual(sidecar_paths.srt_file.parent, runtime_dir)
+            self.assertIn(str(runtime_dir / paths.srt_file.name), " ".join(mock_run_ffmpeg.call_args.args[0]))
+            _, log_path = mock_run_ffmpeg.call_args.args[:2]
+            self.assertIsNone(log_path)
+            mock_write_command_log.assert_not_called()
+            self.assertFalse(paths.log_dir.exists())
+            self.assertEqual(result.output_file, root / "Access" / "20260421_output.mp4")
+            self.assertEqual(result.rc, 0)
 
     def test_main_prints_transcode_time_summary(self) -> None:
         cfg = make_config(mode="transcode")
