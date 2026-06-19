@@ -50,9 +50,10 @@ class TestMpvClientResponseParsing(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self, pause: bool = False, time_pos: float | None = None) -> None:
+    def __init__(self, pause: bool = False, time_pos: float | None = None, paused_for_cache: bool = False) -> None:
         self.pause = pause
         self.time_pos = time_pos
+        self.paused_for_cache = paused_for_cache
         self.time_positions: list[float | None] | None = None
         self.commands: list[tuple[object, ...]] = []
 
@@ -68,8 +69,15 @@ class FakeClient:
     def set_title(self, title: str) -> None:
         self.commands.append(("title", title))
 
+    def set_osd_font_size(self, size: int) -> None:
+        self.commands.append(("osd_font_size", size))
+
     def get_pause(self) -> bool:
         return self.pause
+
+    def get_paused_for_cache(self) -> bool:
+        self.commands.append(("paused_for_cache",))
+        return self.paused_for_cache
 
     def get_time_pos(self) -> float | None:
         self.commands.append(("time_pos",))
@@ -78,6 +86,7 @@ class FakeClient:
         return self.time_pos
 
     def set_pause(self, pause: bool) -> None:
+        self.pause = pause
         self.commands.append(("pause", pause))
 
     def show_text(self, text: str, duration_ms: int) -> None:
@@ -110,8 +119,12 @@ class TestMultiPlayerArgs(unittest.TestCase):
         self.assertEqual(args.width, multi_player.DEFAULT_WIDTH)
         self.assertEqual(args.height, multi_player.DEFAULT_HEIGHT)
         self.assertEqual(args.gap, 0)
+        self.assertEqual(args.x, multi_player.DEFAULT_X)
+        self.assertEqual(args.y, multi_player.DEFAULT_Y)
+        self.assertEqual(args.seek_medium, multi_player.DEFAULT_SEEK_MEDIUM)
         self.assertEqual(args.seek_small, multi_player.DEFAULT_SEEK_SMALL)
         self.assertEqual(args.nudge_small, multi_player.DEFAULT_NUDGE_SMALL)
+        self.assertIsNone(args.ss)
         self.assertIsNone(args.ss1)
         self.assertIsNone(args.ss2)
         self.assertIsNone(args.ss3)
@@ -140,6 +153,11 @@ class TestMultiPlayerArgs(unittest.TestCase):
         args = multi_player.parse_args(["-ss2", "12.5", "one.mp4", "two.mp4", "three.mp4"])
 
         self.assertEqual(multi_player.collect_start_times(args), [0.0, 12.5, 0.0])
+
+    def test_collect_start_times_uses_global_start_seek_with_numbered_overrides(self) -> None:
+        args = multi_player.parse_args(["-ss", "5", "-ss2", "12.5", "one.mp4", "two.mp4", "three.mp4"])
+
+        self.assertEqual(multi_player.collect_start_times(args), [5.0, 12.5, 5.0])
 
     def test_parse_args_accepts_short_position_flags_and_monitor(self) -> None:
         args = multi_player.parse_args(["-x", "10", "-y", "20", "--monitor", "2", "one.mp4", "two.mp4"])
@@ -272,14 +290,14 @@ class TestMultiPlayerKeys(unittest.TestCase):
             b" ": "space",
             b"\r": "selected_pause",
             b"\n": "selected_pause",
-            b"z": "seek_all_back_xs",
-            b"x": "seek_all_forward_xs",
-            b"Z": "seek_all_back_s",
-            b"X": "seek_all_forward_s",
-            b"a": "seek_all_back_m",
-            b"s": "seek_all_forward_m",
-            b"A": "seek_all_back_l",
-            b"S": "seek_all_forward_l",
+            b"z": "seek_all_back_s",
+            b"x": "seek_all_forward_s",
+            b"Z": "seek_all_back_m",
+            b"X": "seek_all_forward_m",
+            b"a": "seek_all_back_l",
+            b"s": "seek_all_forward_l",
+            b"A": "seek_all_back_xl",
+            b"S": "seek_all_forward_xl",
             b",": "nudge_back_xs",
             b".": "nudge_forward_xs",
             b"<": "nudge_back_s",
@@ -298,6 +316,7 @@ class TestMultiPlayerKeys(unittest.TestCase):
             b"$": "audio_4",
             b"m": "mute",
             b"d": "display",
+            b"t": "sync_to_selected_time",
             b"q": "quit",
         }
 
@@ -314,14 +333,14 @@ class TestMultiPlayerKeys(unittest.TestCase):
         self.assertEqual(
             multi_player.SEEK_KEYS,
             {
-                "seek_all_back_xs",
-                "seek_all_forward_xs",
                 "seek_all_back_s",
                 "seek_all_forward_s",
                 "seek_all_back_m",
                 "seek_all_forward_m",
                 "seek_all_back_l",
                 "seek_all_forward_l",
+                "seek_all_back_xl",
+                "seek_all_forward_xl",
             },
         )
 
@@ -338,7 +357,8 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn("--ontop", cmd)
         self.assertIn("--osd-align-x=left", cmd)
         self.assertIn("--osd-align-y=top", cmd)
-        self.assertIn("--osd-font=monospace", cmd)
+        self.assertIn(f"--osd-font={multi_player.OSD_FONT}", cmd)
+        self.assertIn(f"--osd-font-size={multi_player.DEFAULT_OSD_FONT_SIZE}", cmd)
         self.assertLess(cmd.index("--pause"), cmd.index("video.mp4"))
 
     def test_launch_mpv_passes_screen_when_monitor_is_set(self) -> None:
@@ -358,8 +378,51 @@ class TestMultiPlayerControls(unittest.TestCase):
 
         for player in players:
             self.assertIn(("pause", False), player.client.commands)
-            self.assertNotIn(("show_text", "PLAYING", multi_player.ACTION_OSD_MS), player.client.commands)
+            self.assertNotIn(
+                ("show_text", multi_player.play_pause_osd_text(False), multi_player.ACTION_OSD_MS),
+                player.client.commands,
+            )
         self.assertEqual(state.last_action, "started")
+
+    def test_set_all_pause_refreshes_positions_for_restored_persistent_osd(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState()
+        for player in players:
+            player.position_seconds = 0.0
+
+        multi_player.set_all_pause(players, state)
+
+        for player in players:
+            self.assertEqual(player.position_seconds, player.index * 10.0)
+            self.assertIn(("time_pos",), player.client.commands)
+            self.assertIn(("osd_font_size", multi_player.PLAY_PAUSE_OSD_FONT_SIZE), player.client.commands)
+            self.assertIn(
+                ("show_text", multi_player.play_pause_osd_text(True), multi_player.ACTION_OSD_MS),
+                player.client.commands,
+            )
+            self.assertNotIn(
+                ("show_text", multi_player.persistent_osd_text(player, state), multi_player.ACTION_OSD_MS),
+                player.client.commands,
+            )
+
+    def test_toggle_selected_pause_refreshes_position_for_restored_persistent_osd(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=2)
+        players[1].position_seconds = 0.0
+
+        multi_player.toggle_selected_pause(players, state)
+
+        self.assertEqual(players[1].position_seconds, 20.0)
+        self.assertIn(("time_pos",), players[1].client.commands)
+        self.assertIn(("osd_font_size", multi_player.PLAY_PAUSE_OSD_FONT_SIZE), players[1].client.commands)
+        self.assertIn(
+            ("show_text", multi_player.play_pause_osd_text(True), multi_player.ACTION_OSD_MS),
+            players[1].client.commands,
+        )
+        self.assertNotIn(
+            ("show_text", multi_player.persistent_osd_text(players[1], state), multi_player.ACTION_OSD_MS),
+            players[1].client.commands,
+        )
 
     def test_preseek_players_moves_requested_players_before_playback(self) -> None:
         players = make_players(3)
@@ -367,12 +430,78 @@ class TestMultiPlayerControls(unittest.TestCase):
 
         multi_player.preseek_players(players, [0.0, 12.5, 62.0], state)
 
+        self.assertEqual(players[0].start_seconds, 0.0)
+        self.assertEqual(players[1].start_seconds, 12.5)
+        self.assertEqual(players[2].start_seconds, 62.0)
         self.assertNotIn(("seek_absolute", 0.0), players[0].client.commands)
         self.assertIn(("seek_absolute", 12.5), players[1].client.commands)
         self.assertIn(("seek_absolute", 62.0), players[2].client.commands)
         for player in players:
             self.assertIn(("time_pos",), player.client.commands)
         self.assertEqual(state.last_action, "pre-seeked")
+
+    def test_pause_all_if_any_player_is_buffering_pauses_every_player(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState()
+        players[1].client.paused_for_cache = True
+
+        self.assertTrue(multi_player.pause_all_if_any_player_is_buffering(players, state))
+
+        for player in players:
+            self.assertIn(("pause", True), player.client.commands)
+            self.assertIn(("time_pos",), player.client.commands)
+            self.assertIn(
+                ("show_text", f"{multi_player.PAUSE_OSD_TEXT} video 2 buffering", multi_player.ACTION_OSD_MS),
+                player.client.commands,
+            )
+        self.assertEqual(state.cache_pause_index, 2)
+        self.assertTrue(state.auto_paused_for_cache)
+        self.assertEqual(state.last_action, "paused: video 2 buffering")
+
+    def test_pause_all_if_any_player_is_buffering_debounces_same_player(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(cache_pause_index=1)
+        players[0].client.paused_for_cache = True
+
+        self.assertTrue(multi_player.pause_all_if_any_player_is_buffering(players, state))
+
+        for player in players:
+            self.assertNotIn(("pause", True), player.client.commands)
+        self.assertEqual(state.last_action, "ready")
+
+    def test_pause_all_if_any_player_is_buffering_clears_cache_pause_state(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(cache_pause_index=1)
+
+        self.assertFalse(multi_player.pause_all_if_any_player_is_buffering(players, state))
+
+        self.assertIsNone(state.cache_pause_index)
+
+    def test_pause_all_if_any_player_is_buffering_resumes_after_auto_pause(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(cache_pause_index=1, auto_paused_for_cache=True)
+
+        self.assertTrue(multi_player.pause_all_if_any_player_is_buffering(players, state))
+
+        for player in players:
+            self.assertIn(("pause", False), player.client.commands)
+            self.assertIn(("time_pos",), player.client.commands)
+            self.assertIn(
+                ("show_text", multi_player.play_pause_osd_text(False), multi_player.ACTION_OSD_MS),
+                player.client.commands,
+            )
+        self.assertIsNone(state.cache_pause_index)
+        self.assertFalse(state.auto_paused_for_cache)
+        self.assertEqual(state.last_action, "resumed after buffering")
+
+    def test_manual_pause_cancels_buffering_auto_resume(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(cache_pause_index=1, auto_paused_for_cache=True)
+
+        multi_player.set_all_pause(players, state)
+
+        self.assertIsNone(state.cache_pause_index)
+        self.assertFalse(state.auto_paused_for_cache)
 
     def test_controller_state_starts_with_persistent_display_enabled(self) -> None:
         self.assertTrue(multi_player.ControllerState().display_enabled)
@@ -457,12 +586,14 @@ class TestMultiPlayerControls(unittest.TestCase):
         player = make_players(1)[0]
         player.position_seconds = 10.0
         player.osd_block_until = 100.0
+        player.osd_font_size = multi_player.PLAY_PAUSE_OSD_FONT_SIZE
         state = multi_player.ControllerState(display_enabled=True)
 
         multi_player.update_persistent_display(player, state, now=99.0)
         self.assertNotIn(("show_text", multi_player.persistent_osd_text(player, state), multi_player.PERSISTENT_OSD_MS), player.client.commands)
 
         multi_player.update_persistent_display(player, state, now=100.0)
+        self.assertIn(("osd_font_size", multi_player.DEFAULT_OSD_FONT_SIZE), player.client.commands)
         self.assertIn(("show_text", multi_player.persistent_osd_text(player, state), multi_player.PERSISTENT_OSD_MS), player.client.commands)
         self.assertEqual(player.osd_block_until, 0.0)
 
@@ -509,8 +640,9 @@ class TestMultiPlayerControls(unittest.TestCase):
 
         multi_player.seek_all(players, state, -5.0)
 
+        expected_targets = {1: 5.0, 2: 5.0, 3: 5.0}
         for player in players:
-            self.assertIn(("seek", -5.0), player.client.commands)
+            self.assertIn(("seek_absolute", expected_targets[player.index]), player.client.commands)
             self.assertIn(("time_pos",), player.client.commands)
             expected_state = "[V] [A]" if player.index == 1 else "       "
             self.assertIn(
@@ -522,6 +654,121 @@ class TestMultiPlayerControls(unittest.TestCase):
                 player.client.commands,
             )
         self.assertEqual(state.last_action, "seek all -5.000s")
+
+    def test_seek_all_respects_start_offsets(self) -> None:
+        players = make_players(4)
+        state = multi_player.ControllerState(selected_index=4)
+        for player, start_seconds in zip(players, [420.0, 420.0, 420.0, 0.0], strict=True):
+            player.start_seconds = start_seconds
+        players[3].client.time_pos = 10.0
+
+        multi_player.seek_all(players, state, 2.0)
+
+        self.assertIn(("seek_absolute", 432.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 432.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 432.0), players[2].client.commands)
+        self.assertIn(("seek_absolute", 12.0), players[3].client.commands)
+
+    def test_handle_key_maps_seek_and_nudge_levels_to_expected_sizes(self) -> None:
+        args = argparse.Namespace(nudge_small=0.033, nudge_large=0.5, seek_medium=2.0, seek_small=5.0, seek_large=30.0)
+
+        for key, expected_seconds in (
+            ("seek_all_back_s", -0.5),
+            ("seek_all_forward_m", 2.0),
+            ("seek_all_back_l", -5.0),
+            ("seek_all_forward_xl", 30.0),
+        ):
+            with self.subTest(key=key):
+                players = make_players(2)
+                state = multi_player.ControllerState()
+
+                multi_player.handle_key(key, players, state, args)
+
+                for player in players:
+                    self.assertIn(("seek_absolute", 10.0 + expected_seconds), player.client.commands)
+
+        for key, expected_seconds in (
+            ("nudge_back_xs", -0.033),
+            ("nudge_forward_s", 0.5),
+            ("nudge_back_m", -2.0),
+            ("nudge_forward_l", 5.0),
+        ):
+            with self.subTest(key=key):
+                players = make_players(2)
+                state = multi_player.ControllerState(selected_index=2)
+
+                multi_player.handle_key(key, players, state, args)
+
+                self.assertIn(("seek", expected_seconds), players[1].client.commands)
+                self.assertEqual(players[0].client.commands, [])
+
+    def test_sync_to_selected_time_seeks_other_players_to_selected_timestamp(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState(selected_index=2)
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertNotIn(("seek_absolute", 20.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 20.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 20.0), players[2].client.commands)
+        for player in players:
+            self.assertIn(("time_pos",), player.client.commands)
+        self.assertNotIn(
+            (
+                "show_text",
+                multi_player.format_osd_state(players[1], state, "sync 2 00:00:20.000"),
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[1].client.commands,
+        )
+        for player in (players[0], players[2]):
+            self.assertIn(
+                (
+                    "show_text",
+                    multi_player.format_osd_state(player, state, "sync 2 00:00:20.000"),
+                    multi_player.ACTION_OSD_MS,
+                ),
+                player.client.commands,
+            )
+        self.assertEqual(state.last_action, "synced all to video 2 at 00:00:20.000")
+
+    def test_sync_to_selected_time_respects_start_offsets(self) -> None:
+        players = make_players(4)
+        state = multi_player.ControllerState(selected_index=2)
+        for player, start_seconds in zip(players, [420.0, 420.0, 420.0, 0.0], strict=True):
+            player.start_seconds = start_seconds
+        players[1].client.time_pos = 430.0
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertIn(("seek_absolute", 430.0), players[0].client.commands)
+        self.assertNotIn(("seek_absolute", 430.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 430.0), players[2].client.commands)
+        self.assertIn(("seek_absolute", 10.0), players[3].client.commands)
+
+    def test_sync_to_selected_time_respects_start_offsets_from_segment_selected(self) -> None:
+        players = make_players(4)
+        state = multi_player.ControllerState(selected_index=4)
+        for player, start_seconds in zip(players, [420.0, 420.0, 420.0, 0.0], strict=True):
+            player.start_seconds = start_seconds
+        players[3].client.time_pos = 10.0
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertIn(("seek_absolute", 430.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 430.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 430.0), players[2].client.commands)
+        self.assertNotIn(("seek_absolute", 10.0), players[3].client.commands)
+
+    def test_sync_to_selected_time_handles_unavailable_selected_timestamp(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].client.time_pos = None
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertNotIn(("seek_absolute", None), players[1].client.commands)
+        self.assertEqual(state.last_action, "video 1 timestamp is unavailable")
 
     def test_toggle_mute_cycles_mute_on_every_player(self) -> None:
         players = make_players(3)

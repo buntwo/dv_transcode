@@ -26,8 +26,9 @@ from typing import Any
 DEFAULT_WIDTH = 960
 DEFAULT_HEIGHT = 540
 DEFAULT_GAP = 0
-DEFAULT_X = 40
-DEFAULT_Y = 80
+DEFAULT_X = 0
+DEFAULT_Y = 0
+DEFAULT_SEEK_MEDIUM = 2.0
 DEFAULT_SEEK_SMALL = 5.0
 DEFAULT_SEEK_LARGE = 30.0
 DEFAULT_NUDGE_SMALL = 0.0333667
@@ -38,6 +39,11 @@ SELECTED_OSD_MS = 500
 AUDIO_OSD_MS = 500
 ACTION_OSD_MS = 500
 PERSISTENT_OSD_MS = 3_600_000
+PAUSE_OSD_TEXT = "▌▌"
+PLAY_OSD_TEXT = "▶"
+OSD_FONT = "monospace"
+DEFAULT_OSD_FONT_SIZE = 30
+PLAY_PAUSE_OSD_FONT_SIZE = 72
 STATUS_REFRESH_SECONDS = 0.5
 MAX_SELECT_TIMEOUT_SECONDS = 0.1
 PLAYER_READY_TIMEOUT_SECONDS = 10.0
@@ -45,14 +51,14 @@ IPC_CONNECT_ATTEMPTS = 10
 IPC_CONNECT_RETRY_SECONDS = 0.02
 SEEK_KEYS = frozenset(
     {
-        "seek_all_back_xs",
-        "seek_all_forward_xs",
         "seek_all_back_s",
         "seek_all_forward_s",
         "seek_all_back_m",
         "seek_all_forward_m",
         "seek_all_back_l",
         "seek_all_forward_l",
+        "seek_all_back_xl",
+        "seek_all_forward_xl",
     }
 )
 
@@ -89,8 +95,15 @@ class MpvClient:
     def set_title(self, title: str) -> None:
         self.command("set_property", "title", title)
 
+    def set_osd_font_size(self, size: int) -> None:
+        self.command("set_property", "osd-font-size", size)
+
     def get_pause(self) -> bool:
         response = self.command("get_property", "pause")
+        return bool(response.get("data"))
+
+    def get_paused_for_cache(self) -> bool:
+        response = self.command("get_property", "paused-for-cache")
         return bool(response.get("data"))
 
     def get_time_pos(self) -> float | None:
@@ -149,7 +162,9 @@ class Player:
     client: MpvClient | None = None
     offset_seconds: float = 0.0
     position_seconds: float | None = None
+    start_seconds: float = 0.0
     osd_block_until: float = 0.0
+    osd_font_size: int = DEFAULT_OSD_FONT_SIZE
 
     @property
     def title_name(self) -> str:
@@ -162,6 +177,8 @@ class ControllerState:
     audio_index: int = 1
     muted: bool = False
     display_enabled: bool = True
+    cache_pause_index: int | None = None
+    auto_paused_for_cache: bool = False
     last_action: str = "ready"
 
 
@@ -189,9 +206,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-y", type=non_negative_int, default=DEFAULT_Y)
     parser.add_argument("--monitor", type=positive_int)
     parser.add_argument("--seek-small", type=positive_float, default=DEFAULT_SEEK_SMALL)
+    parser.add_argument("--seek-medium", type=positive_float, default=DEFAULT_SEEK_MEDIUM)
     parser.add_argument("--seek-large", type=positive_float, default=DEFAULT_SEEK_LARGE)
     parser.add_argument("--nudge-small", type=positive_float, default=DEFAULT_NUDGE_SMALL)
     parser.add_argument("--nudge-large", type=positive_float, default=DEFAULT_NUDGE_LARGE)
+    parser.add_argument(
+        "-ss",
+        dest="ss",
+        type=parse_timestamp,
+        metavar="TIMESTAMP",
+        help="Pre-seek all videos before playback. Numbered -ssN values override this per video.",
+    )
     for index in range(1, MAX_VIDEOS + 1):
         parser.add_argument(
             f"-ss{index}",
@@ -256,7 +281,11 @@ def parse_timestamp(value: str) -> float:
 
 
 def collect_start_times(args: argparse.Namespace) -> list[float]:
-    return [getattr(args, f"ss{index}") or 0.0 for index in range(1, len(args.videos) + 1)]
+    default_start_time = args.ss or 0.0
+    return [
+        specific_start_time if (specific_start_time := getattr(args, f"ss{index}")) is not None else default_start_time
+        for index in range(1, len(args.videos) + 1)
+    ]
 
 
 def validate_inputs(args: argparse.Namespace) -> None:
@@ -284,7 +313,8 @@ def launch_mpv(
         "--ontop",
         "--osd-align-x=left",
         "--osd-align-y=top",
-        "--osd-font=monospace",
+        f"--osd-font={OSD_FONT}",
+        f"--osd-font-size={DEFAULT_OSD_FONT_SIZE}",
         f"--input-ipc-server={ipc_socket}",
         f"--geometry={geometry.mpv_value()}",
         f"--title={title}",
@@ -316,22 +346,24 @@ def normalize_key(sequence: bytes) -> str | None:
         return "mute"
     if sequence == b"d":
         return "display"
+    if sequence == b"t":
+        return "sync_to_selected_time"
     if sequence == b"z":
-        return "seek_all_back_xs"
-    if sequence == b"x":
-        return "seek_all_forward_xs"
-    if sequence == b"Z":
         return "seek_all_back_s"
-    if sequence == b"X":
+    if sequence == b"x":
         return "seek_all_forward_s"
-    if sequence == b"a":
+    if sequence == b"Z":
         return "seek_all_back_m"
-    if sequence == b"s":
+    if sequence == b"X":
         return "seek_all_forward_m"
-    if sequence == b"A":
+    if sequence == b"a":
         return "seek_all_back_l"
-    if sequence == b"S":
+    if sequence == b"s":
         return "seek_all_forward_l"
+    if sequence == b"A":
+        return "seek_all_back_xl"
+    if sequence == b"S":
+        return "seek_all_forward_xl"
     if sequence == b",":
         return "nudge_back_xs"
     if sequence == b".":
@@ -385,22 +417,25 @@ def print_help() -> None:
     print(
         "\n".join(
             [
-                "Controls:",
-                "  space             play/pause all",
-                "  enter             play/pause selected video",
-                "  z/x               seek all backward/forward by xs step",
-                "  Z/X               seek all backward/forward by s step",
-                "  a/s               seek all backward/forward by m step",
-                "  A/S               seek all backward/forward by l step",
-                "  ,/.               nudge selected video backward/forward by xs step",
-                "  </>               nudge selected video backward/forward by s step",
-                "  k/l               nudge selected video backward/forward by m step",
-                "  K/L               nudge selected video backward/forward by l step",
-                "  1/2/3/4           select video for nudging",
-                "  !/@/#/$           activate audio for video 1/2/3/4",
-                "  m                 toggle mute for all",
-                "  d                 toggle persistent timestamp/nudge display",
-                "  q                 quit",
+                "Controls",
+                "",
+                "Audio / Select",
+                "  !     @     #     $        audio 1-4",
+                "  1     2     3     4        select 1-4",
+                "",
+                "",
+                "Seek all videos                  Nudge selected video",
+                "  A     S    xl  30s  back/fwd     K     L    l   5s     back/fwd",
+                "  a     s    l   5s   back/fwd     k     l    m   2s     back/fwd",
+                "  Z     X    m   2s   back/fwd     <     >    s   0.5s   back/fwd",
+                "  z     x    s   0.5s back/fwd     ,     .    xs  frame  back/fwd",
+                "",
+                "",
+                "Playback                          Other",
+                "  Space      play/pause all       t     sync to selected timestamp",
+                "  Enter      play/pause selected  m     mute",
+                "                                  d     display",
+                "                                  q     quit",
                 "",
             ]
         )
@@ -466,6 +501,35 @@ def refresh_positions(players: list[Player]) -> None:
         refresh_position(player)
 
 
+def pause_all_if_any_player_is_buffering(players: list[Player], state: ControllerState) -> bool:
+    buffering_player = next((player for player in players if live_client(player).get_paused_for_cache()), None)
+    if buffering_player is None:
+        if state.auto_paused_for_cache:
+            state.auto_paused_for_cache = False
+            state.cache_pause_index = None
+            for player in players:
+                live_client(player).set_pause(False)
+            refresh_positions(players)
+            for player in players:
+                show_play_pause_osd(player, False)
+            render_status(players, state, "resumed after buffering")
+            return True
+        state.cache_pause_index = None
+        return False
+    if state.cache_pause_index == buffering_player.index:
+        return True
+
+    state.cache_pause_index = buffering_player.index
+    state.auto_paused_for_cache = True
+    for player in players:
+        live_client(player).set_pause(True)
+    refresh_positions(players)
+    for player in players:
+        show_temporary_osd(player, f"{PAUSE_OSD_TEXT} video {buffering_player.index} buffering", ACTION_OSD_MS)
+    render_status(players, state, f"paused: video {buffering_player.index} buffering")
+    return True
+
+
 def wait_for_player_ready(player: Player, timeout: float = PLAYER_READY_TIMEOUT_SECONDS) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -495,9 +559,30 @@ def format_osd_state(player: Player, state: ControllerState, action: str | None 
     return "\n".join(lines)
 
 
-def show_temporary_osd(player: Player, text: str, duration_ms: int) -> None:
+def set_osd_font_size(player: Player, size: int) -> None:
+    if player.osd_font_size == size:
+        return
+    live_client(player).set_osd_font_size(size)
+    player.osd_font_size = size
+
+
+def show_temporary_osd(
+    player: Player,
+    text: str,
+    duration_ms: int,
+    font_size: int = DEFAULT_OSD_FONT_SIZE,
+) -> None:
     player.osd_block_until = time.monotonic() + duration_ms / 1000
+    set_osd_font_size(player, font_size)
     live_client(player).show_text(text, duration_ms)
+
+
+def play_pause_osd_text(pause: bool) -> str:
+    return PAUSE_OSD_TEXT if pause else PLAY_OSD_TEXT
+
+
+def show_play_pause_osd(player: Player, pause: bool) -> None:
+    show_temporary_osd(player, play_pause_osd_text(pause), ACTION_OSD_MS, font_size=PLAY_PAUSE_OSD_FONT_SIZE)
 
 
 def update_persistent_display(player: Player, state: ControllerState, now: float | None = None, force: bool = False) -> None:
@@ -505,6 +590,7 @@ def update_persistent_display(player: Player, state: ControllerState, now: float
         return
     current_time = time.monotonic() if now is None else now
     if force or current_time >= player.osd_block_until:
+        set_osd_font_size(player, DEFAULT_OSD_FONT_SIZE)
         live_client(player).show_text(persistent_osd_text(player, state), PERSISTENT_OSD_MS)
         player.osd_block_until = 0.0
 
@@ -588,21 +674,28 @@ def activate_audio(players: list[Player], state: ControllerState, index: int, fl
 
 
 def set_all_pause(players: list[Player], state: ControllerState) -> None:
+    state.auto_paused_for_cache = False
+    state.cache_pause_index = None
     next_pause = not live_client(players[0]).get_pause()
     for player in players:
         live_client(player).set_pause(next_pause)
-        show_temporary_osd(player, "PAUSED" if next_pause else "PLAYING", ACTION_OSD_MS)
+    refresh_positions(players)
+    for player in players:
+        show_play_pause_osd(player, next_pause)
     render_status(players, state, "paused" if next_pause else "playing")
 
 
 def toggle_selected_pause(players: list[Player], state: ControllerState) -> None:
+    state.auto_paused_for_cache = False
+    state.cache_pause_index = None
     player = get_player(players, state.selected_index)
     if player is None:
         render_status(players, state, f"video {state.selected_index} is not loaded")
         return
     next_pause = not live_client(player).get_pause()
     live_client(player).set_pause(next_pause)
-    show_temporary_osd(player, "PAUSED" if next_pause else "PLAYING", ACTION_OSD_MS)
+    refresh_position(player)
+    show_play_pause_osd(player, next_pause)
     render_status(players, state, f"{'paused' if next_pause else 'playing'} {player.title_name}")
 
 
@@ -614,6 +707,7 @@ def start_all_playback(players: list[Player], state: ControllerState) -> None:
 
 def preseek_players(players: list[Player], start_times: list[float], state: ControllerState) -> None:
     for player, start_time in zip(players, start_times, strict=True):
+        player.start_seconds = start_time
         if start_time > 0:
             live_client(player).seek_absolute(start_time)
         refresh_position(player)
@@ -622,11 +716,48 @@ def preseek_players(players: list[Player], start_times: list[float], state: Cont
 
 
 def seek_all(players: list[Player], state: ControllerState, seconds: float) -> None:
+    selected = get_player(players, state.selected_index)
+    if selected is None:
+        render_status(players, state, f"video {state.selected_index} is not loaded")
+        return
+
+    refresh_position(selected)
+    if selected.position_seconds is None:
+        render_status(players, state, f"video {selected.index} timestamp is unavailable")
+        return
+
+    target_elapsed_seconds = max(0.0, selected.position_seconds - selected.start_seconds + seconds)
     for player in players:
-        live_client(player).seek(seconds)
+        live_client(player).seek_absolute(player.start_seconds + target_elapsed_seconds)
         refresh_position(player)
         show_temporary_osd(player, format_osd_state(player, state, f"seek  {seconds:+.3f}s"), ACTION_OSD_MS)
     render_status(players, state, f"seek all {seconds:+.3f}s")
+
+
+def sync_to_selected_time(players: list[Player], state: ControllerState) -> None:
+    selected = get_player(players, state.selected_index)
+    if selected is None:
+        render_status(players, state, f"video {state.selected_index} is not loaded")
+        return
+
+    refresh_position(selected)
+    if selected.position_seconds is None:
+        render_status(players, state, f"video {selected.index} timestamp is unavailable")
+        return
+
+    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds
+    for player in players:
+        if player.index != selected.index:
+            live_client(player).seek_absolute(max(0.0, player.start_seconds + selected_elapsed_seconds))
+            refresh_position(player)
+            show_temporary_osd(
+                player,
+                format_osd_state(player, state, f"sync {selected.index} {format_timestamp(selected.position_seconds)}"),
+                ACTION_OSD_MS,
+            )
+        else:
+            refresh_position(player)
+    render_status(players, state, f"synced all to video {selected.index} at {format_timestamp(selected.position_seconds)}")
 
 
 def nudge_selected(players: list[Player], state: ControllerState, seconds: float) -> None:
@@ -675,22 +806,24 @@ def handle_key(
         set_all_pause(players, state)
     elif key == "selected_pause":
         toggle_selected_pause(players, state)
-    elif key == "seek_all_back_xs":
-        seek_all(players, state, -args.nudge_small)
-    elif key == "seek_all_forward_xs":
-        seek_all(players, state, args.nudge_small)
     elif key == "seek_all_back_s":
         seek_all(players, state, -args.nudge_large)
     elif key == "seek_all_forward_s":
         seek_all(players, state, args.nudge_large)
     elif key == "seek_all_back_m":
-        seek_all(players, state, -args.seek_small)
+        seek_all(players, state, -args.seek_medium)
     elif key == "seek_all_forward_m":
-        seek_all(players, state, args.seek_small)
+        seek_all(players, state, args.seek_medium)
     elif key == "seek_all_back_l":
-        seek_all(players, state, -args.seek_large)
+        seek_all(players, state, -args.seek_small)
     elif key == "seek_all_forward_l":
+        seek_all(players, state, args.seek_small)
+    elif key == "seek_all_back_xl":
+        seek_all(players, state, -args.seek_large)
+    elif key == "seek_all_forward_xl":
         seek_all(players, state, args.seek_large)
+    elif key == "sync_to_selected_time":
+        sync_to_selected_time(players, state)
     elif key == "nudge_back_xs":
         nudge_selected(players, state, -args.nudge_small)
     elif key == "nudge_forward_xs":
@@ -700,13 +833,13 @@ def handle_key(
     elif key == "nudge_forward_s":
         nudge_selected(players, state, args.nudge_large)
     elif key == "nudge_back_m":
-        nudge_selected(players, state, -args.seek_small)
+        nudge_selected(players, state, -args.seek_medium)
     elif key == "nudge_forward_m":
-        nudge_selected(players, state, args.seek_small)
+        nudge_selected(players, state, args.seek_medium)
     elif key == "nudge_back_l":
-        nudge_selected(players, state, -args.seek_large)
+        nudge_selected(players, state, -args.seek_small)
     elif key == "nudge_forward_l":
-        nudge_selected(players, state, args.seek_large)
+        nudge_selected(players, state, args.seek_small)
     elif key.startswith("select_"):
         select_player(players, state, int(key[-1]))
     elif key.startswith("audio_"):
@@ -770,6 +903,7 @@ def run(args: argparse.Namespace) -> int:
             activate_audio(players, state, state.audio_index, flash=False)
             print_help()
             start_all_playback(players, state)
+            pause_all_if_any_player_is_buffering(players, state)
 
             old_term = termios.tcgetattr(sys.stdin)
             try:
@@ -783,8 +917,9 @@ def run(args: argparse.Namespace) -> int:
                     restore_due_persistent_displays(players, state, now)
                     if now >= next_status_refresh:
                         refresh_positions(players)
-                        update_persistent_displays(players, state)
-                        print_status(format_status(players, state))
+                        if not pause_all_if_any_player_is_buffering(players, state):
+                            update_persistent_displays(players, state)
+                            print_status(format_status(players, state))
                         next_status_refresh = now + STATUS_REFRESH_SECONDS
                     if not readable:
                         continue
