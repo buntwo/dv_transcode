@@ -126,6 +126,21 @@ class TestParseArgs(unittest.TestCase):
 
         self.assertEqual(cfg.encoder, "libx265")
         self.assertEqual(cfg.codec, "hevc")
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 24.0)
+
+    def test_parse_args_supports_non_vhs_libx265_defaults(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--encoder",
+            "libx265",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
         self.assertEqual(cfg.preset, "medium")
         self.assertEqual(cfg.crf, 20.0)
 
@@ -643,6 +658,7 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertIn("-g", args)
         self.assertIn("60", args)
         self.assertNotIn("libx265", args)
+        self.assertNotIn("-x265-params", args)
         self.assertNotIn("-crf", args)
         self.assertNotIn("-preset", args)
 
@@ -663,7 +679,7 @@ class TestFiltersAndArgs(unittest.TestCase):
         )
 
         args = transcode3.build_ffmpeg_args(
-            make_config(encoder="libx265", preset="slow", crf=22.0),
+            make_config(format_type="vhs", encoder="libx265", preset="slow", crf=22.0, vhs_notch="off"),
             paths,
             "null",
             preview=False,
@@ -674,17 +690,47 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertIn("slow", args)
         self.assertIn("-crf", args)
         self.assertIn("22", args)
+        self.assertIn("-profile:v", args)
+        self.assertIn("main10", args)
         self.assertIn("-pix_fmt", args)
-        self.assertIn("yuv420p", args)
+        self.assertIn("yuv420p10le", args)
         self.assertIn("-tag:v", args)
         self.assertIn("hvc1", args)
         self.assertIn("-g", args)
         self.assertIn("60", args)
         self.assertIn("-movflags", args)
         self.assertIn("+faststart", args)
+        self.assertIn("-x265-params", args)
+        self.assertIn("aq-mode=3:aq-strength=0.8:psy-rd=2.0:psy-rdoq=1.0", args)
         self.assertNotIn("-spatial_aq", args)
         self.assertNotIn("-max_ref_frames", args)
         self.assertNotIn("-q:v", args)
+
+    def test_libx265_vhs_params_are_not_used_for_non_vhs_formats(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(
+            make_config(format_type="video8", encoder="libx265", preset="medium", crf=20.0),
+            paths,
+            "null",
+            preview=False,
+        )
+
+        self.assertIn("libx265", args)
+        self.assertNotIn("-x265-params", args)
 
     def test_vhs_audio_notch_auto_uses_detected_ntsc_frequency(self) -> None:
         paths = transcode3.Paths(
@@ -820,6 +866,46 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("crop=", vf)
         self.assertNotIn("pad=", vf)
 
+    def test_libx265_filter_chain_ends_with_10bit_format(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        vf = transcode3.build_vf(make_config(encoder="libx265"), paths)
+
+        self.assertTrue(vf.endswith(",format=yuv420p10le"))
+
+    def test_videotoolbox_filter_chain_does_not_force_10bit_format(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        vf = transcode3.build_vf(make_config(encoder="videotoolbox"), paths)
+
+        self.assertNotIn("format=yuv420p10le", vf)
+
 
 class TestTranscodeAccess(unittest.TestCase):
     def test_access_parse_args_sets_vhs_defaults_and_access_layout(self) -> None:
@@ -893,8 +979,8 @@ class TestTranscodeAccess(unittest.TestCase):
             cfg, _ = transcode_access.parse_args()
 
         self.assertEqual(cfg.encoder, "libx265")
-        self.assertEqual(cfg.preset, "medium")
-        self.assertEqual(cfg.crf, 20.0)
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 24.0)
 
     def test_access_parse_args_rejects_libx265_options_with_videotoolbox(self) -> None:
         argv = [

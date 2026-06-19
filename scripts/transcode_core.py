@@ -195,8 +195,10 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
     mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
     mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
-    preset = args.preset if args.preset is not None else ("medium" if args.encoder == "libx265" else None)
-    crf = args.crf if args.crf is not None else (20.0 if args.encoder == "libx265" else None)
+    default_preset = "slow" if args.format_type == "vhs" else "medium"
+    default_crf = 24.0 if args.format_type == "vhs" else 20.0
+    preset = args.preset if args.preset is not None else (default_preset if args.encoder == "libx265" else None)
+    crf = args.crf if args.crf is not None else (default_crf if args.encoder == "libx265" else None)
 
     return Config(
         mode=args.mode,
@@ -811,6 +813,9 @@ def build_vf(cfg: Config, paths: Paths) -> str:
             f"subtitles=filename={escape_ffmpeg_filter_value(str(paths.srt_file))}:force_style='{style}'"
         )
 
+    if cfg.encoder == "libx265":
+        filters.append("format=yuv420p10le")
+
     return ",".join(filters)
 
 
@@ -837,12 +842,14 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
             "-crf",
             f"{cfg.crf if cfg.crf is not None else 20:g}",
             "-profile:v",
-            "main",
+            "main10",
             "-pix_fmt",
-            "yuv420p",
+            "yuv420p10le",
             "-tag:v",
             "hvc1",
         ]
+        if cfg.format_type == "vhs":
+            args += ["-x265-params", "aq-mode=3:aq-strength=0.8:psy-rd=2.0:psy-rdoq=1.0"]
     elif cfg.codec == "h264":
         args += ["-c:v", "h264_videotoolbox", "-profile:v", "high", "-coder", "cabac"]
     else:

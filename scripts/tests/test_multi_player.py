@@ -335,6 +335,7 @@ class TestMultiPlayerControls(unittest.TestCase):
 
         cmd = popen.call_args.args[0]
         self.assertIn("--pause", cmd)
+        self.assertIn("--ontop", cmd)
         self.assertIn("--osd-align-x=left", cmd)
         self.assertIn("--osd-align-y=top", cmd)
         self.assertIn("--osd-font=monospace", cmd)

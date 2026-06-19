@@ -281,6 +281,7 @@ def launch_mpv(
         "mpv",
         "--no-terminal",
         "--pause",
+        "--ontop",
         "--osd-align-x=left",
         "--osd-align-y=top",
         "--osd-font=monospace",
