@@ -841,13 +841,13 @@ def seek_all(players: list[Player], state: ControllerState, seconds: float) -> N
         render_status(players, state, f"video {selected.index} timestamp is unavailable")
         return
 
-    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds
+    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds - selected.offset_seconds
     requested_elapsed_seconds = selected_elapsed_seconds + seconds
-    min_elapsed_seconds = -min(player.start_seconds for player in players)
+    min_elapsed_seconds = max(-(player.start_seconds + player.offset_seconds) for player in players)
     target_elapsed_seconds = max(min_elapsed_seconds, requested_elapsed_seconds)
     actual_seconds = target_elapsed_seconds - selected_elapsed_seconds
     for player in players:
-        live_client(player).seek_absolute(player.start_seconds + target_elapsed_seconds)
+        live_client(player).seek_absolute(player.start_seconds + target_elapsed_seconds + player.offset_seconds)
         refresh_position(player)
         show_temporary_osd(player, format_osd_state(player, state, f"seek  {actual_seconds:+.3f}s"), ACTION_OSD_MS)
     render_status(players, state, f"seek all {actual_seconds:+.3f}s")

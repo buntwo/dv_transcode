@@ -837,6 +837,20 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 432.0), players[2].client.commands)
         self.assertIn(("seek_absolute", 12.0), players[3].client.commands)
 
+    def test_seek_all_preserves_nudged_offsets(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        for player in players:
+            player.start_seconds = 100.0
+        players[0].offset_seconds = 1.0
+        players[0].client.time_pos = 111.0
+        players[1].client.time_pos = 110.0
+
+        multi_player.seek_all(players, state, 5.0)
+
+        self.assertIn(("seek_absolute", 116.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 115.0), players[1].client.commands)
+
     def test_seek_all_can_seek_before_initial_start_offsets(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState()
@@ -870,6 +884,21 @@ class TestMultiPlayerControls(unittest.TestCase):
             players[0].client.commands,
         )
         self.assertEqual(state.last_action, "seek all -3.000s")
+
+    def test_seek_all_clips_with_nudged_offsets(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState()
+        players[0].start_seconds = 3.0
+        players[1].start_seconds = 10.0
+        players[0].offset_seconds = -1.0
+        players[1].offset_seconds = 2.0
+        players[0].client.time_pos = 2.0
+
+        multi_player.seek_all(players, state, -5.0)
+
+        self.assertIn(("seek_absolute", 0.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 10.0), players[1].client.commands)
+        self.assertEqual(state.last_action, "seek all -2.000s")
 
     def test_handle_key_maps_seek_and_nudge_levels_to_expected_sizes(self) -> None:
         args = argparse.Namespace(nudge_small=0.033, nudge_large=0.5, seek_medium=2.0, seek_small=5.0, seek_large=30.0)
