@@ -61,6 +61,8 @@ IPC_CONNECT_ATTEMPTS = 10
 IPC_CONNECT_RETRY_SECONDS = 0.02
 SEEK_KEYS = frozenset(
     {
+        "seek_all_back_xs",
+        "seek_all_forward_xs",
         "seek_all_back_s",
         "seek_all_forward_s",
         "seek_all_back_m",
@@ -126,6 +128,14 @@ class MpvClient:
             return float(data)
         return None
 
+    def get_frame_rate(self) -> float | None:
+        for property_name in ("estimated-vf-fps", "container-fps"):
+            response = self.command("get_property", property_name)
+            data = response.get("data")
+            if isinstance(data, int | float) and math.isfinite(data) and data > 0:
+                return float(data)
+        return None
+
     def set_pause(self, pause: bool) -> None:
         self.command("set_property", "pause", pause)
 
@@ -177,6 +187,7 @@ class Player:
     position_seconds: float | None = None
     start_seconds: float = 0.0
     volume: int = DEFAULT_VOLUME
+    frame_seconds: float | None = None
     osd_block_until: float = 0.0
     osd_font_size: int = DEFAULT_OSD_FONT_SIZE
 
@@ -381,6 +392,10 @@ def normalize_key(sequence: bytes) -> str | None:
         return "selected_pause"
     if sequence in (b"q", b"\x03"):
         return "quit"
+    if sequence == b"\x1a":
+        return "seek_all_back_xs"
+    if sequence == b"\x18":
+        return "seek_all_forward_xs"
     if sequence == b"m":
         return "mute"
     if sequence == b"d":
@@ -581,6 +596,24 @@ def refresh_position(player: Player) -> None:
 def refresh_positions(players: list[Player]) -> None:
     for player in players:
         refresh_position(player)
+
+
+def refresh_frame_duration(player: Player, fallback_seconds: float) -> None:
+    frame_rate = live_client(player).get_frame_rate()
+    player.frame_seconds = 1 / frame_rate if frame_rate is not None else fallback_seconds
+
+
+def refresh_frame_durations(players: list[Player], fallback_seconds: float) -> None:
+    for player in players:
+        refresh_frame_duration(player, fallback_seconds)
+
+
+def nudge_selected_frame(players: list[Player], state: ControllerState, direction: int, fallback_seconds: float) -> None:
+    player = get_player(players, state.selected_index)
+    if player is None:
+        render_status(players, state, f"video {state.selected_index} is not loaded")
+        return
+    nudge_selected(players, state, direction * (player.frame_seconds or fallback_seconds))
 
 
 def pause_all_if_any_player_is_buffering(players: list[Player], state: ControllerState) -> bool:
@@ -931,6 +964,12 @@ def handle_key(
         set_all_pause(players, state)
     elif key == "selected_pause":
         toggle_selected_pause(players, state)
+    elif key == "seek_all_back_xs":
+        selected = get_player(players, state.selected_index)
+        seek_all(players, state, -(selected.frame_seconds if selected and selected.frame_seconds else args.nudge_small))
+    elif key == "seek_all_forward_xs":
+        selected = get_player(players, state.selected_index)
+        seek_all(players, state, selected.frame_seconds if selected and selected.frame_seconds else args.nudge_small)
     elif key == "seek_all_back_s":
         seek_all(players, state, -args.nudge_large)
     elif key == "seek_all_forward_s":
@@ -950,9 +989,9 @@ def handle_key(
     elif key == "sync_to_selected_time":
         sync_to_selected_time(players, state)
     elif key == "nudge_back_xs":
-        nudge_selected(players, state, -args.nudge_small)
+        nudge_selected_frame(players, state, -1, args.nudge_small)
     elif key == "nudge_forward_xs":
-        nudge_selected(players, state, args.nudge_small)
+        nudge_selected_frame(players, state, 1, args.nudge_small)
     elif key == "nudge_back_s":
         nudge_selected(players, state, -args.nudge_large)
     elif key == "nudge_forward_s":
@@ -1045,6 +1084,7 @@ def run(args: argparse.Namespace) -> int:
                 player.client = MpvClient(player.socket_path)
             for player in players:
                 wait_for_player_ready(player)
+            refresh_frame_durations(players, args.nudge_small)
             preseek_players(players, start_times, state)
             update_titles(players, state)
             activate_audio(players, state, state.audio_index, flash=False)

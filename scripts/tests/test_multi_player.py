@@ -50,10 +50,17 @@ class TestMpvClientResponseParsing(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self, pause: bool = False, time_pos: float | None = None, paused_for_cache: bool = False) -> None:
+    def __init__(
+        self,
+        pause: bool = False,
+        time_pos: float | None = None,
+        paused_for_cache: bool = False,
+        frame_rate: float | None = None,
+    ) -> None:
         self.pause = pause
         self.time_pos = time_pos
         self.paused_for_cache = paused_for_cache
+        self.frame_rate = frame_rate
         self.time_positions: list[float | None] | None = None
         self.commands: list[tuple[object, ...]] = []
 
@@ -87,6 +94,10 @@ class FakeClient:
         if self.time_positions is not None:
             return self.time_positions.pop(0)
         return self.time_pos
+
+    def get_frame_rate(self) -> float | None:
+        self.commands.append(("frame_rate",))
+        return self.frame_rate
 
     def set_pause(self, pause: bool) -> None:
         self.pause = pause
@@ -423,6 +434,8 @@ class TestMultiPlayerKeys(unittest.TestCase):
             b" ": "space",
             b"\r": "selected_pause",
             b"\n": "selected_pause",
+            b"\x1a": "seek_all_back_xs",
+            b"\x18": "seek_all_forward_xs",
             b"z": "seek_all_back_s",
             b"x": "seek_all_forward_s",
             b"Z": "seek_all_back_m",
@@ -476,6 +489,8 @@ class TestMultiPlayerKeys(unittest.TestCase):
         self.assertEqual(
             multi_player.SEEK_KEYS,
             {
+                "seek_all_back_xs",
+                "seek_all_forward_xs",
                 "seek_all_back_s",
                 "seek_all_forward_s",
                 "seek_all_back_m",
@@ -833,6 +848,28 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertEqual(players[0].offset_seconds, 0.0)
         self.assertEqual(state.last_action, "video 1 timestamp is unavailable")
 
+    def test_refresh_frame_duration_uses_mpv_fps_or_fallback(self) -> None:
+        players = make_players(2)
+        players[0].client.frame_rate = 60000 / 1001
+
+        multi_player.refresh_frame_duration(players[0], fallback_seconds=0.033)
+        multi_player.refresh_frame_duration(players[1], fallback_seconds=0.033)
+
+        self.assertAlmostEqual(players[0].frame_seconds or 0.0, 1001 / 60000)
+        self.assertEqual(players[1].frame_seconds, 0.033)
+        self.assertEqual(players[0].client.commands.count(("frame_rate",)), 1)
+        self.assertEqual(players[1].client.commands.count(("frame_rate",)), 1)
+
+    def test_nudge_selected_frame_uses_cached_frame_duration(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].frame_seconds = 1001 / 60000
+
+        multi_player.nudge_selected_frame(players, state, 1, fallback_seconds=0.033)
+
+        self.assertIn(("seek_absolute", 10.0 + 1001 / 60000), players[0].client.commands)
+        self.assertNotIn(("frame_rate",), players[0].client.commands)
+
     def test_seek_all_moves_every_player(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState()
@@ -935,6 +972,8 @@ class TestMultiPlayerControls(unittest.TestCase):
         args = argparse.Namespace(nudge_small=0.033, nudge_large=0.5, seek_medium=2.0, seek_small=5.0, seek_large=30.0)
 
         for key, expected_seconds in (
+            ("seek_all_back_xs", -1001 / 60000),
+            ("seek_all_forward_xs", 1001 / 60000),
             ("seek_all_back_s", -0.5),
             ("seek_all_forward_m", 2.0),
             ("seek_all_back_l", -5.0),
@@ -943,6 +982,7 @@ class TestMultiPlayerControls(unittest.TestCase):
             with self.subTest(key=key):
                 players = make_players(2)
                 state = multi_player.ControllerState()
+                players[0].frame_seconds = 1001 / 60000
 
                 multi_player.handle_key(key, players, state, args)
 
