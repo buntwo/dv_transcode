@@ -9,6 +9,7 @@ import json
 import math
 import os
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -33,6 +34,15 @@ DEFAULT_SEEK_SMALL = 5.0
 DEFAULT_SEEK_LARGE = 30.0
 DEFAULT_NUDGE_SMALL = 0.0333667
 DEFAULT_NUDGE_LARGE = 0.5
+DEFAULT_VOLUME = 100
+MAX_VOLUME = 200
+VOLUME_STEP_SMALL = 5
+VOLUME_STEP_LARGE = 20
+DEFAULT_SPEED = 1.0
+MIN_SPEED = 0.1
+MAX_SPEED = 4.0
+SPEED_STEP_SMALL = 0.1
+SPEED_STEP_LARGE = 0.25
 MIN_VIDEOS = 2
 MAX_VIDEOS = 4
 SELECTED_OSD_MS = 500
@@ -91,6 +101,9 @@ class MpvClient:
 
     def set_volume(self, volume: int) -> None:
         self.command("set_property", "volume", volume)
+
+    def set_speed(self, speed: float) -> None:
+        self.command("set_property", "speed", speed)
 
     def set_title(self, title: str) -> None:
         self.command("set_property", "title", title)
@@ -163,6 +176,7 @@ class Player:
     offset_seconds: float = 0.0
     position_seconds: float | None = None
     start_seconds: float = 0.0
+    volume: int = DEFAULT_VOLUME
     osd_block_until: float = 0.0
     osd_font_size: int = DEFAULT_OSD_FONT_SIZE
 
@@ -177,6 +191,7 @@ class ControllerState:
     audio_index: int = 1
     muted: bool = False
     display_enabled: bool = True
+    speed: float = DEFAULT_SPEED
     cache_pause_index: int | None = None
     auto_paused_for_cache: bool = False
     last_action: str = "ready"
@@ -228,12 +243,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "Accepts seconds, MM:SS, or HH:MM:SS with optional decimals."
             ),
         )
+        parser.add_argument(
+            f"--vol{index}",
+            dest=f"vol{index}",
+            type=volume_int,
+            metavar="VOLUME",
+            help=f"Initial volume for video {index}, from 0 to {MAX_VOLUME}.",
+        )
     args = parser.parse_args(argv)
     if not MIN_VIDEOS <= len(args.videos) <= MAX_VIDEOS:
         parser.error(f"expected {MIN_VIDEOS} to {MAX_VIDEOS} videos")
     for index in range(len(args.videos) + 1, MAX_VIDEOS + 1):
         if getattr(args, f"ss{index}") is not None:
             parser.error(f"-ss{index} was supplied but video {index} is not loaded")
+        if getattr(args, f"vol{index}") is not None:
+            parser.error(f"--vol{index} was supplied but video {index} is not loaded")
     return args
 
 
@@ -255,6 +279,13 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def volume_int(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= MAX_VOLUME:
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_VOLUME}")
     return parsed
 
 
@@ -284,6 +315,13 @@ def collect_start_times(args: argparse.Namespace) -> list[float]:
     default_start_time = args.ss or 0.0
     return [
         specific_start_time if (specific_start_time := getattr(args, f"ss{index}")) is not None else default_start_time
+        for index in range(1, len(args.videos) + 1)
+    ]
+
+
+def collect_volumes(args: argparse.Namespace) -> list[int]:
+    return [
+        volume if (volume := getattr(args, f"vol{index}")) is not None else DEFAULT_VOLUME
         for index in range(1, len(args.videos) + 1)
     ]
 
@@ -318,6 +356,7 @@ def launch_mpv(
         f"--input-ipc-server={ipc_socket}",
         f"--geometry={geometry.mpv_value()}",
         f"--title={title}",
+        f"--volume-max={MAX_VOLUME}",
         f"--volume={volume}",
     ]
     if screen is not None:
@@ -380,6 +419,26 @@ def normalize_key(sequence: bytes) -> str | None:
         return "nudge_back_l"
     if sequence == b"L":
         return "nudge_forward_l"
+    if sequence == b"[":
+        return "volume_down_s"
+    if sequence == b"]":
+        return "volume_up_s"
+    if sequence == b"{":
+        return "volume_down_l"
+    if sequence == b"}":
+        return "volume_up_l"
+    if sequence == b"\\":
+        return "volume_reset"
+    if sequence == b"y":
+        return "speed_down_s"
+    if sequence == b"u":
+        return "speed_up_s"
+    if sequence == b"Y":
+        return "speed_down_l"
+    if sequence == b"U":
+        return "speed_up_l"
+    if sequence == b"i":
+        return "speed_reset"
     if sequence in (b"1", b"2", b"3", b"4"):
         return f"select_{sequence.decode('ascii')}"
     if sequence == b"!":
@@ -434,6 +493,10 @@ def print_help() -> None:
                 "Playback                          Other",
                 "  Space      play/pause all       t     sync to selected timestamp",
                 "  Enter      play/pause selected  m     mute",
+                "  [ ]        volume -/+ 5         \\     volume 100",
+                "  { }        volume -/+ 20",
+                "  y u        speed -/+ 0.10x      i     speed 1.00x",
+                "  Y U        speed -/+ 0.25x",
                 "                                  d     display",
                 "                                  q     quit",
                 "",
@@ -446,6 +509,25 @@ def print_offset_summary(players: list[Player]) -> None:
     print("Final offset:")
     for player in players:
         print(f"  {player.index}: {player.offset_seconds:+.3f}s")
+    print()
+    print("Copyable positions:")
+    print(format_copyable_positions(players))
+
+
+def format_seconds_argument(seconds: float) -> str:
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+
+def format_copyable_positions(players: list[Player]) -> str:
+    start_args: list[str] = []
+    volume_args: list[str] = []
+    video_args: list[str] = []
+    for player in players:
+        position_seconds = player.position_seconds if player.position_seconds is not None else player.start_seconds
+        start_args.extend([f"-ss{player.index}", format_seconds_argument(position_seconds)])
+        volume_args.extend([f"--vol{player.index}", str(player.volume)])
+        video_args.append(shlex.quote(str(player.video)))
+    return " ".join([*start_args, *volume_args, *video_args])
 
 
 def print_status(message: str) -> None:
@@ -663,7 +745,7 @@ def activate_audio(players: list[Player], state: ControllerState, index: int, fl
         return
     state.audio_index = index
     for current in players:
-        live_client(current).set_volume(100 if current.index == index else 0)
+        live_client(current).set_volume(current.volume if current.index == index else 0)
     update_titles(players, state)
     if flash:
         if state.display_enabled:
@@ -671,6 +753,39 @@ def activate_audio(players: list[Player], state: ControllerState, index: int, fl
         else:
             show_temporary_osd(player, f"AUDIO {index}", AUDIO_OSD_MS)
         render_status(players, state, f"audio {player.title_name}")
+
+
+def change_audio_volume(players: list[Player], state: ControllerState, delta: int | None) -> None:
+    player = get_player(players, state.audio_index)
+    if player is None:
+        render_status(players, state, f"video {state.audio_index} is not loaded")
+        return
+    previous_volume = player.volume
+    player.volume = DEFAULT_VOLUME if delta is None else max(0, min(MAX_VOLUME, player.volume + delta))
+    actual_delta = player.volume - previous_volume
+    live_client(player).set_volume(player.volume)
+    refresh_position(player)
+    show_temporary_osd(player, format_osd_state(player, state, f"vol {actual_delta:+d} -> {player.volume}"), ACTION_OSD_MS)
+    render_status(players, state, f"video {player.index} volume {player.volume}")
+
+
+def format_speed(speed: float) -> str:
+    return f"{speed:.2f}x"
+
+
+def change_speed(players: list[Player], state: ControllerState, delta: float | None) -> None:
+    previous_speed = state.speed
+    state.speed = DEFAULT_SPEED if delta is None else max(MIN_SPEED, min(MAX_SPEED, state.speed + delta))
+    actual_delta = state.speed - previous_speed
+    for player in players:
+        live_client(player).set_speed(state.speed)
+        refresh_position(player)
+        show_temporary_osd(
+            player,
+            format_osd_state(player, state, f"speed {actual_delta:+.2f} -> {format_speed(state.speed)}"),
+            ACTION_OSD_MS,
+        )
+    render_status(players, state, f"speed {format_speed(state.speed)}")
 
 
 def set_all_pause(players: list[Player], state: ControllerState) -> None:
@@ -726,12 +841,16 @@ def seek_all(players: list[Player], state: ControllerState, seconds: float) -> N
         render_status(players, state, f"video {selected.index} timestamp is unavailable")
         return
 
-    target_elapsed_seconds = max(0.0, selected.position_seconds - selected.start_seconds + seconds)
+    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds
+    requested_elapsed_seconds = selected_elapsed_seconds + seconds
+    min_elapsed_seconds = -min(player.start_seconds for player in players)
+    target_elapsed_seconds = max(min_elapsed_seconds, requested_elapsed_seconds)
+    actual_seconds = target_elapsed_seconds - selected_elapsed_seconds
     for player in players:
         live_client(player).seek_absolute(player.start_seconds + target_elapsed_seconds)
         refresh_position(player)
-        show_temporary_osd(player, format_osd_state(player, state, f"seek  {seconds:+.3f}s"), ACTION_OSD_MS)
-    render_status(players, state, f"seek all {seconds:+.3f}s")
+        show_temporary_osd(player, format_osd_state(player, state, f"seek  {actual_seconds:+.3f}s"), ACTION_OSD_MS)
+    render_status(players, state, f"seek all {actual_seconds:+.3f}s")
 
 
 def sync_to_selected_time(players: list[Player], state: ControllerState) -> None:
@@ -840,6 +959,26 @@ def handle_key(
         nudge_selected(players, state, -args.seek_small)
     elif key == "nudge_forward_l":
         nudge_selected(players, state, args.seek_small)
+    elif key == "volume_down_s":
+        change_audio_volume(players, state, -VOLUME_STEP_SMALL)
+    elif key == "volume_up_s":
+        change_audio_volume(players, state, VOLUME_STEP_SMALL)
+    elif key == "volume_down_l":
+        change_audio_volume(players, state, -VOLUME_STEP_LARGE)
+    elif key == "volume_up_l":
+        change_audio_volume(players, state, VOLUME_STEP_LARGE)
+    elif key == "volume_reset":
+        change_audio_volume(players, state, None)
+    elif key == "speed_down_s":
+        change_speed(players, state, -SPEED_STEP_SMALL)
+    elif key == "speed_up_s":
+        change_speed(players, state, SPEED_STEP_SMALL)
+    elif key == "speed_down_l":
+        change_speed(players, state, -SPEED_STEP_LARGE)
+    elif key == "speed_up_l":
+        change_speed(players, state, SPEED_STEP_LARGE)
+    elif key == "speed_reset":
+        change_speed(players, state, None)
     elif key.startswith("select_"):
         select_player(players, state, int(key[-1]))
     elif key.startswith("audio_"):
@@ -866,6 +1005,7 @@ def run(args: argparse.Namespace) -> int:
     validate_inputs(args)
     geometries = calculate_geometry(len(args.videos), args.width, args.height, args.gap, args.x, args.y)
     start_times = collect_start_times(args)
+    volumes = collect_volumes(args)
     screen = args.monitor - 1 if args.monitor is not None else None
     state = ControllerState()
     players: list[Player] = []
@@ -878,8 +1018,9 @@ def run(args: argparse.Namespace) -> int:
                 video=video,
                 geometry=geometry,
                 socket_path=tmp_path / f"player-{index}.sock",
+                volume=volume,
             )
-            for index, (video, geometry) in enumerate(zip(args.videos, geometries, strict=True), start=1)
+            for index, (video, geometry, volume) in enumerate(zip(args.videos, geometries, volumes, strict=True), start=1)
         ]
 
         for player in players:
@@ -888,7 +1029,7 @@ def run(args: argparse.Namespace) -> int:
                 player_title(player, state),
                 player.geometry,
                 player.socket_path,
-                100 if player.index == state.audio_index else 0,
+                player.volume if player.index == state.audio_index else 0,
                 screen,
             )
 
@@ -934,6 +1075,7 @@ def run(args: argparse.Namespace) -> int:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
                 print()
         finally:
+            refresh_positions(players)
             for player in players:
                 if player.process is not None:
                     terminate_process(player.process)

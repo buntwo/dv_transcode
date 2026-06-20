@@ -66,6 +66,9 @@ class FakeClient:
     def set_volume(self, volume: int) -> None:
         self.commands.append(("volume", volume))
 
+    def set_speed(self, speed: float) -> None:
+        self.commands.append(("speed", speed))
+
     def set_title(self, title: str) -> None:
         self.commands.append(("title", title))
 
@@ -129,6 +132,10 @@ class TestMultiPlayerArgs(unittest.TestCase):
         self.assertIsNone(args.ss2)
         self.assertIsNone(args.ss3)
         self.assertIsNone(args.ss4)
+        self.assertIsNone(args.vol1)
+        self.assertIsNone(args.vol2)
+        self.assertIsNone(args.vol3)
+        self.assertIsNone(args.vol4)
 
         self.assertEqual(len(multi_player.parse_args(["1.mp4", "2.mp4", "3.mp4"]).videos), 3)
         self.assertEqual(len(multi_player.parse_args(["1.mp4", "2.mp4", "3.mp4", "4.mp4"]).videos), 4)
@@ -142,6 +149,17 @@ class TestMultiPlayerArgs(unittest.TestCase):
     def test_parse_args_rejects_start_seek_for_unloaded_video(self) -> None:
         with self.assertRaises(SystemExit):
             multi_player.parse_args(["-ss3", "10", "one.mp4", "two.mp4"])
+
+    def test_parse_args_accepts_and_rejects_numbered_volumes(self) -> None:
+        args = multi_player.parse_args(["--vol1", "150", "--vol2", "0", "one.mp4", "two.mp4"])
+
+        self.assertEqual(args.vol1, 150)
+        self.assertEqual(args.vol2, 0)
+
+        with self.assertRaises(SystemExit):
+            multi_player.parse_args(["--vol3", "100", "one.mp4", "two.mp4"])
+        with self.assertRaises(SystemExit):
+            multi_player.parse_args(["--vol1", "201", "one.mp4", "two.mp4"])
 
     def test_parse_timestamp_rejects_invalid_values(self) -> None:
         for value in ("-1", "nan", "inf", "1:2:3:4", "01:", "1.5:02", "abc"):
@@ -158,6 +176,11 @@ class TestMultiPlayerArgs(unittest.TestCase):
         args = multi_player.parse_args(["-ss", "5", "-ss2", "12.5", "one.mp4", "two.mp4", "three.mp4"])
 
         self.assertEqual(multi_player.collect_start_times(args), [5.0, 12.5, 5.0])
+
+    def test_collect_volumes_uses_default_with_numbered_overrides(self) -> None:
+        args = multi_player.parse_args(["--vol2", "150", "one.mp4", "two.mp4", "three.mp4"])
+
+        self.assertEqual(multi_player.collect_volumes(args), [100, 150, 100])
 
     def test_parse_args_accepts_short_position_flags_and_monitor(self) -> None:
         args = multi_player.parse_args(["-x", "10", "-y", "20", "--monitor", "2", "one.mp4", "two.mp4"])
@@ -249,13 +272,14 @@ class TestMultiPlayerAudio(unittest.TestCase):
     def test_activate_audio_sets_one_player_audible_and_updates_titles(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState(selected_index=1, audio_index=1, display_enabled=False)
+        players[2].volume = 135
 
         multi_player.activate_audio(players, state, 3)
 
         self.assertEqual(state.audio_index, 3)
         self.assertIn(("volume", 0), players[0].client.commands)
         self.assertIn(("volume", 0), players[1].client.commands)
-        self.assertIn(("volume", 100), players[2].client.commands)
+        self.assertIn(("volume", 135), players[2].client.commands)
         self.assertIn(("show_text", "AUDIO 3", multi_player.AUDIO_OSD_MS), players[2].client.commands)
         self.assertIn(("title", "  [A] 3: video-3.mp4"), players[2].client.commands)
 
@@ -283,6 +307,115 @@ class TestMultiPlayerAudio(unittest.TestCase):
         self.assertEqual(players[0].client.commands, [])
         self.assertEqual(players[1].client.commands, [])
 
+    def test_change_audio_volume_updates_audio_player_even_when_different_video_is_selected(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=2, audio_index=1, display_enabled=False)
+
+        multi_player.change_audio_volume(players, state, 5)
+
+        self.assertEqual(players[0].volume, 105)
+        self.assertEqual(players[1].volume, 100)
+        self.assertIn(("volume", 105), players[0].client.commands)
+        self.assertIn(("time_pos",), players[0].client.commands)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:10.000\nnudge +0.000s\n    [A]\nvol +5 -> 105",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+        self.assertEqual(state.last_action, "video 1 volume 105")
+
+    def test_change_audio_volume_ignores_unloaded_audio_index(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1, audio_index=3, display_enabled=False)
+
+        multi_player.change_audio_volume(players, state, 20)
+
+        self.assertEqual(players[0].client.commands, [])
+        self.assertEqual(players[1].client.commands, [])
+        self.assertEqual(state.last_action, "video 3 is not loaded")
+
+    def test_change_audio_volume_clamps_and_resets(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1, audio_index=1, display_enabled=False)
+        players[0].volume = 198
+
+        multi_player.change_audio_volume(players, state, 20)
+        self.assertEqual(players[0].volume, multi_player.MAX_VOLUME)
+        self.assertIn(("volume", multi_player.MAX_VOLUME), players[0].client.commands)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:10.000\nnudge +0.000s\n[V] [A]\nvol +2 -> 200",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+
+        multi_player.change_audio_volume(players, state, None)
+        self.assertEqual(players[0].volume, multi_player.DEFAULT_VOLUME)
+        self.assertIn(("volume", multi_player.DEFAULT_VOLUME), players[0].client.commands)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:10.000\nnudge +0.000s\n[V] [A]\nvol -100 -> 100",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+
+        players[0].volume = 2
+        multi_player.change_audio_volume(players, state, -20)
+        self.assertEqual(players[0].volume, 0)
+
+    def test_change_speed_updates_every_player_and_flashes_osd(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=2, audio_index=1)
+
+        multi_player.change_speed(players, state, 0.1)
+
+        self.assertAlmostEqual(state.speed, 1.1)
+        for player in players:
+            self.assertIn(("speed", 1.1), player.client.commands)
+            self.assertIn(("time_pos",), player.client.commands)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:10.000\nnudge +0.000s\n    [A]\nspeed +0.10 -> 1.10x",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:20.000\nnudge +0.000s\n[V]    \nspeed +0.10 -> 1.10x",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[1].client.commands,
+        )
+        self.assertEqual(state.last_action, "speed 1.10x")
+
+    def test_change_speed_clamps_and_resets(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(speed=3.9)
+
+        multi_player.change_speed(players, state, 0.25)
+        self.assertEqual(state.speed, multi_player.MAX_SPEED)
+        for player in players:
+            self.assertIn(("speed", multi_player.MAX_SPEED), player.client.commands)
+
+        multi_player.change_speed(players, state, None)
+        self.assertEqual(state.speed, multi_player.DEFAULT_SPEED)
+        for player in players:
+            self.assertIn(("speed", multi_player.DEFAULT_SPEED), player.client.commands)
+
+        state.speed = 0.2
+        multi_player.change_speed(players, state, -0.25)
+        self.assertEqual(state.speed, multi_player.MIN_SPEED)
+
 
 class TestMultiPlayerKeys(unittest.TestCase):
     def test_normalize_key_maps_requested_shortcuts(self) -> None:
@@ -306,6 +439,16 @@ class TestMultiPlayerKeys(unittest.TestCase):
             b"l": "nudge_forward_m",
             b"K": "nudge_back_l",
             b"L": "nudge_forward_l",
+            b"[": "volume_down_s",
+            b"]": "volume_up_s",
+            b"{": "volume_down_l",
+            b"}": "volume_up_l",
+            b"\\": "volume_reset",
+            b"y": "speed_down_s",
+            b"u": "speed_up_s",
+            b"Y": "speed_down_l",
+            b"U": "speed_up_l",
+            b"i": "speed_reset",
             b"1": "select_1",
             b"2": "select_2",
             b"3": "select_3",
@@ -357,6 +500,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn("--ontop", cmd)
         self.assertIn("--osd-align-x=left", cmd)
         self.assertIn("--osd-align-y=top", cmd)
+        self.assertIn(f"--volume-max={multi_player.MAX_VOLUME}", cmd)
         self.assertIn(f"--osd-font={multi_player.OSD_FONT}", cmd)
         self.assertIn(f"--osd-font-size={multi_player.DEFAULT_OSD_FONT_SIZE}", cmd)
         self.assertLess(cmd.index("--pause"), cmd.index("video.mp4"))
@@ -548,6 +692,30 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertEqual(multi_player.format_timestamp(62.345), "00:01:02.345")
         self.assertEqual(multi_player.format_timestamp(-1.2), "-00:00:01.200")
 
+    def test_format_seconds_argument_trims_unneeded_zeroes(self) -> None:
+        self.assertEqual(multi_player.format_seconds_argument(62.0), "62")
+        self.assertEqual(multi_player.format_seconds_argument(62.5), "62.5")
+        self.assertEqual(multi_player.format_seconds_argument(62.3456), "62.346")
+
+    def test_format_copyable_positions_includes_start_flags_and_quoted_filenames(self) -> None:
+        players = make_players(3)
+        players[0].video = Path("Access/one.mp4")
+        players[1].video = Path("Access/two words.mp4")
+        players[2].video = Path("Access/three's.mp4")
+        players[0].position_seconds = 10.0
+        players[1].position_seconds = 20.5
+        players[2].position_seconds = None
+        players[2].start_seconds = 30.25
+        players[0].volume = 100
+        players[1].volume = 135
+        players[2].volume = 0
+
+        self.assertEqual(
+            multi_player.format_copyable_positions(players),
+            "-ss1 10 -ss2 20.5 -ss3 30.25 --vol1 100 --vol2 135 --vol3 0 "
+            "Access/one.mp4 'Access/two words.mp4' 'Access/three'\"'\"'s.mp4'",
+        )
+
     def test_persistent_osd_text_shows_timestamp_and_total_nudge(self) -> None:
         player = make_players(1)[0]
         player.position_seconds = 62.345
@@ -669,6 +837,40 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 432.0), players[2].client.commands)
         self.assertIn(("seek_absolute", 12.0), players[3].client.commands)
 
+    def test_seek_all_can_seek_before_initial_start_offsets(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState()
+        for player in players:
+            player.start_seconds = 420.0
+        players[0].client.time_pos = 420.0
+
+        multi_player.seek_all(players, state, -5.0)
+
+        for player in players:
+            self.assertIn(("seek_absolute", 415.0), player.client.commands)
+        self.assertEqual(state.last_action, "seek all -5.000s")
+
+    def test_seek_all_clips_to_keep_every_video_at_or_after_zero(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState()
+        players[0].start_seconds = 3.0
+        players[1].start_seconds = 10.0
+        players[0].client.time_pos = 3.0
+
+        multi_player.seek_all(players, state, -5.0)
+
+        self.assertIn(("seek_absolute", 0.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 7.0), players[1].client.commands)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:03.000\nnudge +0.000s\n[V] [A]\nseek  -3.000s",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+        self.assertEqual(state.last_action, "seek all -3.000s")
+
     def test_handle_key_maps_seek_and_nudge_levels_to_expected_sizes(self) -> None:
         args = argparse.Namespace(nudge_small=0.033, nudge_large=0.5, seek_medium=2.0, seek_small=5.0, seek_large=30.0)
 
@@ -701,6 +903,45 @@ class TestMultiPlayerControls(unittest.TestCase):
 
                 self.assertIn(("seek", expected_seconds), players[1].client.commands)
                 self.assertEqual(players[0].client.commands, [])
+
+        for key, expected_volume in (
+            ("volume_down_s", 106),
+            ("volume_up_s", 116),
+            ("volume_down_l", 91),
+            ("volume_up_l", 131),
+            ("volume_reset", 100),
+        ):
+            with self.subTest(key=key):
+                players = make_players(2)
+                state = multi_player.ControllerState(selected_index=2, audio_index=1)
+                players[0].volume = 111
+                players[1].volume = 150
+                if key == "volume_reset":
+                    players[0].volume = 123
+
+                multi_player.handle_key(key, players, state, args)
+
+                self.assertEqual(players[0].volume, expected_volume)
+                self.assertEqual(players[1].volume, 150)
+                self.assertIn(("volume", expected_volume), players[0].client.commands)
+                self.assertNotIn(("volume", expected_volume), players[1].client.commands)
+
+        for key, expected_speed in (
+            ("speed_down_s", 1.4),
+            ("speed_up_s", 1.6),
+            ("speed_down_l", 1.25),
+            ("speed_up_l", 1.75),
+            ("speed_reset", 1.0),
+        ):
+            with self.subTest(key=key):
+                players = make_players(2)
+                state = multi_player.ControllerState(speed=1.5)
+
+                multi_player.handle_key(key, players, state, args)
+
+                self.assertAlmostEqual(state.speed, expected_speed)
+                for player in players:
+                    self.assertIn(("speed", expected_speed), player.client.commands)
 
     def test_sync_to_selected_time_seeks_other_players_to_selected_timestamp(self) -> None:
         players = make_players(3)
