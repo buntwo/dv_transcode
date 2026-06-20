@@ -59,6 +59,8 @@ MAX_SELECT_TIMEOUT_SECONDS = 0.1
 PLAYER_READY_TIMEOUT_SECONDS = 10.0
 IPC_CONNECT_ATTEMPTS = 10
 IPC_CONNECT_RETRY_SECONDS = 0.02
+SEEK_SETTLE_SECONDS = 0.25
+SEEK_SETTLE_TOLERANCE_SECONDS = 0.005
 SEEK_KEYS = frozenset(
     {
         "seek_all_back_xs",
@@ -188,12 +190,22 @@ class Player:
     start_seconds: float = 0.0
     volume: int = DEFAULT_VOLUME
     frame_seconds: float | None = None
+    pending_seek_source_seconds: float | None = None
+    pending_seek_target_seconds: float | None = None
+    pending_seek_until: float = 0.0
     osd_block_until: float = 0.0
     osd_font_size: int = DEFAULT_OSD_FONT_SIZE
 
     @property
     def title_name(self) -> str:
         return f"{self.index}: {self.video.name}"
+
+    @property
+    def timeline_base_seconds(self) -> float:
+        return self.start_seconds + self.offset_seconds
+
+    def shift_timeline_base(self, seconds: float) -> None:
+        self.offset_seconds += seconds
 
 
 @dataclass
@@ -203,6 +215,8 @@ class ControllerState:
     muted: bool = False
     display_enabled: bool = True
     speed: float = DEFAULT_SPEED
+    aligned_elapsed_seconds: float | None = None
+    aligned_elapsed_updated_at: float = 0.0
     cache_pause_index: int | None = None
     auto_paused_for_cache: bool = False
     last_action: str = "ready"
@@ -589,8 +603,48 @@ def live_client(player: Player) -> MpvClient:
     return player.client
 
 
+def seek_player_absolute(player: Player, seconds: float) -> None:
+    player.pending_seek_source_seconds = player.position_seconds
+    live_client(player).seek_absolute(seconds)
+    player.position_seconds = seconds
+    player.pending_seek_target_seconds = seconds
+    player.pending_seek_until = time.monotonic() + SEEK_SETTLE_SECONDS
+
+
 def refresh_position(player: Player) -> None:
-    player.position_seconds = live_client(player).get_time_pos()
+    position_seconds = live_client(player).get_time_pos()
+    pending_target_seconds = player.pending_seek_target_seconds
+    if pending_target_seconds is None:
+        player.position_seconds = position_seconds
+        return
+
+    if position_seconds is None:
+        return
+
+    now = time.monotonic()
+    if abs(position_seconds - pending_target_seconds) <= SEEK_SETTLE_TOLERANCE_SECONDS:
+        player.pending_seek_source_seconds = None
+        player.pending_seek_target_seconds = None
+        player.position_seconds = position_seconds
+        return
+
+    if now < player.pending_seek_until:
+        player.position_seconds = pending_target_seconds
+        return
+
+    pending_source_seconds = player.pending_seek_source_seconds
+    if pending_source_seconds is not None and pending_target_seconds > pending_source_seconds:
+        if position_seconds < pending_target_seconds - SEEK_SETTLE_TOLERANCE_SECONDS:
+            player.position_seconds = pending_target_seconds
+            return
+
+    if live_client(player).get_pause():
+        player.position_seconds = pending_target_seconds
+        return
+
+    player.pending_seek_source_seconds = None
+    player.pending_seek_target_seconds = None
+    player.position_seconds = position_seconds
 
 
 def refresh_positions(players: list[Player]) -> None:
@@ -614,6 +668,42 @@ def nudge_selected_frame(players: list[Player], state: ControllerState, directio
         render_status(players, state, f"video {state.selected_index} is not loaded")
         return
     nudge_selected(players, state, direction * (player.frame_seconds or fallback_seconds))
+
+
+def invalidate_aligned_elapsed(state: ControllerState) -> None:
+    state.aligned_elapsed_seconds = None
+    state.aligned_elapsed_updated_at = 0.0
+
+
+def set_aligned_elapsed(state: ControllerState, elapsed_seconds: float) -> None:
+    state.aligned_elapsed_seconds = elapsed_seconds
+    state.aligned_elapsed_updated_at = time.monotonic()
+
+
+def set_aligned_elapsed_from_player(player: Player, state: ControllerState) -> None:
+    if player.position_seconds is not None:
+        set_aligned_elapsed(state, player.position_seconds - player.timeline_base_seconds)
+
+
+def get_aligned_elapsed(players: list[Player], state: ControllerState) -> float | None:
+    selected = get_player(players, state.selected_index)
+    if selected is None:
+        return None
+    initialized = state.aligned_elapsed_seconds is None
+    if state.aligned_elapsed_seconds is None:
+        refresh_position(selected)
+        if selected.position_seconds is None:
+            return None
+        set_aligned_elapsed_from_player(selected, state)
+    if state.aligned_elapsed_seconds is None:
+        return None
+    if initialized:
+        return state.aligned_elapsed_seconds
+    if not live_client(selected).get_pause():
+        now = time.monotonic()
+        state.aligned_elapsed_seconds += (now - state.aligned_elapsed_updated_at) * state.speed
+        state.aligned_elapsed_updated_at = now
+    return state.aligned_elapsed_seconds
 
 
 def pause_all_if_any_player_is_buffering(players: list[Player], state: ControllerState) -> bool:
@@ -828,6 +918,11 @@ def set_all_pause(players: list[Player], state: ControllerState) -> None:
     for player in players:
         live_client(player).set_pause(next_pause)
     refresh_positions(players)
+    selected = get_player(players, state.selected_index)
+    if next_pause and selected is not None:
+        set_aligned_elapsed_from_player(selected, state)
+    else:
+        invalidate_aligned_elapsed(state)
     for player in players:
         show_play_pause_osd(player, next_pause)
     render_status(players, state, "paused" if next_pause else "playing")
@@ -843,6 +938,10 @@ def toggle_selected_pause(players: list[Player], state: ControllerState) -> None
     next_pause = not live_client(player).get_pause()
     live_client(player).set_pause(next_pause)
     refresh_position(player)
+    if next_pause:
+        set_aligned_elapsed_from_player(player, state)
+    else:
+        invalidate_aligned_elapsed(state)
     show_play_pause_osd(player, next_pause)
     render_status(players, state, f"{'paused' if next_pause else 'playing'} {player.title_name}")
 
@@ -850,6 +949,7 @@ def toggle_selected_pause(players: list[Player], state: ControllerState) -> None
 def start_all_playback(players: list[Player], state: ControllerState) -> None:
     for player in players:
         live_client(player).set_pause(False)
+    invalidate_aligned_elapsed(state)
     render_status(players, state, "started")
 
 
@@ -857,7 +957,7 @@ def preseek_players(players: list[Player], start_times: list[float], state: Cont
     for player, start_time in zip(players, start_times, strict=True):
         player.start_seconds = start_time
         if start_time > 0:
-            live_client(player).seek_absolute(start_time)
+            seek_player_absolute(player, start_time)
         refresh_position(player)
     if any(start_time > 0 for start_time in start_times):
         render_status(players, state, "pre-seeked")
@@ -869,18 +969,18 @@ def seek_all(players: list[Player], state: ControllerState, seconds: float) -> N
         render_status(players, state, f"video {state.selected_index} is not loaded")
         return
 
-    refresh_position(selected)
-    if selected.position_seconds is None:
+    aligned_elapsed_seconds = get_aligned_elapsed(players, state)
+    if aligned_elapsed_seconds is None:
         render_status(players, state, f"video {selected.index} timestamp is unavailable")
         return
 
-    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds - selected.offset_seconds
-    requested_elapsed_seconds = selected_elapsed_seconds + seconds
-    min_elapsed_seconds = max(-(player.start_seconds + player.offset_seconds) for player in players)
+    requested_elapsed_seconds = aligned_elapsed_seconds + seconds
+    min_elapsed_seconds = max(-player.timeline_base_seconds for player in players)
     target_elapsed_seconds = max(min_elapsed_seconds, requested_elapsed_seconds)
-    actual_seconds = target_elapsed_seconds - selected_elapsed_seconds
+    actual_seconds = target_elapsed_seconds - aligned_elapsed_seconds
+    set_aligned_elapsed(state, target_elapsed_seconds)
     for player in players:
-        live_client(player).seek_absolute(player.start_seconds + target_elapsed_seconds + player.offset_seconds)
+        seek_player_absolute(player, player.timeline_base_seconds + target_elapsed_seconds)
         refresh_position(player)
         show_temporary_osd(player, format_osd_state(player, state, f"seek  {actual_seconds:+.3f}s"), ACTION_OSD_MS)
     render_status(players, state, f"seek all {actual_seconds:+.3f}s")
@@ -892,15 +992,18 @@ def sync_to_selected_time(players: list[Player], state: ControllerState) -> None
         render_status(players, state, f"video {state.selected_index} is not loaded")
         return
 
-    refresh_position(selected)
+    refresh_positions(players)
     if selected.position_seconds is None:
         render_status(players, state, f"video {selected.index} timestamp is unavailable")
         return
 
-    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds - selected.offset_seconds
+    selected_start_elapsed_seconds = selected.position_seconds - selected.start_seconds
+    selected_base_elapsed_seconds = selected.position_seconds - selected.timeline_base_seconds
     for player in players:
         if player.index != selected.index:
-            live_client(player).seek_absolute(max(0.0, player.start_seconds + selected_elapsed_seconds + player.offset_seconds))
+            target_position_seconds = max(0.0, player.start_seconds + selected_start_elapsed_seconds)
+            player.offset_seconds = target_position_seconds - player.start_seconds - selected_base_elapsed_seconds
+            seek_player_absolute(player, target_position_seconds)
             refresh_position(player)
             show_temporary_osd(
                 player,
@@ -909,6 +1012,7 @@ def sync_to_selected_time(players: list[Player], state: ControllerState) -> None
             )
         else:
             refresh_position(player)
+    set_aligned_elapsed(state, selected_base_elapsed_seconds)
     render_status(players, state, f"synced all to video {selected.index} at {format_timestamp(selected.position_seconds)}")
 
 
@@ -923,9 +1027,10 @@ def nudge_selected(players: list[Player], state: ControllerState, seconds: float
         return
     target_position_seconds = max(0.0, player.position_seconds + seconds)
     actual_seconds = target_position_seconds - player.position_seconds
-    live_client(player).seek_absolute(target_position_seconds)
-    player.offset_seconds += actual_seconds
+    seek_player_absolute(player, target_position_seconds)
+    player.shift_timeline_base(actual_seconds)
     refresh_position(player)
+    set_aligned_elapsed_from_player(player, state)
     show_temporary_osd(
         player,
         format_osd_state(player, state, f"delta {actual_seconds:+.3f}s"),

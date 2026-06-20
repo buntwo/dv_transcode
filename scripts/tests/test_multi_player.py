@@ -810,12 +810,12 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 20.5), players[1].client.commands)
         self.assertIn(("time_pos",), players[1].client.commands)
         self.assertIn(
-            ("show_text", "time  00:00:20.000\nnudge +0.500s\n[V]    \ndelta +0.500s", multi_player.ACTION_OSD_MS),
+            ("show_text", "time  00:00:20.500\nnudge +0.500s\n[V]    \ndelta +0.500s", multi_player.ACTION_OSD_MS),
             players[1].client.commands,
         )
         self.assertEqual(players[2].client.commands, [])
         self.assertEqual(state.last_action, "video 2 offset +0.500s")
-        self.assertEqual(players[1].position_seconds, 20.0)
+        self.assertEqual(players[1].position_seconds, 20.5)
 
     def test_nudge_selected_clips_at_zero_and_records_actual_delta(self) -> None:
         players = make_players(2)
@@ -830,7 +830,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(
             (
                 "show_text",
-                "time  00:00:02.000\nnudge -3.000s\n[V] [A]\ndelta -2.000s",
+                "time  00:00:00.000\nnudge -3.000s\n[V] [A]\ndelta -2.000s",
                 multi_player.ACTION_OSD_MS,
             ),
             players[0].client.commands,
@@ -870,6 +870,39 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 10.0 + 1001 / 60000), players[0].client.commands)
         self.assertNotIn(("frame_rate",), players[0].client.commands)
 
+    def test_seek_all_after_nudge_uses_canonical_aligned_elapsed(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].client.time_positions = [10.0, 10.0, 10.0, 10.0]
+
+        with patch.object(multi_player.time, "monotonic", return_value=100.0):
+            multi_player.nudge_selected(players, state, 0.5)
+            multi_player.seek_all(players, state, 5.0)
+
+        self.assertIn(("seek_absolute", 10.5), players[0].client.commands)
+        self.assertIn(("seek_absolute", 15.5), players[0].client.commands)
+        self.assertIn(("seek_absolute", 15.0), players[1].client.commands)
+
+    def test_seek_all_preserves_alignment_after_paused_nudges_on_each_player(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].client.pause = True
+        players[1].client.pause = True
+        players[0].client.time_pos = 10.0
+        players[1].start_seconds = 100.0
+        players[1].client.time_pos = 110.0
+
+        multi_player.nudge_selected(players, state, 0.5)
+        state.selected_index = 2
+        multi_player.nudge_selected(players, state, -0.25)
+        multi_player.seek_all(players, state, -0.5)
+
+        self.assertEqual(players[0].offset_seconds, 0.5)
+        self.assertEqual(players[1].offset_seconds, -0.25)
+        self.assertIn(("seek_absolute", 10.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 109.25), players[1].client.commands)
+        self.assertAlmostEqual(state.aligned_elapsed_seconds or 0.0, 9.5)
+
     def test_seek_all_moves_every_player(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState()
@@ -884,7 +917,7 @@ class TestMultiPlayerControls(unittest.TestCase):
             self.assertIn(
                 (
                     "show_text",
-                    f"time  00:00:{player.index * 10:02}.000\nnudge +0.000s\n{expected_state}\nseek  -5.000s",
+                    f"time  00:00:{expected_targets[player.index]:02.0f}.000\nnudge +0.000s\n{expected_state}\nseek  -5.000s",
                     multi_player.ACTION_OSD_MS,
                 ),
                 player.client.commands,
@@ -896,6 +929,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         state = multi_player.ControllerState(selected_index=4)
         for player, start_seconds in zip(players, [420.0, 420.0, 420.0, 0.0], strict=True):
             player.start_seconds = start_seconds
+            player.client.time_pos = start_seconds + 10.0
         players[3].client.time_pos = 10.0
 
         multi_player.seek_all(players, state, 2.0)
@@ -924,6 +958,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         state = multi_player.ControllerState()
         for player in players:
             player.start_seconds = 420.0
+            player.client.time_pos = 420.0
         players[0].client.time_pos = 420.0
 
         multi_player.seek_all(players, state, -5.0)
@@ -938,6 +973,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         players[0].start_seconds = 3.0
         players[1].start_seconds = 10.0
         players[0].client.time_pos = 3.0
+        players[1].client.time_pos = 10.0
 
         multi_player.seek_all(players, state, -5.0)
 
@@ -946,7 +982,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(
             (
                 "show_text",
-                "time  00:00:03.000\nnudge +0.000s\n[V] [A]\nseek  -3.000s",
+                "time  00:00:00.000\nnudge +0.000s\n[V] [A]\nseek  -3.000s",
                 multi_player.ACTION_OSD_MS,
             ),
             players[0].client.commands,
@@ -961,6 +997,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         players[0].offset_seconds = -1.0
         players[1].offset_seconds = 2.0
         players[0].client.time_pos = 2.0
+        players[1].client.time_pos = 12.0
 
         multi_player.seek_all(players, state, -5.0)
 
@@ -1101,7 +1138,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 430.0), players[2].client.commands)
         self.assertNotIn(("seek_absolute", 10.0), players[3].client.commands)
 
-    def test_sync_to_selected_time_preserves_nudged_offsets(self) -> None:
+    def test_sync_to_selected_time_updates_other_offsets_to_selected_start_adjusted_timestamp(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState(selected_index=1)
         for player in players:
@@ -1110,12 +1147,32 @@ class TestMultiPlayerControls(unittest.TestCase):
         players[1].offset_seconds = -2.0
         players[2].offset_seconds = 3.0
         players[0].client.time_pos = 111.0
+        players[1].client.time_pos = 108.0
+        players[2].client.time_pos = 113.0
 
         multi_player.sync_to_selected_time(players, state)
 
         self.assertNotIn(("seek_absolute", 111.0), players[0].client.commands)
-        self.assertIn(("seek_absolute", 108.0), players[1].client.commands)
-        self.assertIn(("seek_absolute", 113.0), players[2].client.commands)
+        self.assertIn(("seek_absolute", 111.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 111.0), players[2].client.commands)
+        self.assertEqual(players[0].offset_seconds, 1.0)
+        self.assertEqual(players[1].offset_seconds, 1.0)
+        self.assertEqual(players[2].offset_seconds, 1.0)
+
+    def test_sync_to_selected_time_corrects_elapsed_drift_after_relative_seek(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].start_seconds = 0.0
+        players[1].start_seconds = 100.0
+        players[0].offset_seconds = 0.5
+        players[1].offset_seconds = -0.25
+        players[0].client.time_pos = 11.5
+        players[1].client.time_pos = 112.0
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertNotIn(("seek_absolute", 11.5), players[0].client.commands)
+        self.assertIn(("seek_absolute", 111.5), players[1].client.commands)
 
     def test_sync_to_selected_time_handles_unavailable_selected_timestamp(self) -> None:
         players = make_players(2)
