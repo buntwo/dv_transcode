@@ -31,6 +31,8 @@ def make_config(**overrides) -> transcode3.Config:
         "encoder": "videotoolbox",
         "preset": None,
         "crf": None,
+        "video_filter": None,
+        "lut": None,
         "deint_mode": "send_field",
         "map_both_audio": False,
         "log_level": "warning",
@@ -906,6 +908,66 @@ class TestFiltersAndArgs(unittest.TestCase):
 
         self.assertNotIn("format=yuv420p10le", vf)
 
+    def test_lut_adds_lut3d_stage_before_subtitles_and_final_format(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+        lut = Path("/tmp/general_vhs_to_video8_strength85.cube")
+
+        vf = transcode3.build_vf(make_config(format_type="digital8", encoder="libx265", lut=lut), paths)
+
+        lut_stage = "lut3d=/tmp/general_vhs_to_video8_strength85.cube:interp=tetrahedral"
+        self.assertIn(lut_stage, vf)
+        self.assertLess(vf.index("setparams=range=limited"), vf.index(lut_stage))
+        self.assertLess(vf.index(lut_stage), vf.index("subtitles="))
+        self.assertLess(vf.index("subtitles="), vf.index("format=yuv420p10le"))
+
+    def test_custom_vf_replaces_generated_filter_chain_exactly(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+        custom_vf = "bwdif=mode=send_frame,scale=640:-2,format=yuv420p"
+        cfg = make_config(
+            format_type="digital8",
+            encoder="libx265",
+            mask_top=8,
+            mask_bottom=8,
+            denoise="strong",
+            video_filter=custom_vf,
+        )
+
+        vf = transcode3.build_vf(cfg, paths)
+        args = transcode3.build_ffmpeg_args(cfg, paths, vf, preview=False)
+
+        self.assertEqual(vf, custom_vf)
+        self.assertEqual(args[args.index("-vf") + 1], custom_vf)
+        self.assertNotIn("drawbox", vf)
+        self.assertNotIn("hqdn3d", vf)
+        self.assertNotIn("subtitles=", vf)
+        self.assertNotIn("yuv420p10le", vf)
+
 
 class TestTranscodeAccess(unittest.TestCase):
     def test_access_parse_args_sets_vhs_defaults_and_access_layout(self) -> None:
@@ -965,6 +1027,78 @@ class TestTranscodeAccess(unittest.TestCase):
             cfg, _ = transcode_access.parse_args()
 
         self.assertTrue(cfg.no_logs)
+
+    def test_access_parse_args_supports_custom_vf(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--vf",
+            "bwdif=mode=send_frame,scale=640:-2",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertEqual(cfg.video_filter, "bwdif=mode=send_frame,scale=640:-2")
+
+    def test_access_parse_args_supports_lut(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lut = Path(tmp) / "general_vhs_to_video8_strength85.cube"
+            lut.write_text("", encoding="utf-8")
+            argv = [
+                "transcode_access.py",
+                "--format",
+                "vhs",
+                "--lut",
+                str(lut),
+                "masters/tape/08.mkv",
+            ]
+            with patch.object(sys, "argv", argv):
+                cfg, _ = transcode_access.parse_args()
+
+        self.assertEqual(cfg.lut, lut)
+
+    def test_access_parse_args_rejects_blank_custom_vf(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--vf",
+            " ",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode_access.parse_args()
+
+    def test_access_parse_args_rejects_missing_lut(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--lut",
+            "/tmp/missing.cube",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode_access.parse_args()
+
+    def test_access_parse_args_rejects_lut_with_custom_vf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lut = Path(tmp) / "general_vhs_to_video8_strength85.cube"
+            lut.write_text("", encoding="utf-8")
+            argv = [
+                "transcode_access.py",
+                "--format",
+                "vhs",
+                "--vf",
+                "bwdif",
+                "--lut",
+                str(lut),
+                "masters/tape/08.mkv",
+            ]
+            with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+                transcode_access.parse_args()
 
     def test_access_parse_args_supports_libx265_defaults(self) -> None:
         argv = [

@@ -45,6 +45,8 @@ class Config:
     encoder: str
     preset: str | None
     crf: float | None
+    video_filter: str | None
+    lut: Path | None
     deint_mode: str
     map_both_audio: bool
     log_level: str
@@ -167,6 +169,8 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
         help="libx265 preset; only valid with --encoder libx265 (default: medium)",
     )
     parser.add_argument("--crf", type=float, help="libx265 CRF; only valid with --encoder libx265 (default: 20)")
+    parser.add_argument("--vf", dest="video_filter", help="Override the complete ffmpeg -vf filter string")
+    parser.add_argument("--lut", type=Path, help="Add a lut3d stage using this .cube file")
     parser.add_argument("--deint-mode", choices=["send_frame", "send_field"], default="send_field")
     parser.add_argument("--map-both-audio", action="store_true")
     parser.add_argument("--log-level", choices=["quiet", "error", "warning", "info"], default="warning")
@@ -188,6 +192,12 @@ def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argpar
             parser.error("--crf is only valid with --encoder libx265")
     elif args.codec != "hevc":
         parser.error("--encoder libx265 requires --codec hevc")
+    if args.video_filter is not None and not args.video_filter.strip():
+        parser.error("--vf cannot be blank")
+    if args.video_filter is not None and args.lut is not None:
+        parser.error("--lut cannot be combined with --vf; include lut3d in --vf")
+    if args.lut is not None and not args.lut.is_file():
+        parser.error(f"--lut file does not exist: {args.lut}")
 
 
 def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
@@ -215,6 +225,8 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         encoder=args.encoder,
         preset=preset,
         crf=crf,
+        video_filter=args.video_filter,
+        lut=args.lut,
         deint_mode=args.deint_mode,
         map_both_audio=args.map_both_audio,
         log_level=args.log_level,
@@ -780,6 +792,9 @@ def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
 
 def build_vf(cfg: Config, paths: Paths) -> str:
     """Build the ffmpeg video filter chain."""
+    if cfg.video_filter is not None:
+        return cfg.video_filter
+
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
     if cfg.mask_top > 0:
@@ -795,6 +810,9 @@ def build_vf(cfg: Config, paths: Paths) -> str:
         "setsar=1",
         "setparams=range=limited",
     ]
+
+    if cfg.lut is not None:
+        filters.append(f"lut3d={escape_ffmpeg_filter_value(str(cfg.lut))}:interp=tetrahedral")
 
     if cfg.format_type == "digital8":
         style = (
