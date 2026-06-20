@@ -864,10 +864,10 @@ def sync_to_selected_time(players: list[Player], state: ControllerState) -> None
         render_status(players, state, f"video {selected.index} timestamp is unavailable")
         return
 
-    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds
+    selected_elapsed_seconds = selected.position_seconds - selected.start_seconds - selected.offset_seconds
     for player in players:
         if player.index != selected.index:
-            live_client(player).seek_absolute(max(0.0, player.start_seconds + selected_elapsed_seconds))
+            live_client(player).seek_absolute(max(0.0, player.start_seconds + selected_elapsed_seconds + player.offset_seconds))
             refresh_position(player)
             show_temporary_osd(
                 player,
@@ -884,12 +884,18 @@ def nudge_selected(players: list[Player], state: ControllerState, seconds: float
     if player is None:
         render_status(players, state, f"video {state.selected_index} is not loaded")
         return
-    live_client(player).seek(seconds)
-    player.offset_seconds += seconds
+    refresh_position(player)
+    if player.position_seconds is None:
+        render_status(players, state, f"video {player.index} timestamp is unavailable")
+        return
+    target_position_seconds = max(0.0, player.position_seconds + seconds)
+    actual_seconds = target_position_seconds - player.position_seconds
+    live_client(player).seek_absolute(target_position_seconds)
+    player.offset_seconds += actual_seconds
     refresh_position(player)
     show_temporary_osd(
         player,
-        format_osd_state(player, state, f"delta {seconds:+.3f}s"),
+        format_osd_state(player, state, f"delta {actual_seconds:+.3f}s"),
         ACTION_OSD_MS,
     )
     render_status(players, state, f"video {player.index} offset {player.offset_seconds:+.3f}s")

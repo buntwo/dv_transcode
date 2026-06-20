@@ -792,7 +792,7 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertEqual(players[1].offset_seconds, 0.5)
         self.assertEqual(players[2].offset_seconds, 0.0)
         self.assertEqual(players[0].client.commands, [])
-        self.assertIn(("seek", 0.5), players[1].client.commands)
+        self.assertIn(("seek_absolute", 20.5), players[1].client.commands)
         self.assertIn(("time_pos",), players[1].client.commands)
         self.assertIn(
             ("show_text", "time  00:00:20.000\nnudge +0.500s\n[V]    \ndelta +0.500s", multi_player.ACTION_OSD_MS),
@@ -801,6 +801,37 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertEqual(players[2].client.commands, [])
         self.assertEqual(state.last_action, "video 2 offset +0.500s")
         self.assertEqual(players[1].position_seconds, 20.0)
+
+    def test_nudge_selected_clips_at_zero_and_records_actual_delta(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].offset_seconds = -1.0
+        players[0].client.time_pos = 2.0
+
+        multi_player.nudge_selected(players, state, -5.0)
+
+        self.assertIn(("seek_absolute", 0.0), players[0].client.commands)
+        self.assertEqual(players[0].offset_seconds, -3.0)
+        self.assertIn(
+            (
+                "show_text",
+                "time  00:00:02.000\nnudge -3.000s\n[V] [A]\ndelta -2.000s",
+                multi_player.ACTION_OSD_MS,
+            ),
+            players[0].client.commands,
+        )
+        self.assertEqual(state.last_action, "video 1 offset -3.000s")
+
+    def test_nudge_selected_handles_unavailable_timestamp(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(selected_index=1)
+        players[0].client.time_pos = None
+
+        multi_player.nudge_selected(players, state, 0.5)
+
+        self.assertNotIn(("seek_absolute", 0.5), players[0].client.commands)
+        self.assertEqual(players[0].offset_seconds, 0.0)
+        self.assertEqual(state.last_action, "video 1 timestamp is unavailable")
 
     def test_seek_all_moves_every_player(self) -> None:
         players = make_players(3)
@@ -930,7 +961,7 @@ class TestMultiPlayerControls(unittest.TestCase):
 
                 multi_player.handle_key(key, players, state, args)
 
-                self.assertIn(("seek", expected_seconds), players[1].client.commands)
+                self.assertIn(("seek_absolute", 20.0 + expected_seconds), players[1].client.commands)
                 self.assertEqual(players[0].client.commands, [])
 
         for key, expected_volume in (
@@ -1029,6 +1060,22 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIn(("seek_absolute", 430.0), players[1].client.commands)
         self.assertIn(("seek_absolute", 430.0), players[2].client.commands)
         self.assertNotIn(("seek_absolute", 10.0), players[3].client.commands)
+
+    def test_sync_to_selected_time_preserves_nudged_offsets(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState(selected_index=1)
+        for player in players:
+            player.start_seconds = 100.0
+        players[0].offset_seconds = 1.0
+        players[1].offset_seconds = -2.0
+        players[2].offset_seconds = 3.0
+        players[0].client.time_pos = 111.0
+
+        multi_player.sync_to_selected_time(players, state)
+
+        self.assertNotIn(("seek_absolute", 111.0), players[0].client.commands)
+        self.assertIn(("seek_absolute", 108.0), players[1].client.commands)
+        self.assertIn(("seek_absolute", 113.0), players[2].client.commands)
 
     def test_sync_to_selected_time_handles_unavailable_selected_timestamp(self) -> None:
         players = make_players(2)
