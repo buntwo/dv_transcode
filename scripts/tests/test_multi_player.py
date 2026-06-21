@@ -529,6 +529,32 @@ class TestMultiPlayerControls(unittest.TestCase):
         cmd = popen.call_args.args[0]
         self.assertIn("--screen=1", cmd)
 
+    def test_restore_terminal_focus_activates_macos_bundle_id(self) -> None:
+        with patch.object(multi_player.sys, "platform", "darwin"), patch.object(multi_player.subprocess, "run") as run:
+            multi_player.restore_terminal_focus("io.alacritty")
+
+        run.assert_called_once_with(
+            ["osascript", "-e", 'tell application id "io.alacritty" to activate'],
+            check=False,
+            stdout=multi_player.subprocess.DEVNULL,
+            stderr=multi_player.subprocess.DEVNULL,
+        )
+
+    def test_restore_terminal_focus_skips_without_macos_or_bundle_id(self) -> None:
+        with patch.object(multi_player.sys, "platform", "linux"), patch.object(multi_player.subprocess, "run") as run:
+            multi_player.restore_terminal_focus("io.alacritty")
+
+        run.assert_not_called()
+
+        with (
+            patch.object(multi_player.sys, "platform", "darwin"),
+            patch.dict(multi_player.os.environ, {}, clear=True),
+            patch.object(multi_player.subprocess, "run") as run,
+        ):
+            multi_player.restore_terminal_focus()
+
+        run.assert_not_called()
+
     def test_start_all_playback_unpauses_every_player_without_osd(self) -> None:
         players = make_players(3)
         state = multi_player.ControllerState()

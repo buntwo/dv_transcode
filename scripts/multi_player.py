@@ -390,6 +390,20 @@ def launch_mpv(
     return subprocess.Popen(cmd)
 
 
+def restore_terminal_focus(bundle_id: str | None = None) -> None:
+    if sys.platform != "darwin":
+        return
+    app_bundle_id = bundle_id or os.environ.get("__CFBundleIdentifier")
+    if not app_bundle_id:
+        return
+    subprocess.run(
+        ["osascript", "-e", f'tell application id "{app_bundle_id}" to activate'],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def wait_for_socket(path: Path, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1193,6 +1207,7 @@ def run(args: argparse.Namespace) -> int:
             preseek_players(players, start_times, state)
             update_titles(players, state)
             activate_audio(players, state, state.audio_index, flash=False)
+            restore_terminal_focus()
             print_help()
             start_all_playback(players, state)
             pause_all_if_any_player_is_buffering(players, state)
