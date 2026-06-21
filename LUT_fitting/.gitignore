@@ -1,0 +1,14 @@
+__pycache__/
+.DS_Store
+*_frames/
+
+# Generated clips, geometry-normalized data, evaluation outputs, and LUT review sheets.
+generated_video_pairs/
+
+# Scratch experiment LUTs are reproducible from the scripts/manifests.
+LUTs/experiments/
+LUTs/known_good_check/
+
+# Contact sheets generated during source-pair review.
+video_pairs_contact_sheet.png
+video_pairs_raw_*_contact_sheet.png
