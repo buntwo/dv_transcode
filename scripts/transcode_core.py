@@ -223,7 +223,7 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
     mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
     default_preset = "slow" if args.format_type == "vhs" else "medium"
-    default_crf = 24.0 if args.format_type == "vhs" else 20.0
+    default_crf = 22.0 if args.format_type == "vhs" else 20.0
     preset = args.preset if args.preset is not None else (default_preset if args.encoder == "libx265" else None)
     crf = args.crf if args.crf is not None else (default_crf if args.encoder == "libx265" else None)
 

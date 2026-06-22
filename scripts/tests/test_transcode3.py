@@ -130,7 +130,7 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.encoder, "libx265")
         self.assertEqual(cfg.codec, "hevc")
         self.assertEqual(cfg.preset, "slow")
-        self.assertEqual(cfg.crf, 24.0)
+        self.assertEqual(cfg.crf, 22.0)
 
     def test_parse_args_supports_non_vhs_libx265_defaults(self) -> None:
         argv = [
@@ -1166,7 +1166,7 @@ class TestTranscodeAccess(unittest.TestCase):
 
         self.assertEqual(cfg.encoder, "libx265")
         self.assertEqual(cfg.preset, "slow")
-        self.assertEqual(cfg.crf, 24.0)
+        self.assertEqual(cfg.crf, 22.0)
 
     def test_access_parse_args_rejects_libx265_options_with_videotoolbox(self) -> None:
         argv = [

@@ -113,7 +113,7 @@ def compare_frame(video: Path, time_s: float, label: str) -> dict[str, object]:
     }
 
 
-def test_videos(args: argparse.Namespace) -> list[tuple[str, Path, int]]:
+def collect_test_videos(args: argparse.Namespace) -> list[tuple[str, Path, int]]:
     videos: list[tuple[str, Path, int]] = []
     for index, (_ref, src) in enumerate(read_manifest(args.validation_pairs), start=1):
         videos.append((f"validation_pair_{index:03d}", src, args.validation_frames))
@@ -173,7 +173,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     rows: list[dict[str, object]] = []
-    for label, video, frame_count in test_videos(args):
+    for label, video, frame_count in collect_test_videos(args):
         info = probe(video)
         duration = info.duration
         for time_s in calculate_sample_times(duration, frame_count):
