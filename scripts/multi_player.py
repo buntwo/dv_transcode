@@ -48,6 +48,7 @@ MAX_VIDEOS = 4
 SELECTED_OSD_MS = 500
 AUDIO_OSD_MS = 500
 ACTION_OSD_MS = 500
+END_OSD_MS = 1_000
 PERSISTENT_OSD_MS = 3_600_000
 PAUSE_OSD_TEXT = "▌▌"
 PLAY_OSD_TEXT = "▶"
@@ -121,6 +122,10 @@ class MpvClient:
 
     def get_paused_for_cache(self) -> bool:
         response = self.command("get_property", "paused-for-cache")
+        return bool(response.get("data"))
+
+    def get_eof_reached(self) -> bool:
+        response = self.command("get_property", "eof-reached")
         return bool(response.get("data"))
 
     def get_time_pos(self) -> float | None:
@@ -218,6 +223,7 @@ class ControllerState:
     aligned_elapsed_seconds: float | None = None
     aligned_elapsed_updated_at: float = 0.0
     cache_pause_index: int | None = None
+    end_pause_index: int | None = None
     auto_paused_for_cache: bool = False
     last_action: str = "ready"
 
@@ -373,6 +379,7 @@ def launch_mpv(
         "mpv",
         "--no-terminal",
         "--pause",
+        "--keep-open=yes",
         "--ontop",
         "--osd-align-x=left",
         "--osd-align-y=top",
@@ -746,6 +753,31 @@ def pause_all_if_any_player_is_buffering(players: list[Player], state: Controlle
     for player in players:
         show_temporary_osd(player, f"{PAUSE_OSD_TEXT} video {buffering_player.index} buffering", ACTION_OSD_MS)
     render_status(players, state, f"paused: video {buffering_player.index} buffering")
+    return True
+
+
+def pause_all_if_any_player_ended(players: list[Player], state: ControllerState) -> bool:
+    ended_player = next((player for player in players if live_client(player).get_eof_reached()), None)
+    if ended_player is None:
+        state.end_pause_index = None
+        return False
+
+    already_paused = all(live_client(player).get_pause() for player in players)
+    if state.end_pause_index == ended_player.index and already_paused:
+        return True
+
+    state.end_pause_index = ended_player.index
+    state.auto_paused_for_cache = False
+    state.cache_pause_index = None
+    for player in players:
+        live_client(player).set_pause(True)
+    refresh_positions(players)
+    selected = get_player(players, state.selected_index)
+    if selected is not None:
+        set_aligned_elapsed_from_player(selected, state)
+    for player in players:
+        show_temporary_osd(player, f"{PAUSE_OSD_TEXT} video {ended_player.index} ended", END_OSD_MS)
+    render_status(players, state, f"paused: video {ended_player.index} ended")
     return True
 
 
@@ -1224,7 +1256,7 @@ def run(args: argparse.Namespace) -> int:
                     restore_due_persistent_displays(players, state, now)
                     if now >= next_status_refresh:
                         refresh_positions(players)
-                        if not pause_all_if_any_player_is_buffering(players, state):
+                        if not pause_all_if_any_player_ended(players, state) and not pause_all_if_any_player_is_buffering(players, state):
                             update_persistent_displays(players, state)
                             print_status(format_status(players, state))
                         next_status_refresh = now + STATUS_REFRESH_SECONDS

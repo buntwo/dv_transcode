@@ -55,11 +55,13 @@ class FakeClient:
         pause: bool = False,
         time_pos: float | None = None,
         paused_for_cache: bool = False,
+        eof_reached: bool = False,
         frame_rate: float | None = None,
     ) -> None:
         self.pause = pause
         self.time_pos = time_pos
         self.paused_for_cache = paused_for_cache
+        self.eof_reached = eof_reached
         self.frame_rate = frame_rate
         self.time_positions: list[float | None] | None = None
         self.commands: list[tuple[object, ...]] = []
@@ -88,6 +90,10 @@ class FakeClient:
     def get_paused_for_cache(self) -> bool:
         self.commands.append(("paused_for_cache",))
         return self.paused_for_cache
+
+    def get_eof_reached(self) -> bool:
+        self.commands.append(("eof_reached",))
+        return self.eof_reached
 
     def get_time_pos(self) -> float | None:
         self.commands.append(("time_pos",))
@@ -512,6 +518,7 @@ class TestMultiPlayerControls(unittest.TestCase):
 
         cmd = popen.call_args.args[0]
         self.assertIn("--pause", cmd)
+        self.assertIn("--keep-open=yes", cmd)
         self.assertIn("--ontop", cmd)
         self.assertIn("--osd-align-x=left", cmd)
         self.assertIn("--osd-align-y=top", cmd)
@@ -678,6 +685,46 @@ class TestMultiPlayerControls(unittest.TestCase):
         self.assertIsNone(state.cache_pause_index)
         self.assertFalse(state.auto_paused_for_cache)
         self.assertEqual(state.last_action, "resumed after buffering")
+
+    def test_pause_all_if_any_player_ended_pauses_every_player(self) -> None:
+        players = make_players(3)
+        state = multi_player.ControllerState(cache_pause_index=1, auto_paused_for_cache=True)
+        players[1].client.eof_reached = True
+
+        self.assertTrue(multi_player.pause_all_if_any_player_ended(players, state))
+
+        for player in players:
+            self.assertIn(("pause", True), player.client.commands)
+            self.assertIn(("time_pos",), player.client.commands)
+            self.assertIn(
+                ("show_text", f"{multi_player.PAUSE_OSD_TEXT} video 2 ended", multi_player.END_OSD_MS),
+                player.client.commands,
+            )
+        self.assertEqual(state.end_pause_index, 2)
+        self.assertIsNone(state.cache_pause_index)
+        self.assertFalse(state.auto_paused_for_cache)
+        self.assertEqual(state.last_action, "paused: video 2 ended")
+
+    def test_pause_all_if_any_player_ended_debounces_same_paused_player(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(end_pause_index=1)
+        players[0].client.eof_reached = True
+        for player in players:
+            player.client.pause = True
+
+        self.assertTrue(multi_player.pause_all_if_any_player_ended(players, state))
+
+        for player in players:
+            self.assertNotIn(("pause", True), player.client.commands)
+        self.assertEqual(state.last_action, "ready")
+
+    def test_pause_all_if_any_player_ended_clears_end_pause_state(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState(end_pause_index=1)
+
+        self.assertFalse(multi_player.pause_all_if_any_player_ended(players, state))
+
+        self.assertIsNone(state.end_pause_index)
 
     def test_manual_pause_cancels_buffering_auto_resume(self) -> None:
         players = make_players(2)
