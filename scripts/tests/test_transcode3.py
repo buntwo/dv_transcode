@@ -847,7 +847,7 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertEqual(transcode3.classify_video_standard(720, 576, 25.0), "pal")
         self.assertAlmostEqual(transcode3.parse_frame_rate("30000/1001") or 0.0, 29.97002997002997)
 
-    def test_mask_top_and_bottom_draw_black_boxes_without_changing_geometry(self) -> None:
+    def test_mask_top_and_bottom_crop_before_denoise_and_pad_before_scale(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),
             stem="input",
@@ -865,10 +865,36 @@ class TestFiltersAndArgs(unittest.TestCase):
 
         vf = transcode3.build_vf(make_config(mask_top=6, mask_bottom=8), paths)
 
-        self.assertIn("drawbox=x=0:y=0:w=iw:h=6:color=black:t=fill", vf)
-        self.assertIn("drawbox=x=0:y=ih-8:w=iw:h=8:color=black:t=fill", vf)
-        self.assertNotIn("crop=", vf)
-        self.assertNotIn("pad=", vf)
+        crop_filter = "crop=w=iw:h=ih-14:x=0:y=6"
+        pad_filter = "pad=w=iw:h=ih+14:x=0:y=6:color=black"
+        self.assertIn(crop_filter, vf)
+        self.assertIn(pad_filter, vf)
+        self.assertLess(vf.index("bwdif="), vf.index(crop_filter))
+        self.assertLess(vf.index(crop_filter), vf.index(transcode3.SCALE_FILTER))
+        self.assertLess(vf.index(pad_filter), vf.index(transcode3.SCALE_FILTER))
+        self.assertNotIn("drawbox=", vf)
+
+    def test_crop_pad_masking_applies_to_video8_defaults_too(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.dv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        vf = transcode3.build_vf(make_config(format_type="video8", mask_top=0, mask_bottom=7), paths)
+
+        self.assertIn("crop=w=iw:h=ih-7:x=0:y=0", vf)
+        self.assertIn("pad=w=iw:h=ih+7:x=0:y=0:color=black", vf)
+        self.assertNotIn("drawbox=", vf)
 
     def test_libx265_filter_chain_ends_with_10bit_format(self) -> None:
         paths = transcode3.Paths(

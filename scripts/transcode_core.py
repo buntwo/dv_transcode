@@ -808,6 +808,22 @@ def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
     return ",".join(filters) if filters else None
 
 
+def build_crop_filter(mask_top: int, mask_bottom: int) -> str | None:
+    """Build a crop that removes masked rows before denoise/color work."""
+    masked_rows = mask_top + mask_bottom
+    if masked_rows <= 0:
+        return None
+    return f"crop=w=iw:h=ih-{masked_rows}:x=0:y={mask_top}"
+
+
+def build_pad_filter(mask_top: int, mask_bottom: int) -> str | None:
+    """Build a pad that restores masked rows after denoise/color work."""
+    masked_rows = mask_top + mask_bottom
+    if masked_rows <= 0:
+        return None
+    return f"pad=w=iw:h=ih+{masked_rows}:x=0:y={mask_top}:color=black"
+
+
 def build_vf(cfg: Config, paths: Paths) -> str:
     """Build the ffmpeg video filter chain."""
     if cfg.video_filter is not None:
@@ -815,16 +831,17 @@ def build_vf(cfg: Config, paths: Paths) -> str:
 
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
-    if cfg.mask_top > 0:
-        filters.append(f"drawbox=x=0:y=0:w=iw:h={cfg.mask_top}:color=black:t=fill")
-    if cfg.mask_bottom > 0:
-        filters.append(f"drawbox=x=0:y=ih-{cfg.mask_bottom}:w=iw:h={cfg.mask_bottom}:color=black:t=fill")
+    if crop_filter := build_crop_filter(cfg.mask_top, cfg.mask_bottom):
+        filters.append(crop_filter)
 
     if hqdn3d := get_hqdn3d_args(cfg.denoise):
         filters.append(f"hqdn3d={hqdn3d}")
 
     if cfg.vhs_color_correct:
         filters.append(VHS_COLOR_CORRECTION_FILTER)
+
+    if pad_filter := build_pad_filter(cfg.mask_top, cfg.mask_bottom):
+        filters.append(pad_filter)
 
     filters += [
         SCALE_FILTER,
