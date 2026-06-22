@@ -1,0 +1,30 @@
+# VHS-to-Video8 visual winner, selected after expt11 master-clip review.
+#
+# This is intentionally not a .cube LUT. It is a pure ffmpeg filtergraph.
+# The inner correction is the expt9F train-selected filtergraph; the final
+# output is a 50/50 blend between the original frame and that corrected frame.
+#
+# Selected because the full-strength correction improved metrics but often
+# looked washed out, while this shrinkage kept most useful color/tone movement
+# without overcorrecting the 10-bit master review clips.
+#
+# Recommended placement in the full transcode workflow:
+#
+#   bwdif=mode=send_field:parity=auto:deint=all,
+#   drawbox=x=0:y=0:w=iw:h=3:color=black:t=fill,
+#   drawbox=x=0:y=ih-12:w=iw:h=12:color=black:t=fill,
+#   hqdn3d=1.5:1.125:2.25:1.6875,
+#   <this color graph>,
+#   scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int,
+#   setsar=1,setparams=range=limited,format=yuv420p10le
+#
+# Keep the executable line below as the color graph only. Several review
+# scripts read this file directly and insert it into larger filter chains.
+#
+# Caveat: some clips were recorded in China and may have originated on PAL
+# tapes or PAL-adjacent capture/playback paths. If so, their black/setup and
+# transfer behavior may differ from the mostly NTSC-derived training evidence;
+# in particular the gamma lift here can be too aggressive on those clips. PAL-
+# specific optimization is intentionally out of scope for this selected graph.
+
+split=2[orig][work];[work]eq=gamma=1.43214046,colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000[filt];[orig][filt]blend=all_expr='0.500000*A+0.500000*B'

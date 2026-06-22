@@ -295,3 +295,220 @@ And that matters because the final LUT is not a magic artifact. It is the produc
 
 That is the difference between a lucky grade and a correction pipeline.
 
+## Then We Stopped Treating the LUT as Sacred
+
+The LUT was useful, but the visual problem had changed. The early question was:
+
+```text
+Can we learn a stable VHS -> Video8 color mapping?
+```
+
+The later question was more practical:
+
+```text
+What actually looks good and encodes quickly on the full tape masters?
+```
+
+The polynomial LUT corrected strong yellow indoor scenes surprisingly well, but bright scenes could still look a little lifted and washed out. We tried more LUT ideas: luma-gated corrections, highlight-protected variants, monotonic luma gates, and baked combinations of tone and chroma transforms. Some improved metrics. Some introduced banding. Most did not change the visual story enough.
+
+So we tried built-in ffmpeg filters.
+
+The first pass tested things like:
+
+- `vibrance`
+- `greyedge`
+- `colorbalance`
+- `colorcorrect`
+- `normalize`
+- `grayworld`
+
+`grayworld` was bad. `greyedge` was visually interesting, but it was slow and frame-adaptive. For a production encode path, the better candidate was a fixed filtergraph: a gamma/tone move plus a small white-balance correction.
+
+That led to:
+
+```bash
+eq=gamma=...,colorcorrect=...
+```
+
+There were a few surprises.
+
+First, `eq=gamma=0.68` was not the same direction as the earlier luma curve. In ffmpeg's `eq` convention, the matching value was around:
+
+```text
+gamma = 1.46
+```
+
+Second, baking the filtergraph into a 3D LUT did not make it faster. A size-65 baked cube was close, but still slower than the native filters; a size-129 cube was much slower. So the simplest thing was also the fastest:
+
+```text
+use the pure filtergraph
+```
+
+Third, `colorcorrect` is a YUV filter. We briefly thought that forcing a GBR format before it meant it was operating in RGB. The ffmpeg docs and verbose filtergraph logs showed otherwise: ffmpeg simply converted back to YUV before `colorcorrect`. That round trip changed the pixel values, which is why the results differed.
+
+So we made the final model stricter:
+
+```text
+no LUT
+no explicit color-space conversions inside the model
+just eq + colorcorrect
+```
+
+The parameterization was:
+
+```text
+rl = -A
+bl = Q * A
+rh = -K * A
+bh = K * Q * A
+```
+
+and we searched:
+
+```text
+G, A, Q, K, saturation
+```
+
+The best train-selected filtergraph became:
+
+```bash
+-vf "eq=gamma=1.43214046,colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000"
+```
+
+It is gentler than the earlier hand-picked setting:
+
+```text
+less gamma lift
+less red/blue correction
+more symmetric shadow/highlight correction
+lower saturation
+```
+
+The validation-best candidate was extremely close:
+
+```bash
+-vf "eq=gamma=1.38885721,colorcorrect=rl=-0.004548:bl=0.013689:rh=-0.004332:bh=0.013040:saturation=0.881156"
+```
+
+The train-best was selected for production review, but both are in the same neighborhood. That is a good sign: the optimum is not a single fragile magic value.
+
+## Testing on the Real Masters
+
+The last step was to leave the little paired clips behind and review the actual 10-bit tape masters.
+
+Those masters are huge FFV1 files on an external disk:
+
+```text
+/Volumes/TU/tu.brian.2026.05.09/data/masters/tape/
+```
+
+Rather than process whole tapes immediately, we generate 12 equally spaced 10-second clips from each master:
+
+```text
+clip_001_control.mkv
+clip_001_optimized.mkv
+...
+clip_012_control.mkv
+clip_012_optimized.mkv
+```
+
+The generator writes both control and corrected clips from one read of the master segment, which matters because the external disk is slow and the files are enormous. The outputs stay FFV1 `yuv422p10le`, so the review path preserves the 10-bit master format.
+
+This is the current practical endpoint:
+
+```text
+not a learned LUT,
+but a short, explainable ffmpeg filtergraph
+validated against paired clips
+and now being reviewed directly on the real masters
+```
+
+## The Last Turn: Less Correction Won
+
+Then we watched the master clips.
+
+The full filtergraph was technically successful by the numbers, but the videos did not always feel better. The common problem was not wild color anymore. It was that the corrected image often felt too open, too lifted, and sometimes a little washed out. The original VHS masters were not perfect, but many scenes were already decent. They needed help, not a personality transplant.
+
+So we went back to the shadows.
+
+We picked a couple of dark clips and looked directly at the native 10-bit Y plane. That mattered because converting through grayscale could hide the actual code values. The result was useful: the dark regions were not just slammed into one black code. There was real separation in the low luma range. In principle, a shadow-toe lift made sense.
+
+In practice, our first curve experiment did not.
+
+We tried smooth RGB `curves=interp=pchip` and a Y-only `lutyuv` approximation. Metrics liked aggressive shadow curves. The images did not. They became patchy. The reason was simple after looking at the curve slopes: the chosen curve lifted deep shadows hard, then flattened a nearby shadow band. That preserved monotonicity, but it crushed local contrast. A curve can be smooth and still look bad on noisy VHS.
+
+That was a useful failure. It told us the metric was too happy with average luma matching and not sensitive enough to local texture.
+
+Next we tried `eq=gamma_weight`. This looked promising because it lets ffmpeg reduce the gamma effect in brighter regions. We ran a new staged search:
+
+```text
+eq=gamma=G:gamma_weight=W,
+colorcorrect=rl=-A:bl=Q*A:rh=-K*A:bh=K*Q*A:saturation=S
+```
+
+The best expt11 result was:
+
+```bash
+eq=gamma=1.54313576:gamma_weight=0.60436964,colorcorrect=rl=-0.006119:bl=0.014374:rh=-0.001099:bh=0.002580:saturation=0.850752
+```
+
+On metrics, it beat the old half-strength correction. But visually it still lived in the same family: it corrected more, and therefore risked looking more corrected. We also learned that `gamma_weight` is conceptually close to blending the gamma result back with the original value. It is useful, but it is not magic.
+
+The decisive comparison was on seven Access videos regenerated from the original 10-bit masters. For each source we made 12 ten-second samples and compared:
+
+```text
+control
+previous correction at 50%
+expt11 best at 100%
+expt11 best at 50%
+```
+
+That made the answer clearer. The two half-strength versions were hard to tell apart. The exact optimized parameters mattered less than the shrinkage.
+
+So the current winner is the old expt9F correction blended 50/50 with the original:
+
+```bash
+split=2[orig][work];[work]eq=gamma=1.43214046,colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000[filt];[orig][filt]blend=all_expr='0.500000*A+0.500000*B'
+```
+
+It is saved as:
+
+```text
+LUTs/vhs_to_video8_previous50_visual_winner.ffmpeg-filtergraph
+```
+
+That ending is less flashy than a new model, but it is probably the right engineering outcome. The learned and optimized transforms found a useful direction. Visual review showed that full strength was too much. The practical correction is therefore not "trust the fitted answer"; it is "use the fitted answer as a direction, then shrink it until the tape still feels like itself."
+
+## The Production Chain
+
+The last practical question was where this correction belongs in the real transcode workflow. The answer is after the structural cleanup and before final resize/output normalization:
+
+```text
+bwdif
+drawbox top/bottom masks
+hqdn3d
+50% color correction
+scale with lanczos+accurate_rnd+full_chroma_int
+setsar, setparams, format
+```
+
+That placement is deliberately conservative. Deinterlacing and masking happen before color. Denoise stays before color too, so the gamma lift is not asked to amplify as much analog noise. The final scale step uses explicit flags:
+
+```text
+scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int
+```
+
+We also measured the cost. On 92 sequential master clips, adding the color graph increased encode time by a median of 18.7% and a mean of 22.2%. On the train/validation pair clips, the median overhead was 28.0% and the mean was 30.5%. That is not free, but it is small enough to use in the real workflow.
+
+We generated one more review set for the seven Access videos, comparing:
+
+```text
+control workflow
+workflow + denoise + color
+workflow + color, no denoise
+workflow + denoise + color + explicit scale flags
+```
+
+The explicit scale flags looked good enough to keep. Denoise is still a visual choice, but the final filtergraph file now documents the preferred placement and scale flags.
+
+There is one unresolved caveat. Some of the clips recorded in China may have come from PAL tapes or PAL-adjacent capture/playback paths. If that is true, they may not want the same gamma lift as the mostly NTSC-derived evidence we optimized around. A PAL-specific correction pass is outside the scope of this project, but the caveat matters: a single home-video archive can contain more than one video standard, even when the files all arrive in one modern container format.

@@ -347,3 +347,317 @@ The fitter defaults are now set so this configuration can be reproduced directly
 
 4. Preserve geometry-normalized train/validation data and current experiment outputs as the reproducible basis for future work.
 
+## Addendum: Moving Beyond LUTs
+
+After the LUT work above, visual review showed a consistent limitation: the learned LUTs corrected strong yellow indoor casts well, but bright non-shadow scenes could still look washed out. Further LUT variants tried to protect highlights, including luma-gated corrections and monotonic luma gates, but the improvements were small and sometimes introduced banding or flatness. This suggested that a simpler, more interpretable ffmpeg filtergraph might be a better production tool than another learned 3D LUT.
+
+We tested several built-in ffmpeg color filters on top of a luma gamma correction:
+
+- `vibrance`
+- `greyedge`
+- `colorbalance`
+- `colorcorrect`
+- `normalize`
+- `grayworld`
+
+`grayworld` was rejected visually. `greyedge` looked promising but was about twice as slow as the simple alternatives and is frame-adaptive, which makes it less attractive for production encodes. The best practical candidate became a fixed `eq + colorcorrect` chain.
+
+Important implementation findings:
+
+- `g_opt`, originally represented as a LUT, can be approximated by `eq=gamma`.
+- `eq=gamma=1.46` matched the previous `lutyuv` gamma reference better than `1 / 0.68`.
+- Baking `eq + colorcorrect` into a 3D LUT was not faster. The pure filtergraph was fastest in real FFV1 encode tests.
+- `colorcorrect` operates in YUV according to ffmpeg documentation. Earlier differences between YUV-only and GBR-roundtrip filtergraphs came from the extra YUV -> GBR -> YUV round trip before `colorcorrect`, not from `colorcorrect` switching to RGB semantics.
+
+## Experiment 9F: YUV-Only Filtergraph Search
+
+We then committed to a source-native YUV-only production model with no explicit color-space conversions inside the optimized filtergraph:
+
+```text
+eq=gamma=G,
+colorcorrect=rl=-A:bl=Q*A:rh=-K*A:bh=K*Q*A:saturation=S
+```
+
+The optimization used the existing `tone_score`:
+
+```text
+delta_e76_mean + 0.05 * nonshadow_positive_luma_bias + 0.25 * new_clip_pct
+```
+
+Search method:
+
+- Stage 1 coarse grid over `G`, `A`, and `saturation`.
+- Stage 2 grid over `Q` and `K` around top Stage 1 candidates.
+- Stage 3 deterministic jitter around top Stage 2 candidates.
+- Full-resolution re-score of the top 25 on train and validation.
+
+The search script is:
+
+```text
+run_expt9F_yuv_only_search.py
+```
+
+Best train-selected filtergraph:
+
+```bash
+-vf "eq=gamma=1.43214046,colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000"
+```
+
+Validation-best searched filtergraph:
+
+```bash
+-vf "eq=gamma=1.38885721,colorcorrect=rl=-0.004548:bl=0.013689:rh=-0.004332:bh=0.013040:saturation=0.881156"
+```
+
+Comparison:
+
+| Candidate | Train tone | Train dE76 | Validation tone | Validation dE76 |
+|---|---:|---:|---:|---:|
+| Previous YUV-only `cc_opt` | 9.662 | 9.064 | 11.351 | 10.390 |
+| Previous GBR-roundtrip pure filtergraph | 9.614 | 9.078 | 11.156 | 10.321 |
+| New train-best YUV-only | 9.301 | 8.751 | 10.744 | 9.873 |
+| New validation-best YUV-only | 9.362 | 8.873 | 10.487 | 9.716 |
+
+We selected the train-best candidate for production review, while keeping the validation-best candidate as a close alternative.
+
+The final selected filtergraph is saved at:
+
+```text
+generated_video_pairs/evaluations/expt9F_yuv_only_search/optimized_filtergraph_train_best.txt
+```
+
+## Master Clip Production Review
+
+The 10-bit FFV1 tape masters live at:
+
+```text
+/Volumes/TU/tu.brian.2026.05.09/data/masters/tape/
+```
+
+A new script generates 12 equally spaced 10-second review clips from each master, writing both:
+
+- `clip_NNN_control.mkv`
+- `clip_NNN_optimized.mkv`
+
+The script reads each sampled segment once and produces both outputs in one ffmpeg invocation:
+
+```text
+generate_expt9F_master_clips.py
+```
+
+Outputs are written under:
+
+```text
+generated_video_pairs/evaluations/expt9F_yuv_only_search/transformed_videos/<master name>/
+```
+
+The output clips are forced to `yuv422p10le` FFV1 so the 10-bit review path does not collapse to 8-bit.
+
+## Addendum: Shadow-Toe Curves, Gamma Weight, and Shrinkage
+
+Visual review of the expt9F train-best filtergraph on real master clips showed a recurring failure mode: many clips were already acceptable before correction, and the full correction often made midtones/highlights look washed out even when metrics improved. This pushed the work away from "fit a stronger transform" and toward "how much correction should survive?"
+
+We investigated dark clips by parsing the native `yuv422p10le` Y plane directly. The dark values were not mostly clipped into a single black floor. Instead, useful shadow content was spread across low Y codes, with substantial mass around the deep-shadow and upper-shadow ranges. This supported a shadow-toe lift, but not a global black pedestal.
+
+### Expt10: Curve-Based Shadow Toe
+
+Expt10 tested three methods:
+
+1. RGB `curves=interp=pchip` with a one-parameter shadow-toe lift.
+2. Y-only `lutyuv` piecewise-linear approximation of the same curve.
+3. A 50% output blend of the previous expt9F filtergraph.
+
+The metrics selected aggressive curves, but visual review showed patchiness and contouring. The derivative analysis explained why: the selected Y-only curve had an almost-flat segment through part of the shadow range, effectively collapsing nearby dark values into patches. The lesson was that smoothness alone is not enough; local contrast preservation matters, and metric optimization was rewarding average luma matching while ignoring patchiness.
+
+### Expt11: Gamma Weight Search
+
+Expt11 returned to the expt9F joint optimization family, adding `eq=gamma_weight`:
+
+```text
+eq=gamma=G:gamma_weight=W,
+colorcorrect=rl=-A:bl=Q*A:rh=-K*A:bh=K*Q*A:saturation=S
+```
+
+The search used the same staged structure:
+
+- Stage 1: trimmed coarse grid over `G`, `W`, `A`, and `S`.
+- Stage 2: grid over `Q` and `K` for top Stage 1 candidates.
+- Stage 3: local random refinement.
+- Full train/validation evaluation of top candidates plus baselines.
+
+The best expt11 100% filtergraph was:
+
+```bash
+eq=gamma=1.54313576:gamma_weight=0.60436964,colorcorrect=rl=-0.006119:bl=0.014374:rh=-0.001099:bh=0.002580:saturation=0.850752
+```
+
+By metrics, this beat the previous 50% blend:
+
+| Split | Candidate | Score | dE76 | RGB MAE | Shadow Lift | Mid Lift | High Lift | New Clip % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Train | expt11 best | 12.447 | 9.654 | 20.663 | 26.502 | 26.014 | 17.974 | 0.099 |
+| Train | previous 50% | 13.804 | 11.934 | 26.108 | 17.677 | 17.626 | 12.341 | 0.074 |
+| Validation | expt11 best | 12.749 | 9.710 | 19.177 | 26.832 | 26.548 | 17.538 | 0.198 |
+| Validation | previous 50% | 13.457 | 11.433 | 22.439 | 17.913 | 17.945 | 12.031 | 0.184 |
+
+However, the metrics also show that expt11 still lifts mids/highs more than the 50% blend. Since the visual complaint was washout, the metric win did not settle the question.
+
+### Focused Master-Clip Review
+
+To avoid filling the disk, we generated clips only for the seven Access videos used for review, resolving Access names back to master filenames with:
+
+```text
+/Users/btu/scratch/Videos/access_name_map.csv
+```
+
+The generator is:
+
+```text
+generate_expt11_access_master_clips.py
+```
+
+For each of the seven Access videos, it writes 12 equally spaced 10-second clips from the original 10-bit master, with four variants:
+
+- `ctrl`
+- `previous_50pct`
+- `expt11_best`
+- `expt11_best_50pct`
+
+Outputs:
+
+```text
+generated_video_pairs/evaluations/expt11_gamma_weight_search/transformed_videos/access_master_clips/
+```
+
+The review player was moved to:
+
+```text
+play_review_videos.sh
+```
+
+and the focused master review can be launched with:
+
+```bash
+./play_review_videos.sh expt11-access
+```
+
+### Current Visual Winner
+
+Visual review found little meaningful difference between `previous_50pct` and `expt11_best_50pct`. This suggests shrinkage is the important tool: blend a too-strong correction back toward the original instead of trusting the full fitted direction.
+
+The current visual winner is:
+
+```bash
+split=2[orig][work];[work]eq=gamma=1.43214046,colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000[filt];[orig][filt]blend=all_expr='0.500000*A+0.500000*B'
+```
+
+This final filtergraph is saved permanently at:
+
+```text
+LUTs/vhs_to_video8_previous50_visual_winner.ffmpeg-filtergraph
+```
+
+It is not a LUT. It is a pure ffmpeg filtergraph selected by visual review because it retains useful correction while avoiding the over-brightened, washed-out look of stronger metric winners.
+
+### Final Transcode Placement and Scale Flags
+
+The selected color graph is meant to be inserted into the production transcode chain, not used as a whole-chain replacement by itself. The recommended placement is:
+
+```text
+bwdif=mode=send_field:parity=auto:deint=all,
+drawbox=x=0:y=0:w=iw:h=3:color=black:t=fill,
+drawbox=x=0:y=ih-12:w=iw:h=12:color=black:t=fill,
+hqdn3d=1.5:1.125:2.25:1.6875,
+<final color graph>,
+scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int,
+setsar=1,
+setparams=range=limited,
+format=yuv420p10le
+```
+
+Rationale:
+
+- `bwdif` and the top/bottom masking should happen before color correction.
+- `hqdn3d` should stay before the gamma/color move so the lift does not amplify as much analog noise.
+- The color graph should run before final resize/output normalization.
+- The final scale should use explicit `flags=lanczos+accurate_rnd+full_chroma_int`, which looked preferable in the review set and removes ambiguity from ffmpeg defaults.
+
+The saved filtergraph file documents this placement:
+
+```text
+LUTs/vhs_to_video8_previous50_visual_winner.ffmpeg-filtergraph
+```
+
+The executable line in that file remains the color graph only, because the review scripts read it directly and splice it into larger chains.
+
+### Final Review Outputs and Timing
+
+All-master final winner clips were generated under:
+
+```text
+generated_video_pairs/evaluations/final_visual_winner/transformed_videos/masters/
+```
+
+This produced 300 control clips and 300 winner clips: 12 ten-second samples from each of 25 master tapes.
+
+Train/validation pair review clips were generated under:
+
+```text
+generated_video_pairs/evaluations/final_visual_winner/transformed_videos/pairs/
+```
+
+This produced 63 clips total: for each of 14 train pairs and 7 validation pairs, `ctrl`, `winner`, and `video8`.
+
+The timing results were:
+
+| Dataset | Timing Mode | Clips | Control Median | Winner Median | Median Overhead | Mean Overhead |
+|---|---:|---:|---:|---:|---:|---:|
+| Master clips | sequential isolated sample | 92 | 2.068 s | 2.476 s | 18.7% | 22.2% |
+| Train/validation pairs | sequential | 21 | 3.141 s | 4.136 s | 28.0% | 30.5% |
+
+After collecting enough isolated timing data, the remaining master clips were filled in parallel. Those parallel timings are useful for throughput but were not used for the overhead estimate.
+
+Playback commands:
+
+```bash
+./play_review_videos.sh final-masters
+./play_review_videos.sh final-pairs
+```
+
+### Denoise and Scale Review
+
+A focused review set was generated for the seven Access videos:
+
+```text
+generated_video_pairs/evaluations/expt12_denoise_workflow_review/transformed_videos/access_master_clips/
+```
+
+For each selected Access video, three equally spaced 10-second clips were generated from the original 10-bit master. Each clip has four variants:
+
+- `ctrl`: existing workflow without the new color graph.
+- `with_denoise`: workflow with `hqdn3d` plus the final color graph.
+- `no_denoise`: same chain but with `hqdn3d` removed.
+- `with_denoise_lanczos`: denoise plus final color graph plus explicit `scale` flags.
+
+Playback command:
+
+```bash
+./play_review_videos.sh denoise-review
+```
+
+Median render times for this review set:
+
+| Variant | Clips | Median Time |
+|---|---:|---:|
+| `ctrl` | 21 | 4.538 s |
+| `with_denoise` | 21 | 5.643 s |
+| `no_denoise` | 21 | 5.481 s |
+| `with_denoise_lanczos` | 21 | 5.637 s |
+
+The explicit scale flags were selected for the final placement. The denoise choice remains visual, but the recommended production placement keeps `hqdn3d` before the color graph.
+
+### PAL/China Caveat
+
+Some clips recorded in China may have originated on PAL tapes, or on PAL-adjacent capture/playback paths. This was not confirmed, and optimizing a PAL-specific pipeline was intentionally out of scope. However, the visual review suggested that the final correction can be less successful on some China-recorded clips than on US-recorded clips.
+
+This is plausible because PAL and NTSC-derived home-video paths can differ in setup/black-level behavior and transfer assumptions. In particular, a gamma lift selected from mostly NTSC-derived evidence may be too aggressive for clips that did not have the same setup-level/crushed-shadow history. The final filtergraph file now records this caveat so future use does not treat the correction as equally validated for every tape standard.

@@ -27,6 +27,13 @@ from transcode_naming import build_access_output_name
 from utils import sibling_dir_for_path
 
 DEFAULT_VALIDATE_DURATION_TOLERANCE = 0.17  # 5 NTSC DV frames at 29.97 fps.
+SCALE_FILTER = "scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int"
+VHS_COLOR_CORRECTION_FILTER = (
+    "split=2[orig][work];"
+    "[work]eq=gamma=1.43214046,"
+    "colorcorrect=rl=-0.004439:bl=0.012896:rh=-0.004175:bh=0.012128:saturation=0.880000[filt];"
+    "[orig][filt]blend=all_expr='0.500000*A+0.500000*B'"
+)
 
 
 @dataclass
@@ -47,6 +54,7 @@ class Config:
     crf: float | None
     video_filter: str | None
     lut: Path | None
+    vhs_color_correct: bool
     deint_mode: str
     map_both_audio: bool
     log_level: str
@@ -171,6 +179,11 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--crf", type=float, help="libx265 CRF; only valid with --encoder libx265 (default: 20)")
     parser.add_argument("--vf", dest="video_filter", help="Override the complete ffmpeg -vf filter string")
     parser.add_argument("--lut", type=Path, help="Add a lut3d stage using this .cube file")
+    parser.add_argument(
+        "--vhs-color-correct",
+        action="store_true",
+        help="Insert the selected VHS color correction filtergraph; only valid with --format vhs",
+    )
     parser.add_argument("--deint-mode", choices=["send_frame", "send_field"], default="send_field")
     parser.add_argument("--map-both-audio", action="store_true")
     parser.add_argument("--log-level", choices=["quiet", "error", "warning", "info"], default="warning")
@@ -196,6 +209,10 @@ def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argpar
         parser.error("--vf cannot be blank")
     if args.video_filter is not None and args.lut is not None:
         parser.error("--lut cannot be combined with --vf; include lut3d in --vf")
+    if args.video_filter is not None and args.vhs_color_correct:
+        parser.error("--vhs-color-correct cannot be combined with --vf; include it in --vf")
+    if args.vhs_color_correct and args.format_type != "vhs":
+        parser.error("--vhs-color-correct is only valid with --format vhs")
     if args.lut is not None and not args.lut.is_file():
         parser.error(f"--lut file does not exist: {args.lut}")
 
@@ -227,6 +244,7 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         crf=crf,
         video_filter=args.video_filter,
         lut=args.lut,
+        vhs_color_correct=args.vhs_color_correct,
         deint_mode=args.deint_mode,
         map_both_audio=args.map_both_audio,
         log_level=args.log_level,
@@ -805,8 +823,11 @@ def build_vf(cfg: Config, paths: Paths) -> str:
     if hqdn3d := get_hqdn3d_args(cfg.denoise):
         filters.append(f"hqdn3d={hqdn3d}")
 
+    if cfg.vhs_color_correct:
+        filters.append(VHS_COLOR_CORRECTION_FILTER)
+
     filters += [
-        "scale='trunc(ih*dar/2)*2:ih'",
+        SCALE_FILTER,
         "setsar=1",
         "setparams=range=limited",
     ]
@@ -973,6 +994,7 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
     print(f"Bottom mask rows: {cfg.mask_bottom}")
     if cfg.format_type == "vhs":
         print(f"VHS audio notch: {cfg.vhs_notch}")
+        print(f"VHS color correction: {'on' if cfg.vhs_color_correct else 'off'}")
     print(f"Audio channel: {cfg.audio_channel}")
     print(f"Deinterlace mode: {cfg.deint_mode}")
     if cfg.format_type == "digital8":
@@ -1008,6 +1030,7 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
     ]
     if cfg.format_type == "vhs":
         lines.append(f"VHS audio notch: {cfg.vhs_notch}")
+        lines.append(f"VHS color correction: {'on' if cfg.vhs_color_correct else 'off'}")
     lines.append(f"Audio channel: {cfg.audio_channel}")
     if cfg.format_type == "digital8":
         lines += [

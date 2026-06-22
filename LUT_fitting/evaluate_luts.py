@@ -108,20 +108,48 @@ def rgb_to_lab(rgb):
     return lab
 
 
-def compute_metrics(ref_samples, test_samples):
+def luma(rgb):
+    return 0.299 * rgb[:, 0] + 0.587 * rgb[:, 1] + 0.114 * rgb[:, 2]
+
+
+def warm_yellow_score(rgb):
+    return (0.5 * (rgb[:, 0] + rgb[:, 1])) - rgb[:, 2]
+
+
+def subset_mean(values, mask):
+    if np.any(mask):
+        return float(np.mean(values[mask]))
+    return float("nan")
+
+
+def subset_percentile(values, mask, percentile):
+    if np.any(mask):
+        return float(np.percentile(values[mask], percentile))
+    return float("nan")
+
+
+def subset_delta_e(ref_samples, test_samples, mask):
+    if not np.any(mask):
+        return float("nan")
+    ref_lab = rgb_to_lab(ref_samples[mask])
+    test_lab = rgb_to_lab(test_samples[mask])
+    delta_e76 = np.sqrt(np.sum((test_lab - ref_lab) ** 2, axis=1))
+    return float(np.mean(delta_e76))
+
+
+def compute_metrics(ref_samples, test_samples, raw_samples=None):
     diff = test_samples - ref_samples
     rgb_mae = np.mean(np.abs(diff)) * 255.0
     rgb_rmse = np.sqrt(np.mean(diff * diff)) * 255.0
 
-    ref_luma = 0.299 * ref_samples[:, 0] + 0.587 * ref_samples[:, 1] + 0.114 * ref_samples[:, 2]
-    test_luma = 0.299 * test_samples[:, 0] + 0.587 * test_samples[:, 1] + 0.114 * test_samples[:, 2]
+    ref_luma = luma(ref_samples)
+    test_luma = luma(test_samples)
     luma_mae = np.mean(np.abs(test_luma - ref_luma)) * 255.0
 
     ref_lab = rgb_to_lab(ref_samples)
     test_lab = rgb_to_lab(test_samples)
     delta_e76 = np.sqrt(np.sum((test_lab - ref_lab) ** 2, axis=1))
-
-    return {
+    metrics = {
         "sample_count": int(len(ref_samples)),
         "rgb_mae": float(rgb_mae),
         "rgb_rmse": float(rgb_rmse),
@@ -130,9 +158,46 @@ def compute_metrics(ref_samples, test_samples):
         "delta_e76_p95": float(np.percentile(delta_e76, 95)),
     }
 
+    if raw_samples is None:
+        raw_samples = test_samples
+
+    raw_luma = luma(raw_samples)
+    raw_max = raw_samples.max(axis=1)
+    test_max = test_samples.max(axis=1)
+    luma_lift = test_luma - raw_luma
+    luma_error = test_luma - ref_luma
+    positive_luma_error = np.maximum(luma_error, 0.0)
+
+    shadow = raw_luma < 0.25
+    mid = (raw_luma >= 0.25) & (raw_luma < 0.65)
+    high = raw_luma >= 0.65
+    nonshadow = raw_luma >= 0.25
+    warm = (warm_yellow_score(raw_samples) > 0.08) & (raw_luma > 0.18) & (raw_luma < 0.88)
+    nonwarm_mid_high = nonshadow & ~warm
+
+    metrics.update(
+        {
+            "shadow_luma_lift": subset_mean(luma_lift, shadow) * 255.0,
+            "mid_luma_lift": subset_mean(luma_lift, mid) * 255.0,
+            "high_luma_lift": subset_mean(luma_lift, high) * 255.0,
+            "mid_luma_bias": subset_mean(luma_error, mid) * 255.0,
+            "high_luma_bias": subset_mean(luma_error, high) * 255.0,
+            "nonshadow_positive_luma_bias": subset_mean(positive_luma_error, nonshadow) * 255.0,
+            "nonwarm_mid_high_luma_bias": subset_mean(luma_error, nonwarm_mid_high) * 255.0,
+            "nonshadow_luma_over_p95": subset_percentile(positive_luma_error, nonshadow, 95) * 255.0,
+            "clip_pct": float(np.mean(test_max > 0.985) * 100.0),
+            "new_clip_pct": float(np.mean((test_max > 0.985) & (raw_max <= 0.985)) * 100.0),
+            "warm_yellow_delta_e76_mean": subset_delta_e(ref_samples, test_samples, warm),
+            "warm_yellow_luma_bias": subset_mean(luma_error, warm) * 255.0,
+        }
+    )
+
+    return metrics
+
 
 def collect_samples(ref_frames, raw_frames, test_frames, masks):
     all_ref = []
+    all_raw = []
     all_test = []
     n = min(len(ref_frames), len(raw_frames), len(test_frames))
     for index in range(n):
@@ -156,12 +221,17 @@ def collect_samples(ref_frames, raw_frames, test_frames, masks):
 
         if np.any(valid):
             all_ref.append(ref_px[valid])
+            all_raw.append(raw_px[valid])
             all_test.append(test_px[valid])
 
     if not all_ref:
         raise RuntimeError("No valid samples after masking")
 
-    return np.concatenate(all_ref, axis=0), np.concatenate(all_test, axis=0)
+    return (
+        np.concatenate(all_ref, axis=0),
+        np.concatenate(all_raw, axis=0),
+        np.concatenate(all_test, axis=0),
+    )
 
 
 def read_manifest(path):
@@ -310,13 +380,13 @@ def evaluate(args):
             ref_frames = load_frames(ref_dir)
             raw_frames = load_frames(raw_dir)
 
-            ref_samples, raw_samples = collect_samples(
+            ref_samples, raw_samples, raw_test_samples = collect_samples(
                 ref_frames,
                 raw_frames,
                 raw_frames,
                 masks,
             )
-            raw_metrics = compute_metrics(ref_samples, raw_samples)
+            raw_metrics = compute_metrics(ref_samples, raw_test_samples, raw_samples)
             rows.append({"pair": pair_label, "candidate": "raw", **raw_metrics})
 
             lut_frames_by_name = {}
@@ -328,13 +398,13 @@ def evaluate(args):
                 lut_frames = load_frames(lut_dir)
                 lut_frames_by_name[name] = lut_frames
 
-                ref_samples, lut_samples = collect_samples(
+                ref_samples, raw_samples, lut_samples = collect_samples(
                     ref_frames,
                     raw_frames,
                     lut_frames,
                     masks,
                 )
-                metrics = compute_metrics(ref_samples, lut_samples)
+                metrics = compute_metrics(ref_samples, lut_samples, raw_samples)
                 rows.append({"pair": pair_label, "candidate": name, **metrics})
 
             if contact_sheet:
@@ -364,6 +434,18 @@ def evaluate(args):
         "luma_mae",
         "delta_e76_mean",
         "delta_e76_p95",
+        "shadow_luma_lift",
+        "mid_luma_lift",
+        "high_luma_lift",
+        "mid_luma_bias",
+        "high_luma_bias",
+        "nonshadow_positive_luma_bias",
+        "nonwarm_mid_high_luma_bias",
+        "nonshadow_luma_over_p95",
+        "clip_pct",
+        "new_clip_pct",
+        "warm_yellow_delta_e76_mean",
+        "warm_yellow_luma_bias",
     ]
     with out_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

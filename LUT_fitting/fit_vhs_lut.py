@@ -9,6 +9,9 @@ import numpy as np
 from PIL import Image
 
 
+LUMA_COEF = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
+
 def run(cmd):
     subprocess.run(cmd, check=True)
 
@@ -85,6 +88,322 @@ def feature_matrix(rgb, degree=2, model="standard", intercept=True):
     return np.stack(feats, axis=1)
 
 
+def rgb_luma(rgb):
+    return rgb @ LUMA_COEF
+
+
+def rgb_to_ycbcr(rgb):
+    y = rgb_luma(rgb)
+    cb = (rgb[:, 2] - y) / 1.772
+    cr = (rgb[:, 0] - y) / 1.402
+    return np.stack([y, cb, cr], axis=1)
+
+
+def ycbcr_to_rgb(ycbcr):
+    y = ycbcr[:, 0]
+    cb = ycbcr[:, 1]
+    cr = ycbcr[:, 2]
+    r = y + 1.402 * cr
+    b = y + 1.772 * cb
+    g = (y - 0.299 * r - 0.114 * b) / 0.587
+    return np.stack([r, g, b], axis=1)
+
+
+def smoothstep(x, edge0, edge1):
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def allowed_luma_lift(src_y, shadow_lift, mid_lift, highlight_lift):
+    return np.interp(
+        src_y,
+        [0.0, 0.20, 0.55, 0.82, 1.0],
+        [shadow_lift, shadow_lift, mid_lift, highlight_lift, highlight_lift],
+    )
+
+
+def controlled_luma_target(
+    src_y,
+    ref_y,
+    shadow_lift=0.18,
+    mid_lift=0.045,
+    highlight_lift=0.01,
+    max_darken=0.22,
+):
+    lift_limit = allowed_luma_lift(src_y, shadow_lift, mid_lift, highlight_lift)
+    delta = np.clip(ref_y - src_y, -max_darken, lift_limit)
+    return np.clip(src_y + delta, 0.0, 1.0)
+
+
+def solve_rgb_coefficients(X, Y, weights, intercept, ridge):
+    sw = np.sqrt(weights)[:, None]
+    Xw = X * sw
+    Yw = Y * sw
+
+    A = Xw.T @ Xw
+    B = Xw.T @ Yw
+
+    reg = np.eye(A.shape[0], dtype=np.float32) * ridge
+    if intercept:
+        # Do not regularize intercept heavily.
+        reg[0, 0] = 0.0
+
+    return np.linalg.solve(A + reg, B)
+
+
+def solve_rgb_luma_regularized(
+    X,
+    Y,
+    src_rgb,
+    ref_rgb,
+    weights,
+    intercept,
+    ridge,
+    luma_regularization,
+    shadow_lift,
+    mid_lift,
+    highlight_lift,
+    max_darken,
+):
+    feature_count = X.shape[1]
+    system_size = feature_count * 3
+    A = np.zeros((system_size, system_size), dtype=np.float64)
+    B = np.zeros(system_size, dtype=np.float64)
+
+    weighted_xtx = X.T @ (weights[:, None] * X)
+    for channel in range(3):
+        start = channel * feature_count
+        end = start + feature_count
+        A[start:end, start:end] += weighted_xtx
+        B[start:end] += X.T @ (weights * Y[:, channel])
+
+        reg = np.full(feature_count, ridge, dtype=np.float64)
+        if intercept:
+            reg[0] = 0.0
+        A[start:end, start:end] += np.diag(reg)
+
+    if luma_regularization > 0.0:
+        src_y = rgb_luma(src_rgb)
+        ref_y = rgb_luma(ref_rgb)
+        target_y = controlled_luma_target(
+            src_y,
+            ref_y,
+            shadow_lift=shadow_lift,
+            mid_lift=mid_lift,
+            highlight_lift=highlight_lift,
+            max_darken=max_darken,
+        )
+        mid_high_weight = 0.35 + 0.65 * smoothstep(src_y, 0.25, 0.78)
+        luma_weights = weights * luma_regularization * mid_high_weight
+        luma_xtx = X.T @ (luma_weights[:, None] * X)
+        luma_rhs = X.T @ (luma_weights * target_y)
+
+        for out_channel in range(3):
+            out_start = out_channel * feature_count
+            out_end = out_start + feature_count
+            B[out_start:out_end] += LUMA_COEF[out_channel] * luma_rhs
+            for in_channel in range(3):
+                in_start = in_channel * feature_count
+                in_end = in_start + feature_count
+                A[out_start:out_end, in_start:in_end] += (
+                    LUMA_COEF[out_channel] * LUMA_COEF[in_channel] * luma_xtx
+                )
+
+    coef_vector = np.linalg.solve(A, B)
+    return np.stack(
+        [
+            coef_vector[0:feature_count],
+            coef_vector[feature_count:2 * feature_count],
+            coef_vector[2 * feature_count:3 * feature_count],
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+
+def fit_rgb_transform(
+    src_rgb,
+    ref_rgb,
+    degree,
+    feature_model,
+    intercept,
+    ridge,
+    robust_iters,
+    luma_regularization=0.0,
+    shadow_lift=0.18,
+    mid_lift=0.045,
+    highlight_lift=0.01,
+    max_darken=0.22,
+):
+    X = feature_matrix(src_rgb, degree=degree, model=feature_model, intercept=intercept)
+    Y = ref_rgb
+
+    weights = np.ones(X.shape[0], dtype=np.float32)
+
+    for _ in range(robust_iters):
+        if luma_regularization > 0.0:
+            coef = solve_rgb_luma_regularized(
+                X,
+                Y,
+                src_rgb,
+                ref_rgb,
+                weights,
+                intercept,
+                ridge,
+                luma_regularization,
+                shadow_lift,
+                mid_lift,
+                highlight_lift,
+                max_darken,
+            )
+        else:
+            coef = solve_rgb_coefficients(X, Y, weights, intercept, ridge)
+
+        pred = np.clip(X @ coef, 0.0, 1.0)
+        err = np.sqrt(np.mean((pred - Y) ** 2, axis=1))
+        weights = robust_weights(err)
+
+    return {
+        "kind": "rgb-poly",
+        "coef": coef,
+        "degree": degree,
+        "feature_model": feature_model,
+        "intercept": intercept,
+    }
+
+
+def robust_weights(err):
+    med = np.median(err)
+    mad = np.median(np.abs(err - med)) + 1e-6
+    sigma = 1.4826 * mad + 1e-6
+    # Cauchy-style robust weighting.
+    c = 3.0 * sigma
+    return 1.0 / (1.0 + (err / c) ** 2)
+
+
+def fit_ycbcr_transform(src_rgb, ref_rgb, degree, intercept, ridge, robust_iters):
+    src_ycc = rgb_to_ycbcr(src_rgb)
+    ref_ycc = rgb_to_ycbcr(ref_rgb)
+    X = feature_matrix(src_ycc, degree=degree, model="standard", intercept=intercept)
+    Y = ref_ycc
+
+    weights = np.ones(X.shape[0], dtype=np.float32)
+    for _ in range(robust_iters):
+        coef = solve_rgb_coefficients(X, Y, weights, intercept, ridge)
+        pred_rgb = np.clip(ycbcr_to_rgb(X @ coef), 0.0, 1.0)
+        err = np.sqrt(np.mean((pred_rgb - ref_rgb) ** 2, axis=1))
+        weights = robust_weights(err)
+
+    return {
+        "kind": "ycbcr-poly",
+        "coef": coef,
+        "degree": degree,
+        "intercept": intercept,
+    }
+
+
+def fit_tone_curve(
+    src_y,
+    ref_y,
+    bins,
+    shadow_lift,
+    mid_lift,
+    highlight_lift,
+    max_darken,
+):
+    edges = np.linspace(0.0, 1.0, bins + 1, dtype=np.float32)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    targets = []
+
+    for index, center in enumerate(centers):
+        if index == len(centers) - 1:
+            mask = (src_y >= edges[index]) & (src_y <= edges[index + 1])
+        else:
+            mask = (src_y >= edges[index]) & (src_y < edges[index + 1])
+
+        if np.any(mask):
+            ref_value = np.median(ref_y[mask])
+        else:
+            ref_value = center
+
+        target = controlled_luma_target(
+            np.array([center], dtype=np.float32),
+            np.array([ref_value], dtype=np.float32),
+            shadow_lift=shadow_lift,
+            mid_lift=mid_lift,
+            highlight_lift=highlight_lift,
+            max_darken=max_darken,
+        )[0]
+        targets.append(target)
+
+    x = np.concatenate([[0.0], centers, [1.0]]).astype(np.float32)
+    y = np.concatenate([[0.0], np.array(targets, dtype=np.float32), [1.0]])
+
+    # Keep the tone mapping ordered so shadow lift does not create reversals.
+    y = np.maximum.accumulate(y)
+    y = np.minimum(y, 1.0)
+    return x, y
+
+
+def apply_tone_curve(y, tone_x, tone_y):
+    return np.interp(y, tone_x, tone_y).astype(np.float32)
+
+
+def fit_chroma_transform(src_ycc, ref_ycc, degree, intercept, ridge, robust_iters):
+    X = feature_matrix(src_ycc, degree=degree, model="standard", intercept=intercept)
+    Y = ref_ycc[:, 1:3]
+
+    weights = np.ones(X.shape[0], dtype=np.float32)
+    for _ in range(robust_iters):
+        coef = solve_rgb_coefficients(X, Y, weights, intercept, ridge)
+        pred = X @ coef
+        err = np.sqrt(np.mean((pred - Y) ** 2, axis=1))
+        weights = robust_weights(err)
+
+    return coef
+
+
+def fit_hybrid_ycbcr_transform(
+    src_rgb,
+    ref_rgb,
+    degree,
+    intercept,
+    ridge,
+    robust_iters,
+    tone_bins,
+    shadow_lift,
+    mid_lift,
+    highlight_lift,
+    max_darken,
+):
+    src_ycc = rgb_to_ycbcr(src_rgb)
+    ref_ycc = rgb_to_ycbcr(ref_rgb)
+    tone_x, tone_y = fit_tone_curve(
+        src_ycc[:, 0],
+        ref_ycc[:, 0],
+        tone_bins,
+        shadow_lift,
+        mid_lift,
+        highlight_lift,
+        max_darken,
+    )
+    chroma_coef = fit_chroma_transform(
+        src_ycc,
+        ref_ycc,
+        degree=degree,
+        intercept=intercept,
+        ridge=ridge,
+        robust_iters=robust_iters,
+    )
+    return {
+        "kind": "hybrid-ycbcr",
+        "tone_x": tone_x,
+        "tone_y": tone_y,
+        "chroma_coef": chroma_coef,
+        "degree": degree,
+        "intercept": intercept,
+    }
+
+
 def fit_transform(
     src_rgb,
     ref_rgb,
@@ -93,44 +412,103 @@ def fit_transform(
     intercept=True,
     ridge=1e-4,
     robust_iters=5,
+    luma_regularization=1.0,
+    shadow_lift=0.18,
+    mid_lift=0.045,
+    highlight_lift=0.01,
+    max_darken=0.22,
+    tone_bins=32,
 ):
-    X = feature_matrix(src_rgb, degree=degree, model=model, intercept=intercept)
-    Y = ref_rgb
+    if model == "rgb-luma-reg":
+        return fit_rgb_transform(
+            src_rgb,
+            ref_rgb,
+            degree=degree,
+            feature_model="standard",
+            intercept=intercept,
+            ridge=ridge,
+            robust_iters=robust_iters,
+            luma_regularization=luma_regularization,
+            shadow_lift=shadow_lift,
+            mid_lift=mid_lift,
+            highlight_lift=highlight_lift,
+            max_darken=max_darken,
+        )
 
-    weights = np.ones(X.shape[0], dtype=np.float32)
+    if model == "ycbcr":
+        return fit_ycbcr_transform(
+            src_rgb,
+            ref_rgb,
+            degree=degree,
+            intercept=intercept,
+            ridge=ridge,
+            robust_iters=robust_iters,
+        )
 
-    for _ in range(robust_iters):
-        sw = np.sqrt(weights)[:, None]
-        Xw = X * sw
-        Yw = Y * sw
+    if model == "hybrid-ycbcr":
+        return fit_hybrid_ycbcr_transform(
+            src_rgb,
+            ref_rgb,
+            degree=degree,
+            intercept=intercept,
+            ridge=ridge,
+            robust_iters=robust_iters,
+            tone_bins=tone_bins,
+            shadow_lift=shadow_lift,
+            mid_lift=mid_lift,
+            highlight_lift=highlight_lift,
+            max_darken=max_darken,
+        )
 
-        A = Xw.T @ Xw
-        B = Xw.T @ Yw
-
-        reg = np.eye(A.shape[0], dtype=np.float32) * ridge
-        if intercept:
-            # Do not regularize intercept heavily.
-            reg[0, 0] = 0.0
-
-        coef = np.linalg.solve(A + reg, B)
-
-        pred = np.clip(X @ coef, 0.0, 1.0)
-        err = np.sqrt(np.mean((pred - Y) ** 2, axis=1))
-
-        med = np.median(err)
-        mad = np.median(np.abs(err - med)) + 1e-6
-        sigma = 1.4826 * mad + 1e-6
-
-        # Cauchy-style robust weighting.
-        c = 3.0 * sigma
-        weights = 1.0 / (1.0 + (err / c) ** 2)
-
-    return coef
+    return fit_rgb_transform(
+        src_rgb,
+        ref_rgb,
+        degree=degree,
+        feature_model=model,
+        intercept=intercept,
+        ridge=ridge,
+        robust_iters=robust_iters,
+    )
 
 
-def apply_transform(rgb, coef, degree=2, model="standard", intercept=True):
-    X = feature_matrix(rgb, degree=degree, model=model, intercept=intercept)
-    return np.clip(X @ coef, 0.0, 1.0)
+def apply_transform(rgb, transform, degree=2, model="standard", intercept=True):
+    if not isinstance(transform, dict):
+        X = feature_matrix(rgb, degree=degree, model=model, intercept=intercept)
+        return np.clip(X @ transform, 0.0, 1.0)
+
+    if transform["kind"] == "rgb-poly":
+        X = feature_matrix(
+            rgb,
+            degree=transform["degree"],
+            model=transform["feature_model"],
+            intercept=transform["intercept"],
+        )
+        return np.clip(X @ transform["coef"], 0.0, 1.0)
+
+    if transform["kind"] == "ycbcr-poly":
+        ycc = rgb_to_ycbcr(rgb)
+        X = feature_matrix(
+            ycc,
+            degree=transform["degree"],
+            model="standard",
+            intercept=transform["intercept"],
+        )
+        return np.clip(ycbcr_to_rgb(X @ transform["coef"]), 0.0, 1.0)
+
+    if transform["kind"] == "hybrid-ycbcr":
+        ycc = rgb_to_ycbcr(rgb)
+        X = feature_matrix(
+            ycc,
+            degree=transform["degree"],
+            model="standard",
+            intercept=transform["intercept"],
+        )
+        out_ycc = np.empty_like(ycc)
+        out_ycc[:, 0] = apply_tone_curve(ycc[:, 0], transform["tone_x"], transform["tone_y"])
+        out_ycc[:, 1:3] = X @ transform["chroma_coef"]
+        return np.clip(ycbcr_to_rgb(out_ycc), 0.0, 1.0)
+
+    raise ValueError(f"Unknown transform kind: {transform['kind']}")
 
 
 def collect_samples(
@@ -376,7 +754,11 @@ def main():
     )
     ap.add_argument("--strengths", type=float, nargs="+")
     ap.add_argument("--degree", type=int, default=2, choices=[1, 2, 3])
-    ap.add_argument("--model", choices=["standard", "root-poly"], default="standard")
+    ap.add_argument(
+        "--model",
+        choices=["standard", "root-poly", "rgb-luma-reg", "ycbcr", "hybrid-ycbcr"],
+        default="standard",
+    )
     ap.add_argument("--intercept", dest="intercept", action="store_true", default=True)
     ap.add_argument("--no-intercept", dest="intercept", action="store_false")
     ap.add_argument("--fps", type=float, default=2.0)
@@ -396,6 +778,42 @@ def main():
         default="random",
     )
     ap.add_argument("--luma-bins", type=int, default=6)
+    ap.add_argument(
+        "--luma-regularization",
+        type=float,
+        default=1.0,
+        help="Mode A only: weight for luma-control regularization.",
+    )
+    ap.add_argument(
+        "--shadow-lift",
+        type=float,
+        default=0.18,
+        help="Modes A/C: maximum positive luma lift allowed in shadows.",
+    )
+    ap.add_argument(
+        "--mid-lift",
+        type=float,
+        default=0.045,
+        help="Modes A/C: maximum positive luma lift encouraged in midtones.",
+    )
+    ap.add_argument(
+        "--highlight-lift",
+        type=float,
+        default=0.01,
+        help="Modes A/C: maximum positive luma lift encouraged in highlights.",
+    )
+    ap.add_argument(
+        "--max-darken",
+        type=float,
+        default=0.22,
+        help="Modes A/C: maximum negative luma movement allowed in the controlled target.",
+    )
+    ap.add_argument(
+        "--tone-bins",
+        type=int,
+        default=32,
+        help="Mode C only: number of bins for the controlled luma tone curve.",
+    )
     args = ap.parse_args()
     if args.model == "root-poly" and args.degree != 2:
         raise SystemExit("root-poly currently supports --degree 2 only")
@@ -452,6 +870,12 @@ def main():
         degree=args.degree,
         model=args.model,
         intercept=args.intercept,
+        luma_regularization=args.luma_regularization,
+        shadow_lift=args.shadow_lift,
+        mid_lift=args.mid_lift,
+        highlight_lift=args.highlight_lift,
+        max_darken=args.max_darken,
+        tone_bins=args.tone_bins,
     )
 
     pred = apply_transform(

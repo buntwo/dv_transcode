@@ -33,6 +33,7 @@ def make_config(**overrides) -> transcode3.Config:
         "crf": None,
         "video_filter": None,
         "lut": None,
+        "vhs_color_correct": False,
         "deint_mode": "send_field",
         "map_both_audio": False,
         "log_level": "warning",
@@ -626,6 +627,7 @@ class TestFiltersAndArgs(unittest.TestCase):
 
         self.assertIn("bwdif=mode=send_field:parity=auto:deint=all", vf)
         self.assertIn("setparams=range=limited", vf)
+        self.assertIn("scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int", vf)
         self.assertNotIn("color_primaries", vf)
         self.assertNotIn("color_trc", vf)
         self.assertNotIn("colorspace", vf)
@@ -933,6 +935,31 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertLess(vf.index(lut_stage), vf.index("subtitles="))
         self.assertLess(vf.index("subtitles="), vf.index("format=yuv420p10le"))
 
+    def test_vhs_color_correction_inserts_before_scale(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        vf = transcode3.build_vf(
+            make_config(format_type="vhs", denoise="verylight", vhs_color_correct=True),
+            paths,
+        )
+
+        self.assertIn(transcode3.VHS_COLOR_CORRECTION_FILTER, vf)
+        self.assertLess(vf.index("hqdn3d="), vf.index(transcode3.VHS_COLOR_CORRECTION_FILTER))
+        self.assertLess(vf.index(transcode3.VHS_COLOR_CORRECTION_FILTER), vf.index(transcode3.SCALE_FILTER))
+
     def test_custom_vf_replaces_generated_filter_chain_exactly(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),
@@ -1058,6 +1085,31 @@ class TestTranscodeAccess(unittest.TestCase):
                 cfg, _ = transcode_access.parse_args()
 
         self.assertEqual(cfg.lut, lut)
+
+    def test_access_parse_args_supports_vhs_color_correction(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "vhs",
+            "--vhs-color-correct",
+            "masters/tape/08.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode_access.parse_args()
+
+        self.assertTrue(cfg.vhs_color_correct)
+
+    def test_access_parse_args_rejects_vhs_color_correction_for_non_vhs(self) -> None:
+        argv = [
+            "transcode_access.py",
+            "--format",
+            "video8",
+            "--vhs-color-correct",
+            "masters/tape/08.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                transcode_access.parse_args()
 
     def test_access_parse_args_rejects_blank_custom_vf(self) -> None:
         argv = [
