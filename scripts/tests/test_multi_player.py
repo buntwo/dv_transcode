@@ -480,11 +480,20 @@ class TestMultiPlayerKeys(unittest.TestCase):
             b"d": "display",
             b"t": "sync_to_selected_time",
             b"q": "quit",
+            b"\x03": "interrupt",
         }
 
         for sequence, expected in cases.items():
             with self.subTest(sequence=sequence):
                 self.assertEqual(multi_player.normalize_key(sequence), expected)
+
+    def test_interrupt_key_raises_keyboard_interrupt(self) -> None:
+        players = make_players(2)
+        state = multi_player.ControllerState()
+        args = argparse.Namespace(nudge_small=0.033, nudge_large=0.5, seek_medium=2.0, seek_small=5.0, seek_large=30.0)
+
+        with self.assertRaises(KeyboardInterrupt):
+            multi_player.handle_key("interrupt", players, state, args)
 
     def test_normalize_key_ignores_removed_shortcuts(self) -> None:
         for sequence in (b"\x1b[D", b"\x1b[C", b"\x1b[1;2D", b"\x1b[1;2C", b"c", b"v", b"C", b"V", b"g", b"h", b"0"):

@@ -425,8 +425,10 @@ def normalize_key(sequence: bytes) -> str | None:
         return "space"
     if sequence in (b"\r", b"\n"):
         return "selected_pause"
-    if sequence in (b"q", b"\x03"):
+    if sequence == b"q":
         return "quit"
+    if sequence == b"\x03":
+        return "interrupt"
     if sequence == b"\x1a":
         return "seek_all_back_xs"
     if sequence == b"\x18":
@@ -1109,6 +1111,8 @@ def handle_key(
     state: ControllerState,
     args: argparse.Namespace,
 ) -> bool:
+    if key == "interrupt":
+        raise KeyboardInterrupt
     if key == "quit":
         return False
     if key == "space":

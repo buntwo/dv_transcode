@@ -1,6 +1,9 @@
 __pycache__/
 .DS_Store
 *_frames/
+*.png
+*.mp4
+*.mkv
 
 # Generated clips, geometry-normalized data, evaluation outputs, and LUT review sheets.
 generated_video_pairs/
