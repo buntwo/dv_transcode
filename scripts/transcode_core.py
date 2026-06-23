@@ -878,6 +878,8 @@ def build_vf(cfg: Config, paths: Paths) -> str:
 def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list[str]:
     """Build the ffmpeg command-line argument list."""
     args = ["ffmpeg", "-hide_banner", "-loglevel", cfg.log_level, "-stats", "-stats_period", "1"]
+    if cfg.assume_yes and not preview:
+        args.append("-y")
 
     if cfg.start:
         args += ["-ss", cfg.start]

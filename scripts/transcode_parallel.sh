@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  transcode_parallel.sh TASK_FILE
+  transcode_parallel.sh [--run-dir RUN_DIR] TASK_FILE
+  transcode_parallel.sh --resume RUN_DIR TASK_FILE
 
 Runs one shell command per non-empty, non-comment TASK_FILE line.
 
@@ -16,26 +17,70 @@ Live controls:
 Environment:
   TRANSCODE_DEFAULT_JOBS   initial active task target, default 1
   TRANSCODE_MAX_JOBS       clamp target to this value, default 3
-  TRANSCODE_POLL_SECONDS   scheduler poll interval, default 2
+  TRANSCODE_POLL_SECONDS   scheduler poll interval, default 1
   TRANSCODE_THROUGHPUT_SECONDS
                            throughput print interval, default 5; 0 disables
   TRANSCODE_REDRAW_STATS   auto, 1, or 0; default auto
   TRANSCODE_CONTROL_FILE   override control file path; default ./vhs_transcode_parallelism
-  TRANSCODE_RUN_DIR        override run/log directory; default ./transcode_parallel_runs
+  TRANSCODE_RUN_DIR        exact run/log directory; default ./transcode_parallel_runs/YYYYMMDD_HHMMSS
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
+run_dir_arg=${TRANSCODE_RUN_DIR:-}
+resume_run_dir=
+positional=()
+while (($# > 0)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --run-dir)
+      if [[ -z "${2:-}" ]]; then
+        echo "--run-dir requires a directory path" >&2
+        exit 2
+      fi
+      run_dir_arg=$2
+      shift 2
+      ;;
+    --resume)
+      if [[ -z "${2:-}" ]]; then
+        echo "--resume requires an existing run directory" >&2
+        exit 2
+      fi
+      resume_run_dir=$2
+      shift 2
+      ;;
+    --)
+      shift
+      while (($# > 0)); do
+        positional+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      positional+=("$1")
+      shift
+      ;;
+  esac
+done
 
-if [[ $# -ne 1 ]]; then
+if ((${#positional[@]} != 1)); then
   usage >&2
   exit 2
 fi
 
-task_file=$1
+if [[ -n "$resume_run_dir" && -n "$run_dir_arg" ]]; then
+  echo "--resume and --run-dir/TRANSCODE_RUN_DIR are mutually exclusive" >&2
+  exit 2
+fi
+
+task_file=${positional[0]}
 if [[ ! -f "$task_file" ]]; then
   echo "Task file not found: $task_file" >&2
   exit 2
@@ -43,18 +88,20 @@ fi
 
 default_jobs=${TRANSCODE_DEFAULT_JOBS:-1}
 max_jobs=${TRANSCODE_MAX_JOBS:-3}
-poll_seconds=${TRANSCODE_POLL_SECONDS:-2}
+poll_seconds=${TRANSCODE_POLL_SECONDS:-1}
 throughput_seconds=${TRANSCODE_THROUGHPUT_SECONDS:-5}
 redraw_stats_setting=${TRANSCODE_REDRAW_STATS:-auto}
 control_file=${TRANSCODE_CONTROL_FILE:-"$PWD/vhs_transcode_parallelism"}
-run_root=${TRANSCODE_RUN_DIR:-"$PWD/transcode_parallel_runs"}
-run_id=$(date +"%Y%m%d_%H%M%S")
-run_dir="$run_root/$run_id"
+if [[ -n "$resume_run_dir" ]]; then
+  run_dir=$resume_run_dir
+elif [[ -n "$run_dir_arg" ]]; then
+  run_dir=$run_dir_arg
+else
+  run_dir="$PWD/transcode_parallel_runs/$(date +"%Y%m%d_%H%M%S")"
+fi
 log_dir="$run_dir/logs"
 status_dir="$run_dir/status"
 throughput_state_dir="$run_dir/throughput_state"
-
-mkdir -p "$log_dir" "$status_dir" "$throughput_state_dir"
 
 if [[ ! "$default_jobs" =~ ^[0-9]+$ || ! "$max_jobs" =~ ^[0-9]+$ ]]; then
   echo "TRANSCODE_DEFAULT_JOBS and TRANSCODE_MAX_JOBS must be non-negative integers" >&2
@@ -83,8 +130,6 @@ if (( default_jobs > max_jobs )); then
   default_jobs=$max_jobs
 fi
 
-printf '%s\n' "$default_jobs" > "$control_file"
-
 commands=()
 while IFS= read -r line || [[ -n "$line" ]]; do
   trimmed=${line#"${line%%[![:space:]]*}"}
@@ -100,6 +145,207 @@ if (( total == 0 )); then
   exit 2
 fi
 
+if [[ -n "$resume_run_dir" ]]; then
+  if [[ ! -d "$run_dir" ]]; then
+    echo "Resume run directory does not exist: $run_dir" >&2
+    exit 2
+  fi
+  if [[ ! -d "$log_dir" || ! -d "$status_dir" ]]; then
+    echo "Resume run directory must contain logs/ and status/: $run_dir" >&2
+    exit 2
+  fi
+else
+  if [[ -d "$run_dir" && -n "$(find "$run_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "Run directory already exists and is not empty: $run_dir" >&2
+    echo "Use --resume '$run_dir' to continue an existing run." >&2
+    exit 2
+  fi
+fi
+
+mkdir -p "$log_dir" "$status_dir" "$throughput_state_dir"
+
+resume_completed_output=
+if [[ -n "$resume_run_dir" ]]; then
+  resume_completed_output=$(python3 - "$task_file" "$run_dir" <<'PY'
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+task_file = Path(sys.argv[1])
+run_dir = Path(sys.argv[2])
+log_dir = run_dir / "logs"
+status_dir = run_dir / "status"
+
+
+def parse_tasks(path: Path) -> list[str]:
+    tasks: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        tasks.append(line)
+    return tasks
+
+
+def file_size(path_text: str | None) -> str:
+    if not path_text:
+        return "unknown"
+    path = Path(path_text)
+    try:
+        return str(path.stat().st_size)
+    except OSError:
+        return "missing"
+
+
+def parse_log(log_path: Path) -> tuple[str | None, str | None]:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+
+    command = None
+    output = None
+    for line in text.splitlines():
+        if command is None and line.startswith("command: "):
+            command = line[len("command: ") :]
+        elif line.startswith("Output: "):
+            output = line[len("Output: ") :].strip()
+    return command, output
+
+
+def read_status(status_path: Path) -> str | None:
+    try:
+        return status_path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+
+
+def task_numbers(path: Path, suffix: str) -> set[int]:
+    numbers: set[int] = set()
+    pattern = re.compile(r"^task_([0-9]+)" + re.escape(suffix) + r"$")
+    for child in path.iterdir():
+        match = pattern.match(child.name)
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+tasks = parse_tasks(task_file)
+total = len(tasks)
+old_numbers = task_numbers(log_dir, ".log") | task_numbers(status_dir, ".status")
+errors: list[str] = []
+rows: list[dict[str, str | int | None]] = []
+completed: list[int] = []
+
+for task_number in sorted(n for n in old_numbers if n > total):
+    errors.append(
+        f"existing run has task {task_number}, but current task file only has {total} task(s)"
+    )
+
+for task_number in range(1, total + 1):
+    log_path = log_dir / f"task_{task_number}.log"
+    status_path = status_dir / f"task_{task_number}.status"
+    has_log = log_path.exists()
+    has_status = status_path.exists()
+
+    if not has_log and not has_status:
+        rows.append(
+            {
+                "task": task_number,
+                "status": "not-started",
+                "action": "run",
+                "output": None,
+                "size": "unknown",
+            }
+        )
+        continue
+
+    if has_status and not has_log:
+        errors.append(f"task {task_number} has a status file but no log file")
+        continue
+
+    command, output = parse_log(log_path)
+    if command is None:
+        errors.append(f"task {task_number} log is missing its command line")
+        continue
+    if command != tasks[task_number - 1]:
+        errors.append(
+            "task "
+            f"{task_number} command mismatch\n"
+            f"  log:  {command}\n"
+            f"  task: {tasks[task_number - 1]}"
+        )
+        continue
+
+    status = read_status(status_path)
+    if status == "0":
+        if not output:
+            errors.append(f"task {task_number} completed but log has no Output line to verify")
+            continue
+        if not Path(output).is_file():
+            errors.append(f"task {task_number} completed but output is missing: {output}")
+            continue
+        completed.append(task_number)
+        rows.append(
+            {
+                "task": task_number,
+                "status": "0",
+                "action": "skip",
+                "output": output,
+                "size": file_size(output),
+            }
+        )
+    else:
+        rows.append(
+            {
+                "task": task_number,
+                "status": status or "interrupted",
+                "action": "rerun",
+                "output": output,
+                "size": file_size(output),
+            }
+        )
+
+print(f"Resume report for {run_dir}", file=sys.stderr)
+print(f"Tasks in current task file: {total}", file=sys.stderr)
+print("", file=sys.stderr)
+print(
+    f"{'task':>4}  {'old_status':>11}  {'action':>6}  {'output_bytes':>12}  output",
+    file=sys.stderr,
+)
+print(f"{'-' * 4}  {'-' * 11}  {'-' * 6}  {'-' * 12}  {'-' * 6}", file=sys.stderr)
+for row in rows:
+    print(
+        f"{row['task']:>4}  {str(row['status']):>11}  {str(row['action']):>6}  "
+        f"{str(row['size']):>12}  {row['output'] or '(unknown)'}",
+        file=sys.stderr,
+    )
+
+if errors:
+    print("", file=sys.stderr)
+    print("Refusing to resume because validation failed:", file=sys.stderr)
+    for error in errors:
+        print(f"- {error}", file=sys.stderr)
+    raise SystemExit(2)
+
+rerun_count = sum(1 for row in rows if row["action"] == "rerun")
+run_count = sum(1 for row in rows if row["action"] in {"run", "rerun"})
+skip_count = len(completed)
+print("", file=sys.stderr)
+print(
+    f"Summary: skip {skip_count}, run new {run_count - rerun_count}, rerun incomplete {rerun_count}",
+    file=sys.stderr,
+)
+
+print(f"RUN_COUNT\t{run_count}")
+for task_number in completed:
+    print(f"COMPLETED\t{task_number}")
+PY
+  )
+fi
+
 pids=()
 states=()
 task_numbers=()
@@ -113,6 +359,35 @@ shutting_down=0
 last_throughput_report=0
 stats_lines_printed=0
 stats_redraw=0
+skip_tasks=()
+
+for ((i=0; i<total; i++)); do
+  skip_tasks[$i]=0
+done
+
+resume_run_count=0
+if [[ -n "$resume_completed_output" ]]; then
+  while IFS=$'\t' read -r resume_record_type resume_record_value; do
+    [[ -z "$resume_record_type" ]] && continue
+    if [[ "$resume_record_type" == "RUN_COUNT" ]]; then
+      resume_run_count=$resume_record_value
+    elif [[ "$resume_record_type" == "COMPLETED" ]]; then
+      skip_tasks[$((resume_record_value - 1))]=1
+      completed=$((completed + 1))
+    fi
+  done <<< "$resume_completed_output"
+fi
+
+if [[ -n "$resume_run_dir" && "$resume_run_count" != "0" ]]; then
+  printf '\nType RESUME to start/rerun the non-completed tasks:\n' >&2
+  IFS= read -r resume_answer
+  if [[ "$resume_answer" != "RESUME" ]]; then
+    echo "Resume aborted." >&2
+    exit 130
+  fi
+fi
+
+printf '%s\n' "$default_jobs" > "$control_file"
 
 if [[ "$redraw_stats_setting" == "1" || ( "$redraw_stats_setting" == "auto" && -t 1 ) ]]; then
   stats_redraw=1
@@ -231,6 +506,7 @@ start_task() {
   local log_file="$log_dir/task_${task_number}.log"
   local pid
 
+  rm -f "$status_file"
   {
     printf '[%s] task %03d start\n' "$(now)" "$task_number"
     printf 'command: %s\n\n' "$command_text"
@@ -334,6 +610,10 @@ resume_to_target() {
 launch_to_target() {
   local target=$1
   while (( $(running_count) < target && next_task < total )); do
+    while (( next_task < total && skip_tasks[$next_task] == 1 )); do
+      next_task=$((next_task + 1))
+    done
+    (( next_task >= total )) && break
     start_task "$next_task"
     next_task=$((next_task + 1))
   done

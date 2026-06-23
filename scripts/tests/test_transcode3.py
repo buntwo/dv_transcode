@@ -666,6 +666,48 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("-crf", args)
         self.assertNotIn("-preset", args)
 
+    def test_yes_adds_ffmpeg_overwrite_for_transcode(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        yes_args = transcode3.build_ffmpeg_args(make_config(assume_yes=True), paths, "null", preview=False)
+        interactive_args = transcode3.build_ffmpeg_args(make_config(assume_yes=False), paths, "null", preview=False)
+
+        self.assertIn("-y", yes_args)
+        self.assertNotIn("-y", interactive_args)
+
+    def test_yes_does_not_add_overwrite_for_preview(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(make_config(assume_yes=True), paths, "null", preview=True)
+
+        self.assertNotIn("-y", args)
+
     def test_libx265_args_use_preset_crf_and_apple_hevc_tag(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),
