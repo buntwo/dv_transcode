@@ -1,7 +1,7 @@
 [project]
 name = "video-scripts"
 version = "0.1.0"
-description = "Operator scripts for 8mm video processing workflows."
+description = "Operator scripts for 8mm and vhs video processing workflows."
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "numpy>=2.4.6",
