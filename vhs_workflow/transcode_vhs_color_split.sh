@@ -16,6 +16,9 @@ Usage:
   transcode_vhs_color_split.sh --emit-tasks [TASK_FILE]
       Write one transcode command per source file.
 
+  transcode_vhs_color_split.sh --print-tasks
+      Print one transcode command per source file to stdout.
+
   transcode_vhs_color_split.sh --parallel [TASK_FILE] [--run-dir RUN_DIR]
       Write tasks, then run them through transcode_parallel.sh.
 
@@ -205,6 +208,9 @@ case "$mode" in
     emit_all_tasks > "$task_file"
     echo "Wrote tasks to $task_file"
     echo "Run with: $repo_dir/scripts/transcode_parallel.sh '$task_file'"
+    ;;
+  --print-tasks)
+    emit_all_tasks
     ;;
   --parallel)
     shift
