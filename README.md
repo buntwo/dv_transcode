@@ -52,6 +52,82 @@ What is optional vs enforced:
 - Transcode duration validation is enabled by default in `--mode transcode` and can be skipped with `--no-validate-duration`.
 - `--mode preview` never writes final access outputs and never runs duration validation.
 
+**VHS Color Split Workflow**
+For the VHS master-audio workflow, run these commands from `/Users/btu/scratch/Videos`.
+The VHS shell entrypoints and rename map live in this repository under `scripts/vhs_workflow/`; the shared Python tools remain under `scripts/scripts/`. Media outputs still live under `/Users/btu/scratch/Videos` by default. Master video files are expected under `/Volumes/TU/tu.brian.2026.05.09/data/masters/tape` by default. Generated task files such as `transcode_vhs_color_split.tasks` are not checked in.
+
+Path overrides:
+
+- `VHS_DATA_ROOT`: media/output root, default `/Users/btu/scratch/Videos`
+- `VHS_MASTER_ROOT`: master video root, default `/Volumes/TU/tu.brian.2026.05.09/data/masters/tape`
+
+Example:
+
+```bash
+VHS_DATA_ROOT=/path/to/Videos \
+VHS_MASTER_ROOT=/path/to/masters/tape \
+scripts/vhs_workflow/transcode_vhs_color_split.sh
+```
+
+1. Transcode the Access MP4s from the VHS file list.
+
+```bash
+scripts/vhs_workflow/transcode_vhs_color_split.sh
+```
+
+To run through the parallel runner instead:
+
+```bash
+scripts/vhs_workflow/transcode_vhs_color_split.sh --parallel
+```
+
+2. Extract master FLAC audio from the same file list.
+
+```bash
+scripts/vhs_workflow/transcode_vhs_color_split_extract_audio.sh \
+  --output-dir Access_crf22_audio
+```
+
+This wrapper uses the same task list as `transcode_vhs_color_split.sh`, including the per-file audio-channel setting for `08.mkv`. It prints the full extraction plan, file counts, channel counts, and output paths before asking for confirmation.
+
+3. Replace Access audio with normalized master audio.
+
+```bash
+scripts/vhs_workflow/transcode_vhs_color_split_normalize_audio.sh \
+  --access-copy-dir Access_crf22 \
+  --audio-dir Access_crf22_audio \
+  --output-dir Access_crf22_normalized
+```
+
+This wrapper prints the full normalization plan before asking for confirmation. The underlying normalizer requires exact stem matching: `Access_crf22/Foo.mp4` pairs with `Access_crf22_audio/Foo.flac`. It writes normalized MP4s plus `metadata.csv` in the output directory.
+
+4. Rename the normalized Access files from the name map.
+
+The rename tool is `scripts/scripts/rename_access_from_map.py`. It is dry-run by default; add `--apply` only after the plan looks right.
+
+```bash
+uv --project scripts run scripts/scripts/rename_access_from_map.py \
+  --file-dir Access_crf22_normalized \
+  --map-file scripts/vhs_workflow/access_name_map.csv
+
+uv --project scripts run scripts/scripts/rename_access_from_map.py \
+  --file-dir Access_crf22_normalized \
+  --map-file scripts/vhs_workflow/access_name_map.csv \
+  --apply
+```
+
+5. Create contact sheets and spectrograms for review.
+
+```bash
+uv --project scripts run scripts/scripts/contact_sheet.py \
+  --output-dir Access_crf22_normalized/contact_sheets \
+  Access_crf22_normalized/*.mp4
+
+uv --project scripts run scripts/scripts/spectrogram.py \
+  --output-dir Access_crf22_normalized/spectrograms \
+  Access_crf22_normalized/*.mp4
+```
+
 **Video8 vs Digital8**
 `video8` flow:
 
