@@ -522,6 +522,51 @@ class TestFixedGainMode(unittest.TestCase):
             confirm_mock.assert_not_called()
             remux_mock.assert_called_once()
 
+    def test_fixed_gain_noninteractive_without_yes_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            access_dir = Path(root) / "access"
+            audio_dir = Path(root) / "audio"
+            output_dir = Path(root) / "output"
+            access_dir.mkdir()
+            audio_dir.mkdir()
+            (access_dir / "Movie.mp4").write_bytes(b"video")
+            (audio_dir / "Movie.flac").write_bytes(b"audio")
+
+            with (
+                patch.object(normalize_access_audio.shutil, "which", return_value="/bin/ffmpeg"),
+                patch.object(
+                    normalize_access_audio,
+                    "probe_media_duration_seconds",
+                    side_effect=[120.0, 120.0],
+                ),
+                patch.object(
+                    normalize_access_audio,
+                    "run_volumedetect",
+                    return_value=audio_volume_analysis.VolumeDetectStats(mean_volume=-30.0, max_volume=-14.0),
+                ),
+                patch.object(normalize_access_audio, "run_fixed_gain_remux") as remux_mock,
+                patch.object(normalize_access_audio.sys, "stdin", io.StringIO()),
+                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()) as stdout_mock,
+                patch.object(normalize_access_audio.sys, "stderr", io.StringIO()),
+            ):
+                code = normalize_access_audio.main(
+                    [
+                        "--access-copy-dir",
+                        str(access_dir),
+                        "--audio-dir",
+                        str(audio_dir),
+                        "--output-dir",
+                        str(output_dir),
+                        "--method",
+                        "fixed-gain",
+                    ]
+                )
+
+            self.assertEqual(code, 1)
+            self.assertIn("interactive confirmation required", stdout_mock.getvalue())
+            remux_mock.assert_not_called()
+            self.assertFalse((output_dir / "metadata.csv").exists())
+
     def test_output_conflict_fails_before_fixed_gain_analysis(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             access_dir = Path(root) / "access"

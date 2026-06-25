@@ -541,8 +541,7 @@ def write_metadata_csv(
 
 def confirm_fixed_gain() -> bool:
     if hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
-        print("Interactive confirmation required. Re-run from a terminal or pass --yes.", file=sys.stderr)
-        return False
+        raise ValueError("interactive confirmation required; re-run from a terminal or pass --yes")
 
     while True:
         print("Apply fixed gain to these files? [y/N] ", end="", flush=True)

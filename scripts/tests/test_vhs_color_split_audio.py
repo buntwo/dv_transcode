@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
@@ -302,6 +303,48 @@ class TestVhsColorSplitAudioConfirmation(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--method") + 1], "fixed-gain")
         self.assertEqual(cmd[cmd.index("--gain") + 1], "12")
         self.assertEqual(cmd[cmd.index("--peak-ceiling") + 1], "-1.5")
+
+    def test_run_normalize_symlinks_absolute_access_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            access_dir = root_path / "Access_crf22"
+            audio_dir = root_path / "audio"
+            output_dir = root_path / "normalized"
+            access_dir.mkdir()
+            audio_dir.mkdir()
+            (access_dir / "A.mp4").write_bytes(b"video")
+            (audio_dir / "A.flac").write_bytes(b"audio")
+            plan = vhs_color_split_audio.NormalizePlan(
+                transcode_list=Path("/repo/vhs_workflow/transcode_vhs_color_split.sh"),
+                access_copy_dir=Path("Access_crf22"),
+                audio_dir=audio_dir,
+                output_dir=output_dir,
+                force=False,
+                jobs=[
+                    vhs_color_split_audio.NormalizeJob(
+                        "A",
+                        Path("Access_crf22/A.mp4"),
+                        audio_dir / "A.flac",
+                        output_dir / "A.mp4",
+                        "found",
+                        "will write",
+                    )
+                ],
+            )
+
+            original_cwd = Path.cwd()
+            os.chdir(root_path)
+            try:
+                def inspect_symlink(cmd: list[str], check: bool) -> None:
+                    self.assertTrue(check)
+                    tmp_access = Path(cmd[cmd.index("--access-copy-dir") + 1])
+                    link_target = Path(os.readlink(tmp_access / "A.mp4"))
+                    self.assertEqual(link_target, (access_dir / "A.mp4").resolve())
+
+                with patch.object(vhs_color_split_audio.subprocess, "run", side_effect=inspect_symlink):
+                    vhs_color_split_audio.run_normalize(plan, Path("/repo"))
+            finally:
+                os.chdir(original_cwd)
 
     def test_run_normalize_forwards_custom_gain_and_ceiling(self) -> None:
         with tempfile.TemporaryDirectory() as root:

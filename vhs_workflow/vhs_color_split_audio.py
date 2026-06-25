@@ -407,7 +407,7 @@ def run_normalize(plan: NormalizePlan, repo_root: Path) -> None:
     with tempfile.TemporaryDirectory() as tmp_access:
         tmp_access_path = Path(tmp_access)
         for job in plan.jobs:
-            os.symlink(job.access_file, tmp_access_path / f"{job.stem}.mp4")
+            os.symlink(job.access_file.resolve(), tmp_access_path / f"{job.stem}.mp4")
 
         cmd = [
             "uv",
