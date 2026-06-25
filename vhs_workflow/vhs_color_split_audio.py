@@ -14,6 +14,8 @@ from pathlib import Path
 
 
 AUDIO_CHANNELS = ("keep", "left", "right")
+DEFAULT_FIXED_GAIN = 12.0
+DEFAULT_PEAK_CEILING = -1.5
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,8 @@ class NormalizePlan:
     output_dir: Path
     force: bool
     jobs: list[NormalizeJob]
+    gain: float = DEFAULT_FIXED_GAIN
+    peak_ceiling: float = DEFAULT_PEAK_CEILING
 
     @property
     def missing_audio_count(self) -> int:
@@ -110,6 +114,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     normalize.add_argument("--access-copy-dir", type=Path, required=True, help="Directory with Access MP4 files")
     normalize.add_argument("--audio-dir", type=Path, required=True, help="Directory containing matching FLAC files")
     normalize.add_argument("--output-dir", type=Path, required=True, help="Directory for normalized MP4 output")
+    normalize.add_argument("--gain", type=float, default=DEFAULT_FIXED_GAIN, help="Fixed audio gain in dB")
+    normalize.add_argument("--peak-ceiling", type=float, default=DEFAULT_PEAK_CEILING, help="Maximum post-gain peak in dB")
     normalize.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     normalize.add_argument("--repo-root", "--project-root", dest="repo_root", type=Path, default=argparse.SUPPRESS)
     normalize.add_argument("--transcode-list", type=Path, default=argparse.SUPPRESS)
@@ -188,6 +194,8 @@ def build_normalize_plan(
     output_dir: Path,
     force: bool,
     transcode_list: Path,
+    gain: float = DEFAULT_FIXED_GAIN,
+    peak_ceiling: float = DEFAULT_PEAK_CEILING,
 ) -> NormalizePlan:
     jobs: list[NormalizeJob] = []
     for task in tasks:
@@ -204,7 +212,7 @@ def build_normalize_plan(
             output_status = "exists, overwrite" if force else "exists, needs --force"
 
         jobs.append(NormalizeJob(stem, access_file, audio_file, output_file, audio_status, output_status))
-    return NormalizePlan(transcode_list, access_copy_dir, audio_dir, output_dir, force, jobs)
+    return NormalizePlan(transcode_list, access_copy_dir, audio_dir, output_dir, force, jobs, gain, peak_ceiling)
 
 
 def common_parent(paths: list[Path]) -> str:
@@ -269,6 +277,7 @@ def format_normalize_plan(plan: NormalizePlan) -> str:
     lines.append(f"Using audio directory: {plan.audio_dir}")
     lines.append(f"Output directory: {plan.output_dir}")
     lines.append(f"Metadata CSV: {plan.output_dir / 'metadata.csv'}")
+    lines.append(f"Normalization method: fixed-gain ({format_float(plan.gain)} dB, ceiling {format_float(plan.peak_ceiling)} dB)")
     lines.append(f"Matching FLAC files missing: {plan.missing_audio_count}")
     lines.append(f"Planned outputs already present: {plan.existing_output_count}")
 
@@ -334,6 +343,12 @@ def _format_table_row(row: tuple[str, ...], widths: list[int], right_aligned_col
         else:
             cells.append(f"{value:<{widths[index]}}")
     return "  " + "  ".join(cells)
+
+
+def format_float(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:g}"
 
 
 def confirm(prompt: str, *, input_stream: object | None = None, output_stream: object | None = None) -> bool:
@@ -406,6 +421,12 @@ def run_normalize(plan: NormalizePlan, repo_root: Path) -> None:
             str(plan.audio_dir),
             "--output-dir",
             str(plan.output_dir),
+            "--method",
+            "fixed-gain",
+            "--gain",
+            format_float(plan.gain),
+            "--peak-ceiling",
+            format_float(plan.peak_ceiling),
         ]
         if plan.force:
             cmd.append("--force")
@@ -432,6 +453,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_dir,
                 args.force,
                 args.transcode_list,
+                args.gain,
+                args.peak_ceiling,
             )
             print(format_normalize_plan(plan))
             if not confirm("Proceed with these normalization jobs? [y/N] "):

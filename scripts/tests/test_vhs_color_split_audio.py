@@ -124,6 +124,32 @@ class TestVhsColorSplitAudioPlans(unittest.TestCase):
         self.assertEqual(plan.jobs[1].audio_status, "missing")
         self.assertEqual(plan.jobs[1].output_status, "exists, needs --force")
 
+    def test_normalize_plan_records_custom_fixed_gain_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            access_dir = root_path / "access"
+            audio_dir = root_path / "audio"
+            output_dir = root_path / "normalized"
+            access_dir.mkdir()
+            audio_dir.mkdir()
+            (access_dir / "A.mp4").write_bytes(b"video")
+            (audio_dir / "A.flac").write_bytes(b"audio")
+            tasks = [vhs_color_split_audio.TranscodeTask(Path("/masters/A.mkv"), "keep")]
+
+            plan = vhs_color_split_audio.build_normalize_plan(
+                tasks,
+                access_dir,
+                audio_dir,
+                output_dir,
+                force=False,
+                transcode_list=Path("/repo/vhs_workflow/transcode_vhs_color_split.sh"),
+                gain=9.5,
+                peak_ceiling=-1.0,
+            )
+
+        self.assertEqual(plan.gain, 9.5)
+        self.assertEqual(plan.peak_ceiling, -1.0)
+
     def test_extract_table_uses_dynamic_widths(self) -> None:
         plan = vhs_color_split_audio.ExtractPlan(
             transcode_list=Path("/repo/vhs_workflow/transcode_vhs_color_split.sh"),
@@ -239,6 +265,81 @@ class TestVhsColorSplitAudioConfirmation(unittest.TestCase):
                 "/masters/08.mkv",
             ],
         )
+
+    def test_run_normalize_passes_fixed_gain_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            access_dir = root_path / "access"
+            audio_dir = root_path / "audio"
+            output_dir = root_path / "normalized"
+            access_dir.mkdir()
+            audio_dir.mkdir()
+            (access_dir / "A.mp4").write_bytes(b"video")
+            (audio_dir / "A.flac").write_bytes(b"audio")
+            plan = vhs_color_split_audio.NormalizePlan(
+                transcode_list=Path("/repo/vhs_workflow/transcode_vhs_color_split.sh"),
+                access_copy_dir=access_dir,
+                audio_dir=audio_dir,
+                output_dir=output_dir,
+                force=False,
+                jobs=[
+                    vhs_color_split_audio.NormalizeJob(
+                        "A",
+                        access_dir / "A.mp4",
+                        audio_dir / "A.flac",
+                        output_dir / "A.mp4",
+                        "found",
+                        "will write",
+                    )
+                ],
+            )
+
+            with patch.object(vhs_color_split_audio.subprocess, "run") as run_mock:
+                vhs_color_split_audio.run_normalize(plan, Path("/repo"))
+
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("--method", cmd)
+        self.assertEqual(cmd[cmd.index("--method") + 1], "fixed-gain")
+        self.assertEqual(cmd[cmd.index("--gain") + 1], "12")
+        self.assertEqual(cmd[cmd.index("--peak-ceiling") + 1], "-1.5")
+
+    def test_run_normalize_forwards_custom_gain_and_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            access_dir = root_path / "access"
+            audio_dir = root_path / "audio"
+            output_dir = root_path / "normalized"
+            access_dir.mkdir()
+            audio_dir.mkdir()
+            (access_dir / "A.mp4").write_bytes(b"video")
+            (audio_dir / "A.flac").write_bytes(b"audio")
+            plan = vhs_color_split_audio.NormalizePlan(
+                transcode_list=Path("/repo/vhs_workflow/transcode_vhs_color_split.sh"),
+                access_copy_dir=access_dir,
+                audio_dir=audio_dir,
+                output_dir=output_dir,
+                force=True,
+                jobs=[
+                    vhs_color_split_audio.NormalizeJob(
+                        "A",
+                        access_dir / "A.mp4",
+                        audio_dir / "A.flac",
+                        output_dir / "A.mp4",
+                        "found",
+                        "will write",
+                    )
+                ],
+                gain=9.5,
+                peak_ceiling=-1.0,
+            )
+
+            with patch.object(vhs_color_split_audio.subprocess, "run") as run_mock:
+                vhs_color_split_audio.run_normalize(plan, Path("/repo"))
+
+        cmd = run_mock.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--gain") + 1], "9.5")
+        self.assertEqual(cmd[cmd.index("--peak-ceiling") + 1], "-1")
+        self.assertIn("--force", cmd)
 
 
 if __name__ == "__main__":
