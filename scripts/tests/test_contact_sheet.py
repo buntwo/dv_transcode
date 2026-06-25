@@ -105,6 +105,12 @@ class TestContactSheetProgress(unittest.TestCase):
             "[#####-----] 2/4 video.mp4",
         )
 
+    def test_format_progress_pads_count_to_total_width(self) -> None:
+        self.assertEqual(
+            format_progress(1, 21, Path("video.mp4"), width=10),
+            "[----------] 01/21 video.mp4",
+        )
+
 
 class TestContactSheetMetadata(unittest.TestCase):
     def test_metadata_from_ffprobe_uses_first_video_and_audio_stream(self) -> None:

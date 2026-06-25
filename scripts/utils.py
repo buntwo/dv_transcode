@@ -10,7 +10,8 @@ def format_progress(current: int, total: int, label: str | Path, width: int = 20
 
     filled = round(width * current / total)
     bar = "#" * filled + "-" * (width - filled)
-    return f"[{bar}] {current}/{total} {label}"
+    count_width = len(str(total))
+    return f"[{bar}] {current:0{count_width}d}/{total:0{count_width}d} {label}"
 
 
 def needs_cjk_font(char: str) -> bool:
