@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import unittest
 from pathlib import Path
+from unittest.mock import call, patch
 
 import contact_sheet
 from utils import build_text_annotations
@@ -21,10 +22,15 @@ class TestContactSheetArgs(unittest.TestCase):
         self.assertEqual(args.columns, contact_sheet.DEFAULT_COLUMNS)
         self.assertEqual(args.rows, contact_sheet.DEFAULT_ROWS)
         self.assertEqual(args.sheet_width, contact_sheet.DEFAULT_SHEET_WIDTH)
+        self.assertEqual(args.jpeg_qscale, contact_sheet.DEFAULT_JPEG_QSCALE)
 
     def test_parse_args_rejects_invalid_sizes(self) -> None:
         with self.assertRaises(SystemExit):
             contact_sheet.parse_args(["--columns", "0", "video.mp4"])
+
+    def test_parse_args_rejects_invalid_jpeg_qscale(self) -> None:
+        with self.assertRaises(SystemExit):
+            contact_sheet.parse_args(["--jpeg-qscale", "0", "video.mp4"])
 
     def test_parse_args_accepts_multiple_inputs(self) -> None:
         args = contact_sheet.parse_args(["one.mp4", "two.mp4"])
@@ -82,7 +88,7 @@ class TestContactSheetOutputPaths(unittest.TestCase):
     def test_default_output_path_appends_contact_sheet_suffix_to_full_name(self) -> None:
         self.assertEqual(
             contact_sheet.default_output_path(Path("/tmp/video.mp4")),
-            Path("/tmp/video.mp4.contact_sheet.png"),
+            Path("/tmp/video.mp4.contact_sheet.jpg"),
         )
 
     def test_resolve_output_path_uses_explicit_output(self) -> None:
@@ -94,7 +100,50 @@ class TestContactSheetOutputPaths(unittest.TestCase):
     def test_resolve_output_path_uses_output_dir_with_auto_name(self) -> None:
         self.assertEqual(
             contact_sheet.resolve_output_path(Path("/tmp/video.mp4"), None, Path("/sheets")),
-            Path("/sheets/video.mp4.contact_sheet.png"),
+            Path("/sheets/video.mp4.contact_sheet.jpg"),
+        )
+
+
+class TestContactSheetOutputEncoding(unittest.TestCase):
+    def test_append_header_writes_png_directly(self) -> None:
+        config = contact_sheet.config_from_args(contact_sheet.parse_args(["video.mp4"]))
+
+        with patch.object(contact_sheet.subprocess, "run") as run:
+            contact_sheet.append_header(Path("header.png"), Path("tile.png"), Path("out.png"), config)
+
+        run.assert_called_once_with(
+            ["magick", "header.png", "tile.png", "-append", "out.png"],
+            check=True,
+        )
+
+    def test_append_header_encodes_jpeg_with_configured_qscale(self) -> None:
+        config = contact_sheet.config_from_args(contact_sheet.parse_args(["--jpeg-qscale", "5", "video.mp4"]))
+
+        with patch.object(contact_sheet.subprocess, "run") as run:
+            contact_sheet.append_header(Path("header.png"), Path("tile.png"), Path("out.jpg"), config)
+
+        self.assertEqual(
+            run.mock_calls,
+            [
+                call(["magick", "header.png", "tile.png", "-append", "contact-sheet-final.png"], check=True),
+                call(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        "contact-sheet-final.png",
+                        "-frames:v",
+                        "1",
+                        "-q:v",
+                        "5",
+                        "out.jpg",
+                    ],
+                    check=True,
+                ),
+            ],
         )
 
 
@@ -228,6 +277,7 @@ class TestContactSheetFilter(unittest.TestCase):
             point_size=18,
             header_point_size=36,
             detail_point_size=22,
+            jpeg_qscale=contact_sheet.DEFAULT_JPEG_QSCALE,
         )
 
         frame_filter = contact_sheet.build_frame_filter(metadata, config, "00:00:05")
@@ -279,6 +329,7 @@ class TestContactSheetFilter(unittest.TestCase):
             point_size=18,
             header_point_size=36,
             detail_point_size=22,
+            jpeg_qscale=contact_sheet.DEFAULT_JPEG_QSCALE,
         )
 
         self.assertEqual(config.tile_width, 456)

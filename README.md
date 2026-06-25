@@ -226,12 +226,13 @@ Digital8 validation behavior:
 
 `scripts/contact_sheet.py`
 
-- Generates timestamped PNG contact sheets for one or more videos.
+- Generates timestamped JPG contact sheets for one or more videos.
 - Defaults to a 5x4 grid, a 2340px sheet width, and a header with filename, size, duration, dimensions, frame rate, video codec, and audio details.
 - Derives thumbnail tile dimensions from the sheet width, grid columns, spacing, and each video's display aspect ratio.
 - Samples frames at evenly spaced interior timestamps using fast ffmpeg input seeks.
 - Requires `ffmpeg` with the `drawtext` filter and ImageMagick `magick`.
-- Writes `<input>.contact_sheet.png` unless `--output` is supplied.
+- Writes `<input>.contact_sheet.jpg` at `--jpeg-qscale 4` unless `--output` is supplied.
+- Explicit `--output some/path.png` still writes PNG.
 - Use `-o`/`--output-dir` to write that auto-generated filename into a separate directory.
 - `--output` is only valid with one input.
 

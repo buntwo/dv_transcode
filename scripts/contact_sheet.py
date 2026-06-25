@@ -34,6 +34,7 @@ DEFAULT_HEADER_TITLE_X = 36
 DEFAULT_HEADER_TITLE_Y = 34
 DEFAULT_HEADER_DETAIL_X = 36
 DEFAULT_HEADER_DETAIL_Y = 75
+DEFAULT_JPEG_QSCALE = 4
 DETAIL_SEPARATOR = "  ·  "
 
 
@@ -97,6 +98,7 @@ class SheetConfig:
     point_size: int
     header_point_size: int
     detail_point_size: int
+    jpeg_qscale: int
 
     @property
     def frame_count(self) -> int:
@@ -125,16 +127,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-o",
         "--output-dir",
         type=Path,
-        help="Directory for <input filename>.contact_sheet.png. Cannot be combined with --output.",
+        help="Directory for <input filename>.contact_sheet.jpg. Cannot be combined with --output.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        help="Output PNG path for one input. Defaults to <input>.contact_sheet.png.",
+        help="Output image path for one input. Defaults to <input>.contact_sheet.jpg.",
     )
     parser.add_argument("--rows", type=positive_int, default=DEFAULT_ROWS, help="Number of thumbnail rows.")
     parser.add_argument("--columns", type=positive_int, default=DEFAULT_COLUMNS, help="Number of thumbnail columns.")
-    parser.add_argument("--sheet-width", type=positive_int, default=DEFAULT_SHEET_WIDTH, help="Final PNG width in pixels.")
+    parser.add_argument("--sheet-width", type=positive_int, default=DEFAULT_SHEET_WIDTH, help="Final image width in pixels.")
+    parser.add_argument(
+        "--jpeg-qscale",
+        type=jpeg_qscale,
+        default=DEFAULT_JPEG_QSCALE,
+        help="JPEG quality scale for .jpg/.jpeg outputs; lower is higher quality.",
+    )
     return parser.parse_args(argv)
 
 
@@ -149,6 +157,13 @@ def non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be 0 or greater")
+    return parsed
+
+
+def jpeg_qscale(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= 31:
+        raise argparse.ArgumentTypeError("must be between 1 and 31")
     return parsed
 
 
@@ -195,18 +210,19 @@ def config_from_args(args: argparse.Namespace) -> SheetConfig:
         point_size=18,
         header_point_size=36,
         detail_point_size=22,
+        jpeg_qscale=args.jpeg_qscale,
     )
 
 
 def default_output_path(input_path: Path) -> Path:
-    return input_path.with_name(f"{input_path.name}.contact_sheet.png")
+    return input_path.with_name(f"{input_path.name}.contact_sheet.jpg")
 
 
 def resolve_output_path(input_path: Path, output_path: Path | None, output_dir: Path | None) -> Path:
     if output_path is not None:
         return output_path
     if output_dir is not None:
-        return output_dir / f"{input_path.name}.contact_sheet.png"
+        return output_dir / f"{input_path.name}.contact_sheet.jpg"
     return default_output_path(input_path)
 
 
@@ -509,10 +525,39 @@ def create_header(header_path: Path, metadata: VideoMetadata, config: SheetConfi
     working_path.replace(header_path)
 
 
-def append_header(header_path: Path, tile_path: Path, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["magick", str(header_path), str(tile_path), "-append", str(output_path)]
+def is_jpeg_output(output_path: Path) -> bool:
+    return output_path.suffix.lower() in {".jpg", ".jpeg"}
+
+
+def encode_jpeg(input_path: Path, output_path: Path, qscale: int) -> None:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        str(qscale),
+        str(output_path),
+    ]
     subprocess.run(cmd, check=True)
+
+
+def append_header(header_path: Path, tile_path: Path, output_path: Path, config: SheetConfig) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    append_output_path = output_path
+    if is_jpeg_output(output_path):
+        append_output_path = header_path.with_name("contact-sheet-final.png")
+
+    cmd = ["magick", str(header_path), str(tile_path), "-append", str(append_output_path)]
+    subprocess.run(cmd, check=True)
+
+    if append_output_path != output_path:
+        encode_jpeg(append_output_path, output_path, config.jpeg_qscale)
 
 
 def create_contact_sheet(input_path: Path, output_path: Path, config: SheetConfig) -> VideoMetadata:
@@ -523,7 +568,7 @@ def create_contact_sheet(input_path: Path, output_path: Path, config: SheetConfi
         tile_path = tmp / "tile.png"
         create_tile(input_path, tile_path, metadata, config)
         create_header(header_path, metadata, config)
-        append_header(header_path, tile_path, output_path)
+        append_header(header_path, tile_path, output_path, config)
     return metadata
 
 
