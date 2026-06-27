@@ -1,0 +1,5 @@
+file,input_i,input_tp,input_lra,input_thresh,output_i,output_tp,output_lra,output_thresh,normalization_type,target_offset
+05_Brian_Tu.flac,-38.13,-19.84,19.50,-50.45,-21.70,-1.50,14.40,-33.21,dynamic,1.70
+06_Brian_15MO-1M.flac,-35.78,-18.68,17.90,-47.25,-19.84,-1.58,13.40,-30.76,dynamic,-0.16
+07_Brian_19mo_-_24_Month.flac,-37.46,-20.12,19.60,-49.41,-20.32,-1.50,15.00,-31.60,dynamic,0.32
+10_Dinner_at_Tus_home_in_Shanghai_Nov._1991_Home_at_Duluth_1991.flac,-32.75,-16.92,17.80,-44.72,-20.26,-1.54,14.60,-31.80,dynamic,0.26
