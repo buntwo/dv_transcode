@@ -31,6 +31,14 @@ class TestAudioVolumeAnalysis(unittest.TestCase):
             ],
         )
 
+    def test_build_volumedetect_command_composes_prefilter(self) -> None:
+        cmd = audio_volume_analysis.build_volumedetect_command(
+            Path("/mnt/audio/Movie.flac"),
+            "highpass=f=60:p=1",
+        )
+
+        self.assertEqual(cmd[cmd.index("-af") + 1], "highpass=f=60:p=1,volumedetect")
+
     def test_run_volumedetect_captures_ffmpeg_output_by_default(self) -> None:
         completed = audio_volume_analysis.subprocess.CompletedProcess(
             ["ffmpeg"],

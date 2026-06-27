@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Batch normalize Access MP4s using corresponding master FLAC audio."""
+"""Batch replace Access MP4 audio with fixed-gain AAC from matching master FLAC audio."""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 import shutil
 import subprocess
@@ -21,39 +20,14 @@ from audio_volume_analysis import (
     format_volume_analysis_table,
     run_volumedetect,
 )
+from transcode_core import build_vhs_audio_filter
 from utils import format_progress
 
 AUDIO_EXTENSION = ".flac"
-DEFAULT_TARGET_LUFS = -20.0
-DEFAULT_TRUE_PEAK = -1.5
-DEFAULT_LRA = 11.0
 DEFAULT_AUDIO_BITRATE = "192k"
 DEFAULT_DURATION_TOLERANCE = 0.05
-NORMALIZATION_TYPE = "loudnorm-two-pass"
-FIXED_GAIN_NORMALIZATION_TYPE = "fixed-gain"
-LOUDNORM_METADATA_FIELDS = [
-    "access_file",
-    "audio_file",
-    "output_file",
-    "video_duration_seconds",
-    "audio_duration_seconds",
-    "duration_delta_seconds",
-    "target_lufs",
-    "true_peak",
-    "lra",
-    "audio_bitrate",
-    "input_i",
-    "input_tp",
-    "input_lra",
-    "input_thresh",
-    "output_i",
-    "output_tp",
-    "output_lra",
-    "output_thresh",
-    "normalization_type",
-    "target_offset",
-]
-FIXED_GAIN_METADATA_FIELDS = [
+NORMALIZATION_TYPE = "fixed-gain"
+METADATA_FIELDS = [
     "access_file",
     "audio_file",
     "output_file",
@@ -70,27 +44,28 @@ FIXED_GAIN_METADATA_FIELDS = [
     "audio_bitrate",
     "normalization_type",
 ]
-METADATA_FIELDS = LOUDNORM_METADATA_FIELDS
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replace Access audio with loudness-normalized AAC from matching FLAC files.",
+        description="Replace Access audio with fixed-gain AAC from matching FLAC files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--access-copy-dir", type=Path, required=True)
     parser.add_argument("--audio-dir", type=Path, required=True)
-    parser.add_argument("--method", choices=("loudnorm", "fixed-gain"), default="loudnorm")
-    parser.add_argument("--target-lufs", type=float, default=DEFAULT_TARGET_LUFS)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--true-peak", type=float, default=DEFAULT_TRUE_PEAK)
-    parser.add_argument("--lra", type=float, default=DEFAULT_LRA)
     parser.add_argument("--gain", type=float, default=DEFAULT_GAIN)
     parser.add_argument("--peak-ceiling", type=float, default=DEFAULT_PEAK_CEILING)
     parser.add_argument("--audio-bitrate", default=DEFAULT_AUDIO_BITRATE)
     parser.add_argument("--duration-tolerance", type=positive_float, default=DEFAULT_DURATION_TOLERANCE)
+    parser.add_argument(
+        "--vhs-notch",
+        choices=("auto", "ntsc", "pal", "off"),
+        default="off",
+        help="Apply the VHS highpass and scan-frequency notch filter before fixed gain",
+    )
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--yes", action="store_true", help="Skip fixed-gain post-analysis confirmation")
+    parser.add_argument("--yes", action="store_true", help="Skip interactive confirmations")
     parser.add_argument("--verbose", action="store_true", help="Show ffmpeg output during fixed-gain analysis")
     return parser.parse_args(argv)
 
@@ -110,12 +85,19 @@ class NormalizationJob:
     video_duration_seconds: float
     audio_duration_seconds: float
     duration_delta_seconds: float
+    audio_filter: str | None
 
 
 @dataclass(frozen=True)
 class FixedGainReview:
     job: NormalizationJob
     analysis: VolumeAnalysis
+
+
+@dataclass(frozen=True)
+class VhsAudioFilterConfig:
+    format_type: str
+    vhs_notch: str
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -131,7 +113,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"audio directory does not exist: {args.audio_dir}")
     if not args.audio_dir.is_dir():
         raise ValueError(f"audio must be a directory: {args.audio_dir}")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def audio_file_for_access(access_file: Path, audio_dir: Path) -> Path:
@@ -148,93 +129,12 @@ def format_float(value: float) -> str:
     return f"{value:g}"
 
 
-def build_pass1_filter(target_lufs: float, true_peak: float, lra: float) -> str:
-    return (
-        f"loudnorm=I={format_float(target_lufs)}:"
-        f"TP={format_float(true_peak)}:"
-        f"LRA={format_float(lra)}:"
-        "print_format=json"
-    )
+def combine_audio_filters(*filters: str | None) -> str:
+    return ",".join(audio_filter for audio_filter in filters if audio_filter)
 
 
-def build_pass1_command(audio_file: Path, args: argparse.Namespace) -> list[str]:
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-stats",
-        "-loglevel",
-        "info",
-        "-i",
-        str(audio_file),
-        "-map",
-        "0:a:0",
-        "-af",
-        build_pass1_filter(args.target_lufs, args.true_peak, args.lra),
-        "-f",
-        "null",
-        "-",
-    ]
-
-
-def build_pass2_filter(
-    target_lufs: float,
-    true_peak: float,
-    lra: float,
-    stats: dict[str, object],
-) -> str:
-    measured_i = require_float(stats, "input_i")
-    measured_tp = require_float(stats, "input_tp")
-    measured_lra = require_float(stats, "input_lra")
-    measured_thresh = require_float(stats, "input_thresh")
-    target_offset = require_float(stats, "target_offset")
-
-    return (
-        f"loudnorm=I={format_float(target_lufs)}:"
-        f"TP={format_float(true_peak)}:"
-        f"LRA={format_float(lra)}:"
-        f"measured_I={format_float(measured_i)}:"
-        f"measured_TP={format_float(measured_tp)}:"
-        f"measured_LRA={format_float(measured_lra)}:"
-        f"measured_thresh={format_float(measured_thresh)}:"
-        f"offset={format_float(target_offset)}:"
-        "linear=true:"
-        "print_format=json"
-    )
-
-
-def build_pass2_command(
-    access_file: Path,
-    audio_file: Path,
-    output_file: Path,
-    args: argparse.Namespace,
-    pass1_stats: dict[str, object],
-    overwrite: bool,
-) -> list[str]:
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-stats",
-        "-loglevel",
-        "info",
-        "-i",
-        str(access_file),
-        "-i",
-        str(audio_file),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        args.audio_bitrate,
-        "-af",
-        build_pass2_filter(args.target_lufs, args.true_peak, args.lra, pass1_stats),
-        *(["-y"] if overwrite else []),
-        str(output_file),
-    ]
+def build_job_audio_filter(args: argparse.Namespace, access_file: Path) -> str | None:
+    return build_vhs_audio_filter(VhsAudioFilterConfig("vhs", args.vhs_notch), access_file)
 
 
 def build_fixed_gain_command(
@@ -243,6 +143,7 @@ def build_fixed_gain_command(
     output_file: Path,
     args: argparse.Namespace,
     overwrite: bool,
+    audio_filter: str | None = None,
 ) -> list[str]:
     return [
         "ffmpeg",
@@ -265,69 +166,10 @@ def build_fixed_gain_command(
         "-b:a",
         args.audio_bitrate,
         "-af",
-        f"volume={format_float(args.gain)}dB",
+        combine_audio_filters(audio_filter, f"volume={format_float(args.gain)}dB"),
         *(["-y"] if overwrite else []),
         str(output_file),
     ]
-
-
-def require_float(data: dict[str, object], key: str) -> float:
-    value = data.get(key)
-    if value is None:
-        raise ValueError(f"missing loudnorm value: {key}")
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid loudnorm value for {key}: {value!r}") from exc
-
-
-def extract_loudnorm_json(stdout: str, stderr: str) -> dict[str, object]:
-    payload = _find_first_json_object((stdout or "") + (stderr or ""))
-    try:
-        return json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise ValueError("failed to parse loudnorm JSON metadata") from exc
-
-
-def _find_first_json_object(text: str) -> str:
-    start = None
-    depth = 0
-    in_string = False
-    escape = False
-
-    for index, char in enumerate(text):
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if char == "\\":
-                escape = True
-                continue
-            if char == '"':
-                in_string = False
-            continue
-
-        if char == '"':
-            in_string = True
-            continue
-        if char == "{":
-            if start is None:
-                start = index
-                depth = 1
-            else:
-                depth += 1
-            continue
-        if char == "}":
-            if depth == 0:
-                continue
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start : index + 1]
-
-    if start is None:
-        raise ValueError("loudnorm output did not contain JSON")
-
-    raise ValueError("loudnorm output contained unterminated JSON")
 
 
 def execute_ffmpeg(cmd: list[str], *, stream_output: bool = False) -> subprocess.CompletedProcess[str]:
@@ -357,35 +199,16 @@ def execute_ffmpeg(cmd: list[str], *, stream_output: bool = False) -> subprocess
     return subprocess.CompletedProcess(cmd, returncode, stdout=output, stderr="")
 
 
-def run_pass1(audio_file: Path, args: argparse.Namespace) -> dict[str, object]:
-    result = execute_ffmpeg(build_pass1_command(audio_file, args), stream_output=True)
-    return extract_loudnorm_json(result.stdout, result.stderr)
-
-
-def run_pass2(
-    access_file: Path,
-    audio_file: Path,
-    output_file: Path,
-    args: argparse.Namespace,
-    pass1_stats: dict[str, object],
-    overwrite: bool,
-) -> dict[str, object]:
-    result = execute_ffmpeg(
-        build_pass2_command(access_file, audio_file, output_file, args, pass1_stats, overwrite),
-        stream_output=True,
-    )
-    return extract_loudnorm_json(result.stdout, result.stderr)
-
-
 def run_fixed_gain_remux(
     access_file: Path,
     audio_file: Path,
     output_file: Path,
     args: argparse.Namespace,
     overwrite: bool,
+    audio_filter: str | None = None,
 ) -> None:
     execute_ffmpeg(
-        build_fixed_gain_command(access_file, audio_file, output_file, args, overwrite),
+        build_fixed_gain_command(access_file, audio_file, output_file, args, overwrite, audio_filter),
         stream_output=True,
     )
 
@@ -442,9 +265,17 @@ def build_jobs(args: argparse.Namespace) -> list[NormalizationJob]:
         )
 
     jobs: list[NormalizationJob] = []
+    total = len(access_files)
     for access_file in access_files:
+        print(
+            "Checking durations "
+            + format_progress(len(jobs) + 1, total, access_file),
+            file=sys.stderr,
+            flush=True,
+        )
         audio_file = audio_file_for_access(access_file, args.audio_dir)
         output_file = args.output_dir / access_file.name
+        audio_filter = build_job_audio_filter(args, access_file)
         video_duration = probe_media_duration_seconds(access_file)
         audio_duration = probe_media_duration_seconds(audio_file)
         delta = abs(video_duration - audio_duration)
@@ -463,43 +294,118 @@ def build_jobs(args: argparse.Namespace) -> list[NormalizationJob]:
                 video_duration_seconds=video_duration,
                 audio_duration_seconds=audio_duration,
                 duration_delta_seconds=delta,
+                audio_filter=audio_filter,
             )
         )
 
     return jobs
 
 
-def metadata_row(
-    job: NormalizationJob,
-    pass1_stats: dict[str, object],
-    pass2_stats: dict[str, object],
-    target_lufs: float,
-    true_peak: float,
-    lra: float,
-    audio_bitrate: str,
-) -> dict[str, object]:
-    return {
-        "access_file": str(job.access_file.name),
-        "audio_file": str(job.audio_file.name),
-        "output_file": str(job.output_file.name),
-        "video_duration_seconds": f"{job.video_duration_seconds:.6f}",
-        "audio_duration_seconds": f"{job.audio_duration_seconds:.6f}",
-        "duration_delta_seconds": f"{job.duration_delta_seconds:.6f}",
-        "target_lufs": format_float(target_lufs),
-        "true_peak": format_float(true_peak),
-        "lra": format_float(lra),
-        "audio_bitrate": audio_bitrate,
-        "input_i": str(require_float(pass1_stats, "input_i")),
-        "input_tp": str(require_float(pass1_stats, "input_tp")),
-        "input_lra": str(require_float(pass1_stats, "input_lra")),
-        "input_thresh": str(require_float(pass1_stats, "input_thresh")),
-        "output_i": str(require_float(pass2_stats, "output_i")),
-        "output_tp": str(require_float(pass2_stats, "output_tp")),
-        "output_lra": str(require_float(pass2_stats, "output_lra")),
-        "output_thresh": str(require_float(pass2_stats, "output_thresh")),
-        "normalization_type": NORMALIZATION_TYPE,
-        "target_offset": str(require_float(pass2_stats, "target_offset")),
-    }
+def analyze_fixed_gain(args: argparse.Namespace, jobs: list[NormalizationJob]) -> list[FixedGainReview]:
+    reviews: list[FixedGainReview] = []
+    total = len(jobs)
+    for index, job in enumerate(jobs, start=1):
+        reviews.append(
+            FixedGainReview(
+                job,
+                VolumeAnalysis(
+                    job.audio_file,
+                    run_volumedetect(job.audio_file, audio_filter=job.audio_filter, verbose=args.verbose),
+                    args.gain,
+                    args.peak_ceiling,
+                ),
+            )
+        )
+        if not args.verbose:
+            print(format_progress(index, total, job.audio_file), file=sys.stderr, flush=True)
+    return reviews
+
+
+def fail_if_unsafe_fixed_gain(reviews: list[FixedGainReview]) -> None:
+    unsafe = [review for review in reviews if review.analysis.headroom < 0]
+    if unsafe:
+        raise ValueError(
+            "fixed gain would exceed peak ceiling for: "
+            + ", ".join(review.job.access_file.name for review in unsafe)
+        )
+
+
+def format_preflight_report(
+    args: argparse.Namespace,
+    jobs: list[NormalizationJob],
+    fixed_gain_reviews: list[FixedGainReview] | None = None,
+) -> str:
+    lines: list[str] = []
+    lines.append(f"Found {len(jobs)} Access MP4 file(s): {args.access_copy_dir}")
+    lines.append(f"Using audio directory: {args.audio_dir}")
+    lines.append(f"Output directory: {args.output_dir}")
+    lines.append(f"Metadata CSV: {args.output_dir / 'metadata.csv'}")
+    lines.append(f"Method: fixed-gain")
+    lines.append(f"Fixed gain: {format_float(args.gain)} dB, peak ceiling {format_float(args.peak_ceiling)} dB")
+    lines.append(f"Duration tolerance: {args.duration_tolerance:.3f}s")
+    lines.append(f"VHS notch: {args.vhs_notch}")
+
+    rows = [
+        (
+            str(index),
+            job.access_file.name,
+            job.audio_file.name,
+            job.output_file.name,
+            f"{job.video_duration_seconds:.3f}",
+            f"{job.audio_duration_seconds:.3f}",
+            f"{job.duration_delta_seconds:.3f}",
+        )
+        for index, job in enumerate(jobs, start=1)
+    ]
+    headers = ("#", "access", "audio", "output", "video_s", "audio_s", "delta_s")
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+
+    lines.append("Preflight normalization list:")
+    lines.append(format_table_row(headers, widths, right_aligned={0, 4, 5, 6}))
+    lines.append(format_table_row(tuple("-" * len(header) for header in headers), widths, right_aligned={0, 4, 5, 6}))
+    for row in rows:
+        lines.append(format_table_row(row, widths, right_aligned={0, 4, 5, 6}))
+
+    if fixed_gain_reviews is not None:
+        lines.append("")
+        lines.append(
+            f"Fixed-gain analysis: gain={format_db(args.gain)} dB "
+            f"peak ceiling={format_db(args.peak_ceiling)} dB"
+        )
+        lines.append(format_volume_analysis_table([review.analysis for review in fixed_gain_reviews]))
+    return "\n".join(lines)
+
+
+def format_table_row(row: tuple[str, ...], widths: list[int], right_aligned: set[int]) -> str:
+    cells: list[str] = []
+    for index, value in enumerate(row):
+        if index in right_aligned:
+            cells.append(f"{value:>{widths[index]}}")
+        else:
+            cells.append(f"{value:<{widths[index]}}")
+    return "  " + "  ".join(cells)
+
+
+def confirm_preflight() -> bool:
+    if hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
+        raise ValueError("interactive confirmation required; re-run from a terminal or pass --yes")
+
+    while True:
+        print("Proceed with these normalization jobs? [y/N] ", end="", flush=True)
+        answer = sys.stdin.readline()
+        if answer == "":
+            print("Aborted.")
+            return False
+        answer = answer.strip()
+        if answer in {"y", "Y"}:
+            return True
+        if answer in {"", "n", "N"}:
+            print("Aborted.")
+            return False
+        print("Please answer y or n.")
 
 
 def fixed_gain_metadata_row(review: FixedGainReview, audio_bitrate: str) -> dict[str, object]:
@@ -520,7 +426,7 @@ def fixed_gain_metadata_row(review: FixedGainReview, audio_bitrate: str) -> dict
         "headroom": str(analysis.headroom),
         "status": analysis.status,
         "audio_bitrate": audio_bitrate,
-        "normalization_type": FIXED_GAIN_NORMALIZATION_TYPE,
+        "normalization_type": NORMALIZATION_TYPE,
     }
 
 
@@ -539,85 +445,11 @@ def write_metadata_csv(
             writer.writerow(row)
 
 
-def confirm_fixed_gain() -> bool:
-    if hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
-        raise ValueError("interactive confirmation required; re-run from a terminal or pass --yes")
-
-    while True:
-        print("Apply fixed gain to these files? [y/N] ", end="", flush=True)
-        answer = sys.stdin.readline()
-        if answer == "":
-            print("Aborted.")
-            return False
-        answer = answer.strip()
-        if answer in {"y", "Y"}:
-            return True
-        if answer in {"", "n", "N"}:
-            print("Aborted.")
-            return False
-        print("Please answer y or n.")
-
-
-def run_loudnorm_mode(args: argparse.Namespace, jobs: list[NormalizationJob], metadata_path: Path) -> None:
-    rows: list[dict[str, object]] = []
-    for job in jobs:
-        pass1_stats = run_pass1(job.audio_file, args)
-        pass2_stats = run_pass2(
-            job.access_file,
-            job.audio_file,
-            job.output_file,
-            args,
-            pass1_stats,
-            overwrite=args.force,
-        )
-        rows.append(
-            metadata_row(
-                job,
-                pass1_stats,
-                pass2_stats,
-                args.target_lufs,
-                args.true_peak,
-                args.lra,
-                args.audio_bitrate,
-            )
-        )
-        print(f"Wrote {job.output_file}")
-
-    write_metadata_csv(rows, metadata_path, LOUDNORM_METADATA_FIELDS)
-    print(f"Wrote {metadata_path}")
-
-
-def run_fixed_gain_mode(args: argparse.Namespace, jobs: list[NormalizationJob], metadata_path: Path) -> None:
-    reviews: list[FixedGainReview] = []
-    total = len(jobs)
-    for index, job in enumerate(jobs, start=1):
-        reviews.append(
-            FixedGainReview(
-                job,
-                VolumeAnalysis(
-                    job.audio_file,
-                    run_volumedetect(job.audio_file, verbose=args.verbose),
-                    args.gain,
-                    args.peak_ceiling,
-                ),
-            )
-        )
-        if not args.verbose:
-            print(format_progress(index, total, job.audio_file), file=sys.stderr, flush=True)
-
-    print(f"Fixed-gain analysis: gain={format_db(args.gain)} dB peak ceiling={format_db(args.peak_ceiling)} dB")
-    print(format_volume_analysis_table([review.analysis for review in reviews]))
-
-    unsafe = [review for review in reviews if review.analysis.headroom < 0]
-    if unsafe:
-        raise ValueError(
-            "fixed gain would exceed peak ceiling for: "
-            + ", ".join(review.job.access_file.name for review in unsafe)
-        )
-
-    if not args.yes and not confirm_fixed_gain():
-        return
-
+def run_fixed_gain_mode(
+    args: argparse.Namespace,
+    reviews: list[FixedGainReview],
+    metadata_path: Path,
+) -> None:
     rows: list[dict[str, object]] = []
     for review in reviews:
         job = review.job
@@ -627,11 +459,12 @@ def run_fixed_gain_mode(args: argparse.Namespace, jobs: list[NormalizationJob], 
             job.output_file,
             args,
             overwrite=args.force,
+            audio_filter=job.audio_filter,
         )
         rows.append(fixed_gain_metadata_row(review, args.audio_bitrate))
         print(f"Wrote {job.output_file}")
 
-    write_metadata_csv(rows, metadata_path, FIXED_GAIN_METADATA_FIELDS)
+    write_metadata_csv(rows, metadata_path, METADATA_FIELDS)
     print(f"Wrote {metadata_path}")
 
 
@@ -640,12 +473,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         validate_args(args)
         jobs = build_jobs(args)
+        fixed_gain_reviews = analyze_fixed_gain(args, jobs)
+        fail_if_unsafe_fixed_gain(fixed_gain_reviews)
+        print(format_preflight_report(args, jobs, fixed_gain_reviews))
+        if not args.yes and not confirm_preflight():
+            return 0
+        args.output_dir.mkdir(parents=True, exist_ok=True)
         metadata_path = args.output_dir / "metadata.csv"
-        if args.method == "fixed-gain":
-            run_fixed_gain_mode(args, jobs, metadata_path)
-        else:
-            run_loudnorm_mode(args, jobs, metadata_path)
-    except (OSError, ValueError, subprocess.CalledProcessError, KeyError) as exc:
+        run_fixed_gain_mode(args, fixed_gain_reviews, metadata_path)
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError, KeyError) as exc:
         print(f"normalize_access_audio.py: error: {exc}")
         return 1
 

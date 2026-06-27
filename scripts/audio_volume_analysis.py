@@ -92,7 +92,11 @@ def collect_audio_files(audio_dir: Path | None, audio_files: list[Path]) -> list
     return collected
 
 
-def build_volumedetect_command(audio_file: Path) -> list[str]:
+def combine_audio_filters(*filters: str | None) -> str:
+    return ",".join(audio_filter for audio_filter in filters if audio_filter)
+
+
+def build_volumedetect_command(audio_file: Path, audio_filter: str | None = None) -> list[str]:
     return [
         "ffmpeg",
         "-hide_banner",
@@ -104,7 +108,7 @@ def build_volumedetect_command(audio_file: Path) -> list[str]:
         "-map",
         "0:a:0",
         "-af",
-        "volumedetect",
+        combine_audio_filters(audio_filter, "volumedetect"),
         "-f",
         "null",
         "-",
@@ -152,8 +156,8 @@ def execute_ffmpeg(cmd: list[str], *, verbose: bool = False) -> subprocess.Compl
     return subprocess.CompletedProcess(cmd, returncode, stdout=output, stderr="")
 
 
-def run_volumedetect(audio_file: Path, *, verbose: bool = False) -> VolumeDetectStats:
-    result = execute_ffmpeg(build_volumedetect_command(audio_file), verbose=verbose)
+def run_volumedetect(audio_file: Path, *, audio_filter: str | None = None, verbose: bool = False) -> VolumeDetectStats:
+    result = execute_ffmpeg(build_volumedetect_command(audio_file, audio_filter), verbose=verbose)
     return parse_volumedetect_stats(result.stdout, result.stderr)
 
 

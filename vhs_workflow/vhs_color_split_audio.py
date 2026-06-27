@@ -8,7 +8,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,35 +42,15 @@ class ExtractPlan:
     def channel_counts(self) -> dict[str, int]:
         return {channel: sum(1 for job in self.jobs if job.audio_channel == channel) for channel in AUDIO_CHANNELS}
 
-
-@dataclass(frozen=True)
-class NormalizeJob:
-    stem: str
-    access_file: Path
-    audio_file: Path
-    output_file: Path
-    audio_status: str
-    output_status: str
-
-
-@dataclass(frozen=True)
-class NormalizePlan:
-    transcode_list: Path
-    access_copy_dir: Path
-    audio_dir: Path
-    output_dir: Path
-    force: bool
-    jobs: list[NormalizeJob]
-    gain: float = DEFAULT_FIXED_GAIN
-    peak_ceiling: float = DEFAULT_PEAK_CEILING
+    @property
+    def skipped_output_count(self) -> int:
+        return sum(1 for job in self.jobs if job.output_status == "exists, skip")
 
     @property
-    def missing_audio_count(self) -> int:
-        return sum(1 for job in self.jobs if job.audio_status == "missing")
-
-    @property
-    def existing_output_count(self) -> int:
-        return sum(1 for job in self.jobs if job.output_status.startswith("exists,"))
+    def runnable_job_count(self) -> int:
+        if self.force:
+            return len(self.jobs)
+        return sum(1 for job in self.jobs if job.output_status != "exists, skip")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -116,6 +95,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     normalize.add_argument("--output-dir", type=Path, required=True, help="Directory for normalized MP4 output")
     normalize.add_argument("--gain", type=float, default=DEFAULT_FIXED_GAIN, help="Fixed audio gain in dB")
     normalize.add_argument("--peak-ceiling", type=float, default=DEFAULT_PEAK_CEILING, help="Maximum post-gain peak in dB")
+    normalize.add_argument(
+        "--vhs-notch",
+        choices=("auto", "ntsc", "pal", "off"),
+        default="auto",
+        help="Apply the VHS highpass and scan-frequency notch filter before fixed gain",
+    )
     normalize.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     normalize.add_argument("--repo-root", "--project-root", dest="repo_root", type=Path, default=argparse.SUPPRESS)
     normalize.add_argument("--transcode-list", type=Path, default=argparse.SUPPRESS)
@@ -182,37 +167,9 @@ def build_extract_plan(tasks: list[TranscodeTask], output_dir: Path, force: bool
         output_file = flac_output_path(task.input_file, output_dir)
         status = "will write"
         if output_file.exists():
-            status = "exists, overwrite" if force else "exists, needs --force"
+            status = "exists, overwrite" if force else "exists, skip"
         jobs.append(ExtractJob(task.input_file, task.audio_channel, output_file, status))
     return ExtractPlan(transcode_list, output_dir, force, jobs)
-
-
-def build_normalize_plan(
-    tasks: list[TranscodeTask],
-    access_copy_dir: Path,
-    audio_dir: Path,
-    output_dir: Path,
-    force: bool,
-    transcode_list: Path,
-    gain: float = DEFAULT_FIXED_GAIN,
-    peak_ceiling: float = DEFAULT_PEAK_CEILING,
-) -> NormalizePlan:
-    jobs: list[NormalizeJob] = []
-    for task in tasks:
-        stem = task.input_file.stem
-        access_file = access_copy_dir / f"{stem}.mp4"
-        audio_file = audio_dir / f"{stem}.flac"
-        output_file = output_dir / f"{stem}.mp4"
-        if not access_file.is_file():
-            raise ValueError(f"Expected Access file not found: {access_file}")
-
-        audio_status = "found" if audio_file.is_file() else "missing"
-        output_status = "will write"
-        if output_file.exists():
-            output_status = "exists, overwrite" if force else "exists, needs --force"
-
-        jobs.append(NormalizeJob(stem, access_file, audio_file, output_file, audio_status, output_status))
-    return NormalizePlan(transcode_list, access_copy_dir, audio_dir, output_dir, force, jobs, gain, peak_ceiling)
 
 
 def common_parent(paths: list[Path]) -> str:
@@ -241,6 +198,8 @@ def format_extract_plan(plan: ExtractPlan) -> str:
     lines.append(f"Left channel: {counts['left']}")
     lines.append(f"Right channel: {counts['right']}")
     lines.append(f"Planned FLAC outputs in: {plan.output_dir}")
+    lines.append(f"Extraction jobs to run: {plan.runnable_job_count}")
+    lines.append(f"Existing FLAC outputs skipped: {plan.skipped_output_count}")
 
     if total_files == 0:
         lines.append("No source files found.")
@@ -266,44 +225,6 @@ def format_extract_plan(plan: ExtractPlan) -> str:
     lines.append(f"Input parent: {input_parent}")
     lines.append("Planned extraction list:")
     lines.extend(_format_table(("#", "channel", "input", "output", "status"), rows, widths, {0}))
-    return "\n".join(lines)
-
-
-def format_normalize_plan(plan: NormalizePlan) -> str:
-    lines: list[str] = []
-    total_files = len(plan.jobs)
-    lines.append(f"Found {total_files} source file(s) in transcode list: {plan.transcode_list}")
-    lines.append(f"Using access directory: {plan.access_copy_dir}")
-    lines.append(f"Using audio directory: {plan.audio_dir}")
-    lines.append(f"Output directory: {plan.output_dir}")
-    lines.append(f"Metadata CSV: {plan.output_dir / 'metadata.csv'}")
-    lines.append(f"Normalization method: fixed-gain ({format_float(plan.gain)} dB, ceiling {format_float(plan.peak_ceiling)} dB)")
-    lines.append(f"Matching FLAC files missing: {plan.missing_audio_count}")
-    lines.append(f"Planned outputs already present: {plan.existing_output_count}")
-
-    if total_files == 0:
-        lines.append("No source files found.")
-        return "\n".join(lines)
-
-    access_parent = common_parent([job.access_file for job in plan.jobs])
-    rows = [
-        (
-            str(index),
-            f"{job.stem}.mp4",
-            relative_to_parent(access_parent, job.access_file),
-            str(job.audio_file),
-            str(job.output_file),
-            job.audio_status,
-            job.output_status,
-        )
-        for index, job in enumerate(plan.jobs, start=1)
-    ]
-    headers = ("#", "file", "access", "audio", "output", "audio", "status")
-    widths = _table_widths(headers, rows, right_aligned_columns={0})
-
-    lines.append(f"Access parent: {access_parent}")
-    lines.append("Planned normalization list:")
-    lines.extend(_format_table(headers, rows, widths, {0}))
     return "\n".join(lines)
 
 
@@ -378,6 +299,8 @@ def confirm(prompt: str, *, input_stream: object | None = None, output_stream: o
 def run_extract(plan: ExtractPlan, repo_root: Path) -> None:
     grouped: dict[str, list[Path]] = {channel: [] for channel in AUDIO_CHANNELS}
     for job in plan.jobs:
+        if job.output_file.exists() and not plan.force:
+            continue
         grouped[job.audio_channel].append(job.input_file)
 
     script = repo_root / "scripts" / "extract_master_audio.py"
@@ -402,64 +325,72 @@ def run_extract(plan: ExtractPlan, repo_root: Path) -> None:
         subprocess.run(cmd, check=True)
 
 
-def run_normalize(plan: NormalizePlan, repo_root: Path) -> None:
+def run_normalize(
+    *,
+    access_copy_dir: Path,
+    audio_dir: Path,
+    output_dir: Path,
+    force: bool,
+    gain: float,
+    peak_ceiling: float,
+    vhs_notch: str,
+    repo_root: Path,
+) -> None:
     script = repo_root / "scripts" / "normalize_access_audio.py"
-    with tempfile.TemporaryDirectory() as tmp_access:
-        tmp_access_path = Path(tmp_access)
-        for job in plan.jobs:
-            os.symlink(job.access_file.resolve(), tmp_access_path / f"{job.stem}.mp4")
-
-        cmd = [
-            "uv",
-            "--project",
-            str(repo_root),
-            "run",
-            str(script),
-            "--access-copy-dir",
-            str(tmp_access_path),
-            "--audio-dir",
-            str(plan.audio_dir),
-            "--output-dir",
-            str(plan.output_dir),
-            "--method",
-            "fixed-gain",
-            "--gain",
-            format_float(plan.gain),
-            "--peak-ceiling",
-            format_float(plan.peak_ceiling),
-        ]
-        if plan.force:
-            cmd.append("--force")
-        subprocess.run(cmd, check=True)
+    cmd = [
+        "uv",
+        "--project",
+        str(repo_root),
+        "run",
+        str(script),
+        "--access-copy-dir",
+        str(access_copy_dir),
+        "--audio-dir",
+        str(audio_dir),
+        "--output-dir",
+        str(output_dir),
+        "--gain",
+        format_float(gain),
+        "--peak-ceiling",
+        format_float(peak_ceiling),
+        "--vhs-notch",
+        vhs_notch,
+    ]
+    if force:
+        cmd.append("--force")
+    subprocess.run(cmd, check=True)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        tasks = load_tasks(args.transcode_list)
         if args.command == "extract-audio":
+            tasks = load_tasks(args.transcode_list)
             plan = build_extract_plan(tasks, args.output_dir, args.force, args.transcode_list)
             print(format_extract_plan(plan))
+            if plan.runnable_job_count == 0:
+                print("No extraction jobs to run.")
+                return 0
             if not confirm("Proceed with these extraction jobs? [y/N] "):
                 return 0
             run_extract(plan, args.repo_root)
             return 0
 
         if args.command == "normalize-audio":
-            plan = build_normalize_plan(
-                tasks,
-                args.access_copy_dir,
-                args.audio_dir,
-                args.output_dir,
-                args.force,
-                args.transcode_list,
-                args.gain,
-                args.peak_ceiling,
+            print(
+                "Handing off normalization preflight to normalize_access_audio.py "
+                f"for Access directory: {args.access_copy_dir}"
             )
-            print(format_normalize_plan(plan))
-            if not confirm("Proceed with these normalization jobs? [y/N] "):
-                return 0
-            run_normalize(plan, args.repo_root)
+            run_normalize(
+                access_copy_dir=args.access_copy_dir,
+                audio_dir=args.audio_dir,
+                output_dir=args.output_dir,
+                force=args.force,
+                gain=args.gain,
+                peak_ceiling=args.peak_ceiling,
+                vhs_notch=args.vhs_notch,
+                repo_root=args.repo_root,
+            )
             return 0
 
         raise ValueError(f"unsupported command: {args.command}")
