@@ -50,6 +50,59 @@ def make_config(**overrides) -> transcode3.Config:
     return transcode3.Config(**values)
 
 
+def make_paths(root: Path, input_file: Path | None = None) -> transcode3.Paths:
+    if input_file is None:
+        input_file = root / "input.mkv"
+    return transcode3.Paths(
+        input_file=input_file,
+        stem=input_file.stem,
+        out_dir=root / "Access",
+        log_dir=root / "Logs",
+        output_file=root / "Access" / f"{input_file.stem}.mp4",
+        ffmpeg_log_file=root / "Logs" / f"{input_file.stem}_access.log",
+        command_log_file=root / "Logs" / f"{input_file.stem}_cmd.log",
+        csv_raw=root / "Logs" / f"{input_file.stem}.frameinfo.csv",
+        csv_with_play=root / "Logs" / f"{input_file.stem}.frameinfo.with_play_time.csv",
+        srt_file=root / "Logs" / f"{input_file.stem}.record_time_overlay.srt",
+        add_play_time_script=root / "add_play_time_columns.py",
+        create_srt_script=root / "create_srt.py",
+    )
+
+
+def make_source_analysis(
+    input_file: Path,
+    *,
+    mean_volume: float = -30.0,
+    max_volume: float = -14.0,
+    audio_filter: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> transcode3.audio_volume_analysis.SourceVolumeAnalysis:
+    fingerprint = transcode3.audio_volume_analysis.input_fingerprint(input_file)
+    return transcode3.audio_volume_analysis.SourceVolumeAnalysis(
+        input_file=Path(str(fingerprint["path"])),
+        stats=transcode3.audio_volume_analysis.VolumeDetectStats(
+            mean_volume=mean_volume,
+            max_volume=max_volume,
+        ),
+        audio_stream=transcode3.audio_volume_analysis.DEFAULT_AUDIO_STREAM,
+        audio_filter=audio_filter,
+        start=start,
+        end=end,
+        command=tuple(
+            transcode3.audio_volume_analysis.build_volumedetect_command(
+                input_file,
+                audio_filter,
+                start=start,
+                end=end,
+            )
+        ),
+        input_size=int(fingerprint["size"]),
+        input_mtime_ns=int(fingerprint["mtime_ns"]),
+        created_at="2026-06-26T00:00:00Z",
+    )
+
+
 class TestParseArgs(unittest.TestCase):
     def test_parse_args_supports_validate_duration_mode_and_defaults(self) -> None:
         argv = [
@@ -93,6 +146,28 @@ class TestParseArgs(unittest.TestCase):
             cfg, _ = transcode3.parse_args()
 
         self.assertTrue(cfg.no_logs)
+
+    def test_parse_args_supports_audio_gain_analysis_options(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "vhs",
+            "--audio-gain",
+            "12",
+            "--audio-peak-ceiling",
+            "-1.5",
+            "--refresh-audio-analysis",
+            "--audio-analysis",
+            "/tmp/audio-json",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.audio_gain, 12.0)
+        self.assertEqual(cfg.audio_peak_ceiling, -1.5)
+        self.assertTrue(cfg.refresh_audio_analysis)
+        self.assertEqual(cfg.audio_analysis, Path("/tmp/audio-json"))
 
     def test_parse_args_supports_vhs_defaults(self) -> None:
         argv = [
@@ -1062,6 +1137,163 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("hqdn3d", vf)
         self.assertNotIn("subtitles=", vf)
         self.assertNotIn("yuv420p10le", vf)
+
+
+class TestAudioGainAnalysis(unittest.TestCase):
+    def test_audio_gain_reuses_cached_measured_facts_for_different_gain_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "input.mkv"
+            input_file.write_bytes(b"media")
+            paths = make_paths(root, input_file)
+            analysis_path = transcode3.default_audio_analysis_path(paths)
+            transcode3.audio_volume_analysis.write_source_volume_analysis(
+                make_source_analysis(input_file, max_volume=-14.0),
+                analysis_path,
+            )
+            cfg = make_config(format_type="vhs", vhs_notch="off", audio_gain=12.0)
+
+            with patch.object(transcode3.audio_volume_analysis, "analyze_source_volume") as analyze_mock:
+                analysis = transcode3.run_or_reuse_audio_analysis(cfg, paths, None)
+
+            analyze_mock.assert_not_called()
+            self.assertEqual(analysis.stats.max_volume, -14.0)
+            transcode3.verify_audio_gain_safety(analysis, gain=12.0, peak_ceiling=-1.5)
+            transcode3.verify_audio_gain_safety(analysis, gain=10.0, peak_ceiling=-1.5)
+
+    def test_unsafe_audio_gain_fails_before_video_transcode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "input.mkv"
+            input_file.write_bytes(b"media")
+            paths = make_paths(root, input_file)
+            cfg = make_config(
+                format_type="vhs",
+                vhs_notch="off",
+                audio_gain=50.0,
+                audio_peak_ceiling=-1.5,
+            )
+
+            with (
+                patch.object(transcode3, "build_paths", return_value=paths),
+                patch.object(
+                    transcode3.audio_volume_analysis,
+                    "analyze_source_volume",
+                    return_value=make_source_analysis(input_file, max_volume=-10.0),
+                ),
+                patch.object(transcode3, "run_ffmpeg") as run_mock,
+                self.assertRaisesRegex(ValueError, "audio gain would exceed peak ceiling"),
+            ):
+                transcode3.process_one_file(cfg, input_file, prompt=False)
+
+            run_mock.assert_not_called()
+
+    def test_right_channel_analysis_and_transcode_filters_put_pan_before_gain(self) -> None:
+        paths = make_paths(Path("/tmp"), Path("/tmp/08.mkv"))
+        cfg = make_config(format_type="vhs", vhs_notch="off", audio_channel="right", audio_gain=12.0)
+
+        pre_gain_filter = transcode3.build_pre_gain_audio_filter(cfg, paths.input_file)
+        final_filter = transcode3.build_audio_filter_from_pre_gain(pre_gain_filter, cfg.audio_gain)
+        analysis_cmd = transcode3.audio_volume_analysis.build_volumedetect_command(
+            paths.input_file,
+            pre_gain_filter,
+        )
+
+        self.assertEqual(pre_gain_filter, "pan=stereo|c0=c1|c1=c1")
+        self.assertEqual(final_filter, "pan=stereo|c0=c1|c1=c1,volume=12dB")
+        self.assertEqual(analysis_cmd[analysis_cmd.index("-af") + 1], "pan=stereo|c0=c1|c1=c1,volumedetect")
+
+    def test_analyze_audio_mode_writes_json_and_does_not_run_video_transcode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "masters" / "tape" / "08.mkv"
+            input_file.parent.mkdir(parents=True)
+            input_file.write_bytes(b"media")
+            cfg = make_config(
+                mode="analyze-audio",
+                format_type="vhs",
+                vhs_notch="off",
+                layout="access",
+                source_root=root / "masters",
+            )
+            output_json = root / "masters" / "Logs" / "tape" / "08.audio_analysis.json"
+
+            with (
+                patch.object(
+                    transcode3.audio_volume_analysis,
+                    "analyze_source_volume",
+                    return_value=make_source_analysis(input_file),
+                ),
+                patch.object(transcode3, "run_ffmpeg") as run_mock,
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = transcode3.run_transcode_workflow(cfg, [input_file])
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(output_json.is_file())
+            self.assertFalse((root / "masters" / "Access").exists())
+            run_mock.assert_not_called()
+
+    def test_audio_analysis_directory_lookup_validates_embedded_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "input.mkv"
+            input_file.write_bytes(b"media")
+            paths = make_paths(root, input_file)
+            analysis_dir = root / "analysis-cache"
+            analysis_path = analysis_dir / "input.audio_analysis.json"
+            transcode3.audio_volume_analysis.write_source_volume_analysis(
+                make_source_analysis(input_file, audio_filter="pan=stereo|c0=c1|c1=c1"),
+                analysis_path,
+            )
+            cfg = make_config(
+                format_type="vhs",
+                vhs_notch="off",
+                audio_channel="right",
+                audio_analysis=analysis_dir,
+                audio_gain=12.0,
+            )
+
+            with patch.object(transcode3.audio_volume_analysis, "analyze_source_volume") as analyze_mock:
+                analysis = transcode3.run_or_reuse_audio_analysis(
+                    cfg,
+                    paths,
+                    "pan=stereo|c0=c1|c1=c1",
+                )
+
+            analyze_mock.assert_not_called()
+            self.assertEqual(analysis.analysis_file, analysis_path)
+
+    def test_no_audio_analysis_appends_gain_and_logs_unverified_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "input.mkv"
+            input_file.write_bytes(b"media")
+            paths = make_paths(root, input_file)
+            paths.log_dir.mkdir()
+            cfg = make_config(
+                format_type="vhs",
+                vhs_notch="off",
+                audio_gain=12.0,
+                no_audio_analysis=True,
+            )
+
+            self.assertEqual(transcode3.build_audio_filter(cfg, paths.input_file), "volume=12dB")
+            transcode3.write_command_log(
+                cfg,
+                paths,
+                ["ffmpeg", "-af", "volume=12dB"],
+                audio_gain_verification=transcode3.AudioGainVerification(
+                    analysis=None,
+                    gain=12.0,
+                    peak_ceiling=-1.5,
+                    verified=False,
+                ),
+            )
+
+            log_text = paths.command_log_file.read_text(encoding="utf-8")
+            self.assertIn("Audio gain: +12.00 dB", log_text)
+            self.assertIn("Audio gain verification: unverified", log_text)
 
 
 class TestTranscodeAccess(unittest.TestCase):

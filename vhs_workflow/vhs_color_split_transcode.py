@@ -14,8 +14,11 @@ from pathlib import Path
 DEFAULT_DATA_ROOT = Path("/Users/btu/scratch/Videos")
 DEFAULT_MASTER_ROOT = Path("/Volumes/TU/tu.brian.2026.05.09/data/masters/tape")
 DEFAULT_TASK_FILE_NAME = "transcode_vhs_color_split.tasks"
+DEFAULT_AUDIO_GAIN = 12
+DEFAULT_AUDIO_PEAK_CEILING = -1.5
 
 COLOR_CORRECT_FILES = (
+    "04_1st_Birthday_Christmas_1993.mkv",
     "05_Brian_Tu.mkv",
     "06_Brian_15MO-1M.mkv",
     "07_Brian_19mo_-_24_Month.mkv",
@@ -40,9 +43,9 @@ NO_COLOR_CORRECT_FILES = (
     "24_Butterfield_Gallerie_of_Dance_5-6_Year_Olds_2000-2001.mkv",
     "25_Swim_Trial.mkv",
     "26_Zoe_Play_Narrator.mkv",
-    "01_Y2K_1.mkv",
-    "02_Y2K_2.mkv",
-    "03_Y2K_3.mkv",
+    #"01_Y2K_1.mkv",
+    #"02_Y2K_2.mkv",
+    #"03_Y2K_3.mkv",
 )
 
 
@@ -136,6 +139,10 @@ def build_transcode_command(task: TranscodeTask, config: WorkflowConfig) -> list
         str(config.data_root / "Logs_crf22"),
         "--crf",
         "22",
+        "--audio-gain",
+        str(DEFAULT_AUDIO_GAIN),
+        "--audio-peak-ceiling",
+        str(DEFAULT_AUDIO_PEAK_CEILING),
         "--yes",
     ]
     if task.color_correct:

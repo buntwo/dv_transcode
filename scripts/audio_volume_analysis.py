@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 
 from utils import format_progress
@@ -17,12 +20,29 @@ from utils import format_progress
 AUDIO_EXTENSION = ".flac"
 DEFAULT_GAIN = 12.0
 DEFAULT_PEAK_CEILING = -1.5
+DEFAULT_AUDIO_STREAM = "0:a:0"
+ANALYSIS_SCHEMA = "audio-volume-analysis-v1"
 
 
 @dataclass(frozen=True)
 class VolumeDetectStats:
     mean_volume: float
     max_volume: float
+
+
+@dataclass(frozen=True)
+class SourceVolumeAnalysis:
+    input_file: Path
+    stats: VolumeDetectStats
+    audio_stream: str
+    audio_filter: str | None
+    start: str | None
+    end: str | None
+    command: tuple[str, ...]
+    input_size: int
+    input_mtime_ns: int
+    analysis_file: Path | None = None
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +74,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--audio-dir", type=Path, help="Directory containing FLAC files to analyze")
     parser.add_argument("--gain", type=float, default=DEFAULT_GAIN, help="Fixed gain in dB")
     parser.add_argument("--peak-ceiling", type=float, default=DEFAULT_PEAK_CEILING, help="Maximum post-gain peak in dB")
+    parser.add_argument("--audio-stream", default=DEFAULT_AUDIO_STREAM, help="ffmpeg audio stream selector to analyze")
+    parser.add_argument("--audio-filter", "--af", dest="audio_filter", help="Pre-gain audio filter chain")
+    parser.add_argument("--start", help="Optional start timestamp for analysis")
+    parser.add_argument("--end", help="Optional end timestamp for analysis")
+    parser.add_argument("--json-output", type=Path, help="Write analysis JSON to this file or directory")
     parser.add_argument("--verbose", action="store_true", help="Show ffmpeg volumedetect output")
     return parser.parse_args(argv)
 
@@ -96,17 +121,30 @@ def combine_audio_filters(*filters: str | None) -> str:
     return ",".join(audio_filter for audio_filter in filters if audio_filter)
 
 
-def build_volumedetect_command(audio_file: Path, audio_filter: str | None = None) -> list[str]:
-    return [
+def build_volumedetect_command(
+    audio_file: Path,
+    audio_filter: str | None = None,
+    *,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[str]:
+    command = [
         "ffmpeg",
         "-hide_banner",
         "-stats",
         "-loglevel",
         "info",
+    ]
+    if start:
+        command += ["-ss", start]
+    if end:
+        command += ["-to", end]
+    return command + [
         "-i",
         str(audio_file),
         "-map",
-        "0:a:0",
+        audio_stream,
         "-af",
         combine_audio_filters(audio_filter, "volumedetect"),
         "-f",
@@ -156,9 +194,212 @@ def execute_ffmpeg(cmd: list[str], *, verbose: bool = False) -> subprocess.Compl
     return subprocess.CompletedProcess(cmd, returncode, stdout=output, stderr="")
 
 
-def run_volumedetect(audio_file: Path, *, audio_filter: str | None = None, verbose: bool = False) -> VolumeDetectStats:
-    result = execute_ffmpeg(build_volumedetect_command(audio_file, audio_filter), verbose=verbose)
+def run_volumedetect(
+    audio_file: Path,
+    *,
+    audio_filter: str | None = None,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+    verbose: bool = False,
+) -> VolumeDetectStats:
+    result = execute_ffmpeg(
+        build_volumedetect_command(
+            audio_file,
+            audio_filter,
+            audio_stream=audio_stream,
+            start=start,
+            end=end,
+        ),
+        verbose=verbose,
+    )
     return parse_volumedetect_stats(result.stdout, result.stderr)
+
+
+def input_fingerprint(input_file: Path) -> dict[str, int | str]:
+    resolved = input_file.resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def current_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def analyze_source_volume(
+    input_file: Path,
+    *,
+    audio_filter: str | None = None,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+    verbose: bool = False,
+) -> SourceVolumeAnalysis:
+    command = build_volumedetect_command(
+        input_file,
+        audio_filter,
+        audio_stream=audio_stream,
+        start=start,
+        end=end,
+    )
+    result = execute_ffmpeg(command, verbose=verbose)
+    fingerprint = input_fingerprint(input_file)
+    return SourceVolumeAnalysis(
+        input_file=Path(str(fingerprint["path"])),
+        stats=parse_volumedetect_stats(result.stdout, result.stderr),
+        audio_stream=audio_stream,
+        audio_filter=audio_filter,
+        start=start,
+        end=end,
+        command=tuple(command),
+        input_size=int(fingerprint["size"]),
+        input_mtime_ns=int(fingerprint["mtime_ns"]),
+        created_at=current_timestamp(),
+    )
+
+
+def source_volume_analysis_to_dict(analysis: SourceVolumeAnalysis) -> dict[str, object]:
+    return {
+        "schema": ANALYSIS_SCHEMA,
+        "created_at": analysis.created_at,
+        "input": {
+            "path": str(analysis.input_file),
+            "size": analysis.input_size,
+            "mtime_ns": analysis.input_mtime_ns,
+        },
+        "audio_stream": analysis.audio_stream,
+        "start": analysis.start,
+        "end": analysis.end,
+        "pre_gain_audio_filter": analysis.audio_filter,
+        "volumedetect_audio_filter": combine_audio_filters(analysis.audio_filter, "volumedetect"),
+        "command": list(analysis.command),
+        "mean_volume_db": analysis.stats.mean_volume,
+        "max_volume_db": analysis.stats.max_volume,
+    }
+
+
+def source_volume_analysis_from_dict(
+    payload: dict[str, object],
+    *,
+    analysis_file: Path | None = None,
+) -> SourceVolumeAnalysis:
+    if payload.get("schema") != ANALYSIS_SCHEMA:
+        raise ValueError("audio analysis JSON has an unsupported schema")
+    input_payload = payload.get("input")
+    if not isinstance(input_payload, dict):
+        raise ValueError("audio analysis JSON missing input fingerprint")
+
+    try:
+        input_path = Path(str(input_payload["path"]))
+        input_size = int(input_payload["size"])
+        input_mtime_ns = int(input_payload["mtime_ns"])
+        mean_volume = float(payload["mean_volume_db"])
+        max_volume = float(payload["max_volume_db"])
+        audio_stream = str(payload["audio_stream"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("audio analysis JSON missing required fields") from exc
+
+    command_payload = payload.get("command") or []
+    if not isinstance(command_payload, list):
+        raise ValueError("audio analysis JSON command must be a list")
+    command = tuple(str(part) for part in command_payload)
+
+    audio_filter = payload.get("pre_gain_audio_filter")
+    start = payload.get("start")
+    end = payload.get("end")
+    created_at = payload.get("created_at")
+    return SourceVolumeAnalysis(
+        input_file=input_path,
+        stats=VolumeDetectStats(mean_volume=mean_volume, max_volume=max_volume),
+        audio_stream=audio_stream,
+        audio_filter=str(audio_filter) if audio_filter is not None else None,
+        start=str(start) if start is not None else None,
+        end=str(end) if end is not None else None,
+        command=command,
+        input_size=input_size,
+        input_mtime_ns=input_mtime_ns,
+        analysis_file=analysis_file,
+        created_at=str(created_at) if created_at is not None else None,
+    )
+
+
+def write_source_volume_analysis(analysis: SourceVolumeAnalysis, output_path: Path) -> SourceVolumeAnalysis:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(source_volume_analysis_to_dict(analysis), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return SourceVolumeAnalysis(
+        input_file=analysis.input_file,
+        stats=analysis.stats,
+        audio_stream=analysis.audio_stream,
+        audio_filter=analysis.audio_filter,
+        start=analysis.start,
+        end=analysis.end,
+        command=analysis.command,
+        input_size=analysis.input_size,
+        input_mtime_ns=analysis.input_mtime_ns,
+        analysis_file=output_path,
+        created_at=analysis.created_at,
+    )
+
+
+def read_source_volume_analysis(path: Path) -> SourceVolumeAnalysis:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("audio analysis JSON root must be an object")
+    return source_volume_analysis_from_dict(payload, analysis_file=path)
+
+
+def source_volume_analysis_matches(
+    analysis: SourceVolumeAnalysis,
+    input_file: Path,
+    *,
+    audio_filter: str | None = None,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+) -> bool:
+    fingerprint = input_fingerprint(input_file)
+    return (
+        str(analysis.input_file) == str(fingerprint["path"])
+        and analysis.input_size == int(fingerprint["size"])
+        and analysis.audio_stream == audio_stream
+        and analysis.audio_filter == audio_filter
+        and analysis.start == start
+        and analysis.end == end
+    )
+
+
+def load_valid_source_volume_analysis(
+    path: Path,
+    input_file: Path,
+    *,
+    audio_filter: str | None = None,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+) -> SourceVolumeAnalysis | None:
+    if not path.is_file():
+        return None
+    try:
+        analysis = read_source_volume_analysis(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not source_volume_analysis_matches(
+        analysis,
+        input_file,
+        audio_filter=audio_filter,
+        audio_stream=audio_stream,
+        start=start,
+        end=end,
+    ):
+        return None
+    return analysis
 
 
 def analyze_audio_files(
@@ -166,6 +407,11 @@ def analyze_audio_files(
     gain: float,
     peak_ceiling: float,
     *,
+    audio_filter: str | None = None,
+    audio_stream: str = DEFAULT_AUDIO_STREAM,
+    start: str | None = None,
+    end: str | None = None,
+    json_output: Path | None = None,
     verbose: bool = False,
     show_progress: bool = False,
     progress_stream: object | None = None,
@@ -176,10 +422,58 @@ def analyze_audio_files(
     analyses: list[VolumeAnalysis] = []
     total = len(audio_files)
     for index, audio_file in enumerate(audio_files, start=1):
-        analyses.append(VolumeAnalysis(audio_file, run_volumedetect(audio_file, verbose=verbose), gain, peak_ceiling))
+        detect_kwargs: dict[str, object] = {"verbose": verbose}
+        if audio_filter is not None:
+            detect_kwargs["audio_filter"] = audio_filter
+        if audio_stream != DEFAULT_AUDIO_STREAM:
+            detect_kwargs["audio_stream"] = audio_stream
+        if start is not None:
+            detect_kwargs["start"] = start
+        if end is not None:
+            detect_kwargs["end"] = end
+        stats = run_volumedetect(audio_file, **detect_kwargs)
+        analyses.append(VolumeAnalysis(audio_file, stats, gain, peak_ceiling))
+        if json_output is not None:
+            output_path = resolve_json_output_path(json_output, audio_file, len(audio_files))
+            fingerprint = input_fingerprint(audio_file)
+            write_source_volume_analysis(
+                SourceVolumeAnalysis(
+                    input_file=Path(str(fingerprint["path"])),
+                    stats=stats,
+                    audio_stream=audio_stream,
+                    audio_filter=audio_filter,
+                    start=start,
+                    end=end,
+                    command=tuple(
+                        build_volumedetect_command(
+                            audio_file,
+                            audio_filter,
+                            audio_stream=audio_stream,
+                            start=start,
+                            end=end,
+                        )
+                    ),
+                    input_size=int(fingerprint["size"]),
+                    input_mtime_ns=int(fingerprint["mtime_ns"]),
+                    created_at=current_timestamp(),
+                ),
+                output_path,
+            )
         if show_progress and not verbose:
             print(format_progress(index, total, audio_file), file=progress_stream, flush=True)
     return analyses
+
+
+def default_json_name(input_file: Path) -> str:
+    return f"{input_file.stem}.audio_analysis.json"
+
+
+def resolve_json_output_path(json_output: Path, input_file: Path, input_count: int) -> Path:
+    if input_count > 1 and json_output.suffix == ".json" and not json_output.is_dir():
+        raise ValueError("--json-output must be a directory when analyzing multiple inputs")
+    if input_count == 1 and json_output.suffix == ".json" and not json_output.is_dir():
+        return json_output
+    return json_output / default_json_name(input_file)
 
 
 def format_volume_analysis_table(analyses: list[VolumeAnalysis]) -> str:
@@ -224,6 +518,11 @@ def main(argv: list[str] | None = None) -> int:
             audio_files,
             args.gain,
             args.peak_ceiling,
+            audio_filter=args.audio_filter,
+            audio_stream=args.audio_stream,
+            start=args.start,
+            end=args.end,
+            json_output=args.json_output,
             verbose=args.verbose,
             show_progress=not args.verbose,
         )

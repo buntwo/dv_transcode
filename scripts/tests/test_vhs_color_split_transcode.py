@@ -51,37 +51,55 @@ def python_print_tasks(env_overrides: dict[str, str] | None = None) -> str:
 
 
 class TestVhsColorSplitTranscodeTaskOutput(unittest.TestCase):
-    def test_default_print_tasks_matches_legacy_byte_for_byte(self) -> None:
-        self.assertEqual(python_print_tasks(), legacy_print_tasks())
+    def test_default_print_tasks_include_fixed_gain_analysis_flags(self) -> None:
+        lines = python_print_tasks().splitlines()
 
-    def test_simple_env_overrides_match_legacy_byte_for_byte(self) -> None:
+        self.assertEqual(
+            len(lines),
+            len(vhs_color_split_transcode.COLOR_CORRECT_FILES)
+            + len(vhs_color_split_transcode.NO_COLOR_CORRECT_FILES),
+        )
+        self.assertTrue(all("--audio-gain 12 --audio-peak-ceiling -1.5" in line for line in lines))
+
+    def test_simple_env_overrides_are_used_in_task_lines(self) -> None:
         env = {
             "VHS_DATA_ROOT": "/tmp/VideosRoot",
             "VHS_MASTER_ROOT": "/tmp/MastersRoot/tape",
         }
 
-        self.assertEqual(python_print_tasks(env), legacy_print_tasks(env))
+        output = python_print_tasks(env)
 
-    def test_env_overrides_with_spaces_are_argv_equivalent(self) -> None:
+        self.assertIn("--output-dir /tmp/VideosRoot/Access_crf22", output)
+        self.assertIn("--log-dir /tmp/VideosRoot/Logs_crf22", output)
+        self.assertIn("/tmp/MastersRoot/tape/08.mkv", output)
+
+    def test_env_overrides_with_spaces_are_shell_argv_safe(self) -> None:
         env = {
             "VHS_DATA_ROOT": str(TEST_TMP_ROOT / "Videos Root"),
             "VHS_MASTER_ROOT": str(TEST_TMP_ROOT / "Masters Root" / "tape"),
         }
 
         python_lines = python_print_tasks(env).splitlines()
-        legacy_lines = legacy_print_tasks(env).splitlines()
 
-        self.assertEqual(len(python_lines), len(legacy_lines))
-        self.assertEqual([shlex.split(line) for line in python_lines], [shlex.split(line) for line in legacy_lines])
+        self.assertEqual(
+            len(python_lines),
+            len(vhs_color_split_transcode.COLOR_CORRECT_FILES)
+            + len(vhs_color_split_transcode.NO_COLOR_CORRECT_FILES),
+        )
+        first_argv = shlex.split(python_lines[0])
+        self.assertIn(str(TEST_TMP_ROOT / "Videos Root" / "Access_crf22"), first_argv)
+        self.assertIn(str(TEST_TMP_ROOT / "Videos Root" / "Logs_crf22"), first_argv)
 
     def test_audio_channel_and_color_correction_grouping(self) -> None:
         lines = python_print_tasks().splitlines()
+        color_count = len(vhs_color_split_transcode.COLOR_CORRECT_FILES)
 
-        self.assertEqual(len(lines), 24)
-        self.assertTrue(all("--vhs-color-correct" in line for line in lines[:12]))
-        self.assertTrue(all("--vhs-color-correct" not in line for line in lines[12:]))
-        self.assertIn("--audio-channel right", lines[12])
-        self.assertTrue(lines[12].endswith("/08.mkv"))
+        self.assertEqual(len(lines), color_count + len(vhs_color_split_transcode.NO_COLOR_CORRECT_FILES))
+        self.assertTrue(all("--vhs-color-correct" in line for line in lines[:color_count]))
+        self.assertTrue(all("--vhs-color-correct" not in line for line in lines[color_count:]))
+        first_no_color_line = lines[color_count]
+        self.assertIn("--audio-channel right", first_no_color_line)
+        self.assertTrue(first_no_color_line.endswith("/08.mkv"))
 
 
 class TestVhsColorSplitTranscodeModes(unittest.TestCase):
@@ -109,12 +127,27 @@ class TestVhsColorSplitTranscodeModes(unittest.TestCase):
             code = vhs_color_split_transcode.main(["run"], repo_root=REPO_ROOT)
 
         self.assertEqual(code, 0)
-        self.assertEqual(run_mock.call_count, 24)
+        self.assertEqual(
+            run_mock.call_count,
+            len(vhs_color_split_transcode.COLOR_CORRECT_FILES)
+            + len(vhs_color_split_transcode.NO_COLOR_CORRECT_FILES),
+        )
         first_command = run_mock.call_args_list[0].args[0]
-        self.assertEqual(first_command[-1], str(vhs_color_split_transcode.DEFAULT_MASTER_ROOT / "05_Brian_Tu.mkv"))
+        self.assertEqual(
+            first_command[-1],
+            str(
+                vhs_color_split_transcode.DEFAULT_MASTER_ROOT
+                / vhs_color_split_transcode.COLOR_CORRECT_FILES[0]
+            ),
+        )
         self.assertIn("--vhs-color-correct", first_command)
-        thirteenth_command = run_mock.call_args_list[12].args[0]
-        self.assertEqual(thirteenth_command[-3:], ["--audio-channel", "right", str(vhs_color_split_transcode.DEFAULT_MASTER_ROOT / "08.mkv")])
+        self.assertIn("--audio-gain", first_command)
+        self.assertIn("12", first_command)
+        first_no_color = run_mock.call_args_list[len(vhs_color_split_transcode.COLOR_CORRECT_FILES)].args[0]
+        self.assertEqual(
+            first_no_color[-3:],
+            ["--audio-channel", "right", str(vhs_color_split_transcode.DEFAULT_MASTER_ROOT / "08.mkv")],
+        )
 
     def test_parallel_writes_tasks_and_invokes_runner_when_exec_disabled(self) -> None:
         with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as root:

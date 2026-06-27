@@ -1,9 +1,10 @@
 # 8mm Video Transcoding
 
-This repository is an operator-maintained workflow for DV captures from analog and digital 8mm-family tapes. It is built around two media types:
+This repository is an operator-maintained workflow for DV captures from analog and digital 8mm-family tapes, plus VHS access-copy work. It is built around three media types:
 
 - `video8`
 - `digital8`
+- `vhs`
 
 The repository assumes a sibling-directory output model:
 
@@ -53,7 +54,7 @@ What is optional vs enforced:
 - `--mode preview` never writes final access outputs and never runs duration validation.
 
 **VHS Color Split Workflow**
-For the VHS master-audio workflow, run these commands from `/Users/btu/scratch/Videos`.
+For the VHS color-split access workflow, run these commands from `/Users/btu/scratch/Videos`.
 The VHS shell entrypoints and rename map live in this repository under `scripts/vhs_workflow/`; the shared Python tools remain under `scripts/scripts/`. Media outputs still live under `/Users/btu/scratch/Videos` by default. Master video files are expected under `/Volumes/TU/tu.brian.2026.05.09/data/masters/tape` by default. Generated task files such as `transcode_vhs_color_split.tasks` are not checked in.
 
 Path overrides:
@@ -75,13 +76,55 @@ scripts/vhs_workflow/transcode_vhs_color_split.sh
 scripts/vhs_workflow/transcode_vhs_color_split.sh
 ```
 
+The default VHS color-split transcode now performs fixed-gain audio in the same ffmpeg pass as the video transcode. Generated tasks pass `--audio-gain 12 --audio-peak-ceiling -1.5`, so each input is analyzed with `volumedetect` before the video transcode starts. Analysis runs against the source media audio after the same pre-gain cleanup/channel filter chain that the final transcode will use, then the final command appends `volume=12dB`.
+
+Audio-analysis JSON is written in the transcode log directory as `<stem>.audio_analysis.json`, for example `Logs_crf22/08.audio_analysis.json`. The JSON stores measured facts and cache identity, not the requested gain, so changing gain values can reuse valid analysis. Cache validity requires matching input path, file size, audio stream, start/end range, and pre-gain audio filter chain.
+
+If the estimated post-gain peak would exceed the ceiling, the job fails before running the video transcode. `08.mkv` still uses the right-channel pan before analysis and before final gain.
+
 To run through the parallel runner instead:
 
 ```bash
 scripts/vhs_workflow/transcode_vhs_color_split.sh --parallel
 ```
 
-2. Extract master FLAC audio from the same file list.
+Useful audio-analysis controls:
+
+- `--mode analyze-audio`: write/reuse audio-analysis JSON and exit without creating video outputs
+- `--refresh-audio-analysis`: ignore valid cache and rerun `volumedetect`
+- `--audio-analysis PATH_OR_DIR`: read/write analysis JSON at an explicit file or directory
+- `--no-audio-analysis`: apply `--audio-gain` without verification; command logs mark this as unverified
+
+2. Rename the Access files from the name map.
+
+The rename tool is `scripts/scripts/rename_access_from_map.py`. It is dry-run by default; add `--apply` only after the plan looks right.
+
+```bash
+uv --project scripts run scripts/scripts/rename_access_from_map.py \
+  --file-dir Access_crf22 \
+  --map-file scripts/vhs_workflow/access_name_map.csv
+
+uv --project scripts run scripts/scripts/rename_access_from_map.py \
+  --file-dir Access_crf22 \
+  --map-file scripts/vhs_workflow/access_name_map.csv \
+  --apply
+```
+
+3. Create contact sheets and spectrograms for review.
+
+```bash
+uv --project scripts run scripts/scripts/contact_sheet.py \
+  --output-dir Access_crf22/contact_sheets \
+  Access_crf22/*.mp4
+
+uv --project scripts run scripts/scripts/spectrogram.py \
+  --output-dir Access_crf22/spectrograms \
+  Access_crf22/*.mp4
+```
+
+Legacy/manual audio replacement path:
+
+The FLAC extraction and normalizer wrappers are still available when you explicitly need the old two-step audio replacement flow. They are no longer required for the default VHS color-split access transcode.
 
 ```bash
 scripts/vhs_workflow/transcode_vhs_color_split_extract_audio.sh \
@@ -89,8 +132,6 @@ scripts/vhs_workflow/transcode_vhs_color_split_extract_audio.sh \
 ```
 
 This wrapper uses the same task list as `transcode_vhs_color_split.sh`, including the per-file audio-channel setting for `08.mkv`. It prints the full extraction plan, file counts, channel counts, and output paths before asking for confirmation.
-
-3. Replace Access audio with normalized master audio.
 
 ```bash
 scripts/vhs_workflow/transcode_vhs_color_split_normalize_audio.sh \
@@ -100,33 +141,6 @@ scripts/vhs_workflow/transcode_vhs_color_split_normalize_audio.sh \
 ```
 
 This wrapper prints the full normalization plan before asking for confirmation. The underlying normalizer requires exact stem matching: `Access_crf22/Foo.mp4` pairs with `Access_crf22_audio/Foo.flac`. It writes normalized MP4s plus `metadata.csv` in the output directory.
-
-4. Rename the normalized Access files from the name map.
-
-The rename tool is `scripts/scripts/rename_access_from_map.py`. It is dry-run by default; add `--apply` only after the plan looks right.
-
-```bash
-uv --project scripts run scripts/scripts/rename_access_from_map.py \
-  --file-dir Access_crf22_normalized \
-  --map-file scripts/vhs_workflow/access_name_map.csv
-
-uv --project scripts run scripts/scripts/rename_access_from_map.py \
-  --file-dir Access_crf22_normalized \
-  --map-file scripts/vhs_workflow/access_name_map.csv \
-  --apply
-```
-
-5. Create contact sheets and spectrograms for review.
-
-```bash
-uv --project scripts run scripts/scripts/contact_sheet.py \
-  --output-dir Access_crf22_normalized/contact_sheets \
-  Access_crf22_normalized/*.mp4
-
-uv --project scripts run scripts/scripts/spectrogram.py \
-  --output-dir Access_crf22_normalized/spectrograms \
-  Access_crf22_normalized/*.mp4
-```
 
 **Video8 vs Digital8**
 `video8` flow:
@@ -162,6 +176,7 @@ Digital8 validation behavior:
   - `transcode`: generate MP4 outputs, logs, and optionally run duration validation after the batch
   - `preview`: pipe ffmpeg output to `ffplay` instead of writing the final MP4
   - `validate-duration`: skip transcoding and only audit durations
+  - `analyze-audio`: write/reuse audio-analysis JSON and skip video output
 - Important defaults:
   - `--codec hevc`
   - `--denoise light`
@@ -175,10 +190,18 @@ Digital8 validation behavior:
 - Audio mapping:
   - default is `-map 0:a:0?`
   - `--map-both-audio` adds `0:a:1?`
+- Fixed-gain audio:
+  - `--audio-gain DB` appends `volume=<DB>dB` to the audio filter chain
+  - by default, fixed gain is verified with source-media `volumedetect` before video transcode
+  - `--audio-peak-ceiling DB` sets the maximum allowed estimated post-gain peak, default `-1.5`
+  - `--audio-analysis PATH_OR_DIR` reuses/writes analysis JSON outside the default log-dir path
+  - `--refresh-audio-analysis` reruns analysis even when a valid cache exists
+  - `--no-audio-analysis` applies gain without verification and records that in command logs
 - Output and logging:
   - final MP4 goes under the matching `Access/...` sibling path
   - ffmpeg stderr is logged to `Logs/.../<stem>_access_<timestamp>.log`
   - the ffmpeg command and key settings are written to `Logs/.../<stem>_transcode_cmd_<timestamp>.log`
+  - audio-analysis JSON defaults to `Logs/.../<stem>.audio_analysis.json`
   - Digital8 sidecars live in `Logs/...` as `<stem>.frameinfo.csv`, `<stem>.frameinfo.with_play_time.csv`, and `<stem>.record_time_overlay.srt`
 - Preview mode:
   - uses a temporary runtime directory for ffmpeg logs and any Digital8 CSV/SRT sidecars

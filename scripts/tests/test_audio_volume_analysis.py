@@ -39,6 +39,39 @@ class TestAudioVolumeAnalysis(unittest.TestCase):
 
         self.assertEqual(cmd[cmd.index("-af") + 1], "highpass=f=60:p=1,volumedetect")
 
+    def test_build_volumedetect_command_supports_source_media_range_and_stream(self) -> None:
+        cmd = audio_volume_analysis.build_volumedetect_command(
+            Path("/mnt/video/Source.mkv"),
+            "pan=stereo|c0=c1|c1=c1",
+            audio_stream="0:a:0",
+            start="00:01:00",
+            end="00:02:00",
+        )
+
+        self.assertEqual(
+            cmd,
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-stats",
+                "-loglevel",
+                "info",
+                "-ss",
+                "00:01:00",
+                "-to",
+                "00:02:00",
+                "-i",
+                "/mnt/video/Source.mkv",
+                "-map",
+                "0:a:0",
+                "-af",
+                "pan=stereo|c0=c1|c1=c1,volumedetect",
+                "-f",
+                "null",
+                "-",
+            ],
+        )
+
     def test_run_volumedetect_captures_ffmpeg_output_by_default(self) -> None:
         completed = audio_volume_analysis.subprocess.CompletedProcess(
             ["ffmpeg"],
@@ -144,6 +177,72 @@ class TestAudioVolumeAnalysis(unittest.TestCase):
 
         self.assertEqual(progress.getvalue(), "")
         detect_mock.assert_called_once_with(Path("/audio/A.flac"), verbose=True)
+
+    def test_source_volume_analysis_json_validates_input_and_filter_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            input_file = Path(root) / "Source.mkv"
+            input_file.write_bytes(b"media-a")
+            fingerprint = audio_volume_analysis.input_fingerprint(input_file)
+            output_file = Path(root) / "Source.audio_analysis.json"
+            audio_filter = "pan=stereo|c0=c1|c1=c1"
+            audio_volume_analysis.write_source_volume_analysis(
+                audio_volume_analysis.SourceVolumeAnalysis(
+                    input_file=Path(str(fingerprint["path"])),
+                    stats=audio_volume_analysis.VolumeDetectStats(mean_volume=-30.0, max_volume=-14.0),
+                    audio_stream="0:a:0",
+                    audio_filter=audio_filter,
+                    start="00:01:00",
+                    end="00:02:00",
+                    command=tuple(
+                        audio_volume_analysis.build_volumedetect_command(
+                            input_file,
+                            audio_filter,
+                            start="00:01:00",
+                            end="00:02:00",
+                        )
+                    ),
+                    input_size=int(fingerprint["size"]),
+                    input_mtime_ns=int(fingerprint["mtime_ns"]),
+                    created_at="2026-06-26T00:00:00Z",
+                ),
+                output_file,
+            )
+
+            valid = audio_volume_analysis.load_valid_source_volume_analysis(
+                output_file,
+                input_file,
+                audio_filter=audio_filter,
+                start="00:01:00",
+                end="00:02:00",
+            )
+            stale_filter = audio_volume_analysis.load_valid_source_volume_analysis(
+                output_file,
+                input_file,
+                audio_filter=None,
+                start="00:01:00",
+                end="00:02:00",
+            )
+            input_file.write_bytes(b"media-b")
+            same_size_changed_file = audio_volume_analysis.load_valid_source_volume_analysis(
+                output_file,
+                input_file,
+                audio_filter=audio_filter,
+                start="00:01:00",
+                end="00:02:00",
+            )
+            input_file.write_bytes(b"media-b-long")
+            stale_file = audio_volume_analysis.load_valid_source_volume_analysis(
+                output_file,
+                input_file,
+                audio_filter=audio_filter,
+                start="00:01:00",
+                end="00:02:00",
+            )
+
+        self.assertIsNotNone(valid)
+        self.assertIsNone(stale_filter)
+        self.assertIsNotNone(same_size_changed_file)
+        self.assertIsNone(stale_file)
 
     def test_main_analyzes_audio_dir_without_access_mp4s(self) -> None:
         with tempfile.TemporaryDirectory() as root:

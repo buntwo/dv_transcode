@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import add_play_time_columns
+import audio_volume_analysis
 import create_srt
 from transcode_naming import build_access_output_name
 from utils import sibling_dir_for_path
@@ -66,6 +67,11 @@ class Config:
     logs_dirname: str
     vhs_notch: str = "auto"
     audio_channel: str = "keep"
+    audio_gain: float | None = None
+    audio_peak_ceiling: float = audio_volume_analysis.DEFAULT_PEAK_CEILING
+    refresh_audio_analysis: bool = False
+    audio_analysis: Path | None = None
+    no_audio_analysis: bool = False
     layout: str = "archive"
     source_root: Path | None = None
     output_dir: Path | None = None
@@ -135,6 +141,28 @@ class DurationValidationResult:
         return not self.errors
 
 
+@dataclass(frozen=True)
+class AudioGainVerification:
+    analysis: audio_volume_analysis.SourceVolumeAnalysis | None
+    gain: float
+    peak_ceiling: float
+    verified: bool
+    analysis_path: Path | None = None
+
+    @property
+    def estimated_post_gain_peak(self) -> float | None:
+        if self.analysis is None:
+            return None
+        return self.analysis.stats.max_volume + self.gain
+
+    @property
+    def headroom(self) -> float | None:
+        peak = self.estimated_post_gain_peak
+        if peak is None:
+            return None
+        return self.peak_ceiling - peak
+
+
 try:
     sys.stdout.reconfigure(line_buffering=True, write_through=True)
     sys.stderr.reconfigure(line_buffering=True, write_through=True)
@@ -161,7 +189,7 @@ def default_denoise(format_type: str) -> str:
 
 def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     """Add transcode options shared by archive and generic access CLIs."""
-    parser.add_argument("--mode", choices=["transcode", "preview", "validate-duration"], default="transcode")
+    parser.add_argument("--mode", choices=["transcode", "preview", "validate-duration", "analyze-audio"], default="transcode")
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8", "vhs"], required=True)
     parser.add_argument("--start")
     parser.add_argument("--end")
@@ -193,6 +221,20 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--validate-duration-tolerance", type=float, default=DEFAULT_VALIDATE_DURATION_TOLERANCE)
     parser.add_argument("--vhs-notch", choices=["auto", "ntsc", "pal", "off"], default="auto")
     parser.add_argument("--audio-channel", choices=["keep", "left", "right"], default="keep")
+    parser.add_argument("--audio-gain", type=float, help="Append fixed audio gain in dB")
+    parser.add_argument(
+        "--audio-peak-ceiling",
+        type=float,
+        default=audio_volume_analysis.DEFAULT_PEAK_CEILING,
+        help="Maximum allowed post-gain peak in dB when audio analysis is enabled",
+    )
+    parser.add_argument("--refresh-audio-analysis", action="store_true", help="Ignore valid audio-analysis cache")
+    parser.add_argument("--audio-analysis", type=Path, help="Audio-analysis JSON file or directory to reuse/write")
+    parser.add_argument(
+        "--no-audio-analysis",
+        action="store_true",
+        help="Apply --audio-gain without volumedetect verification",
+    )
     parser.add_argument("--output-suffix", default="")
 
 
@@ -215,6 +257,12 @@ def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argpar
         parser.error("--vhs-color-correct is only valid with --format vhs")
     if args.lut is not None and not args.lut.is_file():
         parser.error(f"--lut file does not exist: {args.lut}")
+    if args.no_audio_analysis and args.audio_analysis is not None:
+        parser.error("--audio-analysis cannot be combined with --no-audio-analysis")
+    if args.no_audio_analysis and args.refresh_audio_analysis:
+        parser.error("--refresh-audio-analysis cannot be combined with --no-audio-analysis")
+    if args.mode == "analyze-audio" and args.no_audio_analysis:
+        parser.error("--mode analyze-audio cannot be combined with --no-audio-analysis")
 
 
 def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
@@ -256,6 +304,11 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         logs_dirname=args.logs_dirname,
         vhs_notch=args.vhs_notch,
         audio_channel=args.audio_channel,
+        audio_gain=args.audio_gain,
+        audio_peak_ceiling=args.audio_peak_ceiling,
+        refresh_audio_analysis=args.refresh_audio_analysis,
+        audio_analysis=args.audio_analysis,
+        no_audio_analysis=args.no_audio_analysis,
         layout=layout,
         source_root=getattr(args, "source_root", None),
         output_dir=getattr(args, "output_dir", None),
@@ -795,8 +848,8 @@ def build_channel_copy_audio_filter(cfg: Config) -> str | None:
     return None
 
 
-def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
-    """Build the complete audio filter chain."""
+def build_pre_gain_audio_filter(cfg: Config, input_file: Path) -> str | None:
+    """Build the audio filter chain before any fixed gain stage."""
     filters = [
         audio_filter
         for audio_filter in (
@@ -806,6 +859,29 @@ def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
         if audio_filter is not None
     ]
     return ",".join(filters) if filters else None
+
+
+def build_gain_audio_filter(gain: float) -> str:
+    """Build the ffmpeg volume filter for a fixed dB gain."""
+    return f"volume={audio_volume_analysis.format_float(gain)}dB"
+
+
+def build_audio_filter_from_pre_gain(pre_gain_filter: str | None, gain: float | None) -> str | None:
+    """Append fixed gain to a pre-gain audio filter chain when requested."""
+    filters = [
+        audio_filter
+        for audio_filter in (
+            pre_gain_filter,
+            build_gain_audio_filter(gain) if gain is not None else None,
+        )
+        if audio_filter
+    ]
+    return ",".join(filters) if filters else None
+
+
+def build_audio_filter(cfg: Config, input_file: Path) -> str | None:
+    """Build the complete audio filter chain."""
+    return build_audio_filter_from_pre_gain(build_pre_gain_audio_filter(cfg, input_file), cfg.audio_gain)
 
 
 def build_crop_filter(mask_top: int, mask_bottom: int) -> str | None:
@@ -875,7 +951,14 @@ def build_vf(cfg: Config, paths: Paths) -> str:
     return ",".join(filters)
 
 
-def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list[str]:
+def build_ffmpeg_args(
+    cfg: Config,
+    paths: Paths,
+    vf: str,
+    preview: bool,
+    *,
+    audio_filter: str | None = None,
+) -> list[str]:
     """Build the ffmpeg command-line argument list."""
     args = ["ffmpeg", "-hide_banner", "-loglevel", cfg.log_level, "-stats", "-stats_period", "1"]
     if cfg.assume_yes and not preview:
@@ -888,8 +971,9 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
 
     args += ["-i", str(paths.input_file), "-vf", vf, "-map", "0:v:0"]
     args += ["-map", "0:a:0?", "-map", "0:a:1?"] if cfg.map_both_audio else ["-map", "0:a:0?"]
-    if audio_filter := build_audio_filter(cfg, paths.input_file):
-        args += ["-af", audio_filter]
+    final_audio_filter = audio_filter if audio_filter is not None else build_audio_filter(cfg, paths.input_file)
+    if final_audio_filter:
+        args += ["-af", final_audio_filter]
 
     if cfg.encoder == "libx265":
         args += [
@@ -923,6 +1007,116 @@ def build_ffmpeg_args(cfg: Config, paths: Paths, vf: str, preview: bool) -> list
     args += ["-g", "60", "-color_range", "tv", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
 
     return args + (["-f", "matroska", "-"] if preview else [str(paths.output_file)])
+
+
+def default_audio_analysis_path(paths: Paths) -> Path:
+    """Return the default audio-analysis JSON path for an input."""
+    return paths.log_dir / audio_volume_analysis.default_json_name(paths.input_file)
+
+
+def resolve_audio_analysis_path(cfg: Config, paths: Paths) -> Path:
+    """Resolve the preferred audio-analysis JSON path for this input."""
+    if cfg.audio_analysis is None:
+        return default_audio_analysis_path(paths)
+    if cfg.audio_analysis.is_dir() or cfg.audio_analysis.suffix != ".json":
+        return cfg.audio_analysis / audio_volume_analysis.default_json_name(paths.input_file)
+    return cfg.audio_analysis
+
+
+def audio_analysis_candidates(cfg: Config, paths: Paths) -> list[Path]:
+    """Return cache lookup paths in preference order."""
+    preferred = resolve_audio_analysis_path(cfg, paths)
+    default = default_audio_analysis_path(paths)
+    if preferred == default:
+        return [default]
+    return [preferred, default]
+
+
+def load_cached_audio_analysis(
+    cfg: Config,
+    paths: Paths,
+    pre_gain_audio_filter: str | None,
+) -> audio_volume_analysis.SourceVolumeAnalysis | None:
+    """Load the first valid audio-analysis cache for this input and filter identity."""
+    if cfg.refresh_audio_analysis:
+        return None
+    for candidate in audio_analysis_candidates(cfg, paths):
+        analysis = audio_volume_analysis.load_valid_source_volume_analysis(
+            candidate,
+            paths.input_file,
+            audio_filter=pre_gain_audio_filter,
+            audio_stream=audio_volume_analysis.DEFAULT_AUDIO_STREAM,
+            start=cfg.start,
+            end=cfg.end,
+        )
+        if analysis is not None:
+            return analysis
+    return None
+
+
+def run_or_reuse_audio_analysis(
+    cfg: Config,
+    paths: Paths,
+    pre_gain_audio_filter: str | None,
+) -> audio_volume_analysis.SourceVolumeAnalysis:
+    """Return valid measured audio facts, running volumedetect when needed."""
+    cached = load_cached_audio_analysis(cfg, paths, pre_gain_audio_filter)
+    if cached is not None:
+        return cached
+
+    analysis = audio_volume_analysis.analyze_source_volume(
+        paths.input_file,
+        audio_filter=pre_gain_audio_filter,
+        audio_stream=audio_volume_analysis.DEFAULT_AUDIO_STREAM,
+        start=cfg.start,
+        end=cfg.end,
+    )
+    return audio_volume_analysis.write_source_volume_analysis(analysis, resolve_audio_analysis_path(cfg, paths))
+
+
+def verify_audio_gain_safety(
+    analysis: audio_volume_analysis.SourceVolumeAnalysis,
+    *,
+    gain: float,
+    peak_ceiling: float,
+) -> None:
+    """Fail before transcode if fixed gain would exceed the configured peak ceiling."""
+    estimated_post_gain_peak = analysis.stats.max_volume + gain
+    if estimated_post_gain_peak > peak_ceiling:
+        raise ValueError(
+            "audio gain would exceed peak ceiling for "
+            f"{analysis.input_file.name}: max_volume={audio_volume_analysis.format_db(analysis.stats.max_volume)} dB, "
+            f"gain={audio_volume_analysis.format_db(gain)} dB, "
+            f"estimated_post_gain_peak={audio_volume_analysis.format_db(estimated_post_gain_peak)} dB, "
+            f"peak_ceiling={audio_volume_analysis.format_db(peak_ceiling)} dB"
+        )
+
+
+def prepare_audio_gain(
+    cfg: Config,
+    paths: Paths,
+    pre_gain_audio_filter: str | None,
+) -> AudioGainVerification | None:
+    """Verify requested fixed audio gain and return loggable verification details."""
+    if cfg.audio_gain is None:
+        return None
+    if cfg.no_audio_analysis:
+        return AudioGainVerification(
+            analysis=None,
+            gain=cfg.audio_gain,
+            peak_ceiling=cfg.audio_peak_ceiling,
+            verified=False,
+        )
+
+    analysis = run_or_reuse_audio_analysis(cfg, paths, pre_gain_audio_filter)
+    verify_audio_gain_safety(analysis, gain=cfg.audio_gain, peak_ceiling=cfg.audio_peak_ceiling)
+    return AudioGainVerification(
+        analysis=analysis,
+        gain=cfg.audio_gain,
+        peak_ceiling=cfg.audio_peak_ceiling,
+        verified=True,
+        analysis_path=analysis.analysis_file,
+    )
 
 
 def shjoin(args: list[str]) -> str:
@@ -995,7 +1189,14 @@ def generate_digital8_sidecars(paths: Paths) -> None:
         print("Warning: could not find first-frame rdt date; leaving output filename unchanged.")
 
 
-def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bool) -> None:
+def print_summary(
+    cfg: Config,
+    paths: Paths,
+    ffmpeg_args: list[str],
+    preview: bool,
+    *,
+    audio_gain_verification: AudioGainVerification | None = None,
+) -> None:
     """Print a summary of the transcode job and ffmpeg command."""
     print(f"Mode: {cfg.mode}")
     print(f"Format: {cfg.format_type}")
@@ -1015,6 +1216,18 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
         print(f"VHS audio notch: {cfg.vhs_notch}")
         print(f"VHS color correction: {'on' if cfg.vhs_color_correct else 'off'}")
     print(f"Audio channel: {cfg.audio_channel}")
+    if cfg.audio_gain is not None:
+        print(f"Audio gain: {audio_volume_analysis.format_db(cfg.audio_gain)} dB")
+        if audio_gain_verification is None or not audio_gain_verification.verified:
+            print("Audio gain verification: unverified")
+        else:
+            analysis = audio_gain_verification.analysis
+            assert analysis is not None
+            print(f"Audio analysis: {audio_gain_verification.analysis_path}")
+            print(f"Audio max before gain: {audio_volume_analysis.format_db(analysis.stats.max_volume)} dB")
+            peak = audio_gain_verification.estimated_post_gain_peak
+            if peak is not None:
+                print(f"Estimated post-gain peak: {audio_volume_analysis.format_db(peak)} dB")
     print(f"Deinterlace mode: {cfg.deint_mode}")
     if cfg.format_type == "digital8":
         print(f"CSV: {paths.csv_raw}")
@@ -1034,7 +1247,13 @@ def print_summary(cfg: Config, paths: Paths, ffmpeg_args: list[str], preview: bo
     print()
 
 
-def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None:
+def write_command_log(
+    cfg: Config,
+    paths: Paths,
+    ffmpeg_args: list[str],
+    *,
+    audio_gain_verification: AudioGainVerification | None = None,
+) -> None:
     """Write a human-readable command log for the transcode."""
     lines = [
         f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -1051,6 +1270,25 @@ def write_command_log(cfg: Config, paths: Paths, ffmpeg_args: list[str]) -> None
         lines.append(f"VHS audio notch: {cfg.vhs_notch}")
         lines.append(f"VHS color correction: {'on' if cfg.vhs_color_correct else 'off'}")
     lines.append(f"Audio channel: {cfg.audio_channel}")
+    if cfg.audio_gain is not None:
+        lines.append(f"Audio gain: {audio_volume_analysis.format_db(cfg.audio_gain)} dB")
+        if audio_gain_verification is None or not audio_gain_verification.verified:
+            lines.append("Audio gain verification: unverified")
+        else:
+            analysis = audio_gain_verification.analysis
+            assert analysis is not None
+            estimated_peak = audio_gain_verification.estimated_post_gain_peak
+            assert estimated_peak is not None
+            lines.extend(
+                [
+                    "Audio gain verification: verified",
+                    f"Audio analysis JSON: {audio_gain_verification.analysis_path}",
+                    f"Audio mean before gain: {audio_volume_analysis.format_db(analysis.stats.mean_volume)} dB",
+                    f"Audio max before gain: {audio_volume_analysis.format_db(analysis.stats.max_volume)} dB",
+                    f"Audio peak ceiling: {audio_volume_analysis.format_db(cfg.audio_peak_ceiling)} dB",
+                    f"Estimated post-gain peak: {audio_volume_analysis.format_db(estimated_peak)} dB",
+                ]
+            )
     if cfg.format_type == "digital8":
         lines += [
             f"CSV: {paths.csv_raw}",
@@ -1213,7 +1451,15 @@ def process_preview_file(cfg: Config, input_file: Path) -> ProcessResult:
     with tempfile.TemporaryDirectory(prefix=f"{persistent_paths.stem}_preview_") as tmp:
         paths = build_runtime_paths(persistent_paths, Path(tmp))
         prepare_digital8_sidecars(cfg, paths)
-        ffmpeg_args = build_ffmpeg_args(cfg, paths, build_vf(cfg, paths), preview=True)
+        pre_gain_audio_filter = build_pre_gain_audio_filter(cfg, paths.input_file)
+        final_audio_filter = build_audio_filter_from_pre_gain(pre_gain_audio_filter, cfg.audio_gain)
+        ffmpeg_args = build_ffmpeg_args(
+            cfg,
+            paths,
+            build_vf(cfg, paths),
+            preview=True,
+            audio_filter=final_audio_filter,
+        )
         print_summary(cfg, paths, ffmpeg_args, preview=True)
         log_path = None if cfg.no_logs else paths.ffmpeg_log_file
         rc = run_ffmpeg(ffmpeg_args, log_path, preview_stem=paths.stem)
@@ -1240,8 +1486,23 @@ def process_transcode_file(cfg: Config, input_file: Path, prompt: bool) -> Proce
         if runtime_paths.output_file != paths.output_file:
             paths.output_file = runtime_paths.output_file
 
-        ffmpeg_args = build_ffmpeg_args(cfg, runtime_paths, build_vf(cfg, runtime_paths), preview=False)
-        print_summary(cfg, paths, ffmpeg_args, preview=False)
+        pre_gain_audio_filter = build_pre_gain_audio_filter(cfg, runtime_paths.input_file)
+        audio_gain_verification = prepare_audio_gain(cfg, runtime_paths, pre_gain_audio_filter)
+        final_audio_filter = build_audio_filter_from_pre_gain(pre_gain_audio_filter, cfg.audio_gain)
+        ffmpeg_args = build_ffmpeg_args(
+            cfg,
+            runtime_paths,
+            build_vf(cfg, runtime_paths),
+            preview=False,
+            audio_filter=final_audio_filter,
+        )
+        print_summary(
+            cfg,
+            paths,
+            ffmpeg_args,
+            preview=False,
+            audio_gain_verification=audio_gain_verification,
+        )
 
         if prompt:
             input("Press Enter to start transcode batch, or Ctrl-C to cancel...")
@@ -1249,7 +1510,7 @@ def process_transcode_file(cfg: Config, input_file: Path, prompt: bool) -> Proce
         start = time.perf_counter()
         try:
             if not cfg.no_logs:
-                write_command_log(cfg, paths, ffmpeg_args)
+                write_command_log(cfg, paths, ffmpeg_args, audio_gain_verification=audio_gain_verification)
             log_path = None if cfg.no_logs else paths.ffmpeg_log_file
             rc = run_ffmpeg(ffmpeg_args, log_path)
         finally:
@@ -1269,6 +1530,28 @@ def process_transcode_file(cfg: Config, input_file: Path, prompt: bool) -> Proce
     )
 
 
+def process_analyze_audio_file(cfg: Config, input_file: Path) -> audio_volume_analysis.SourceVolumeAnalysis:
+    """Write or reuse source-media audio-analysis JSON without transcoding video."""
+    paths = build_paths(cfg, input_file, create_dirs=False)
+    pre_gain_audio_filter = build_pre_gain_audio_filter(cfg, paths.input_file)
+    analysis = run_or_reuse_audio_analysis(cfg, paths, pre_gain_audio_filter)
+    if cfg.audio_gain is not None:
+        verify_audio_gain_safety(analysis, gain=cfg.audio_gain, peak_ceiling=cfg.audio_peak_ceiling)
+
+    print(f"Audio analysis: {analysis.analysis_file}")
+    print(f"Input: {paths.input_file}")
+    print(f"Audio filter: {pre_gain_audio_filter or 'none'}")
+    print(f"Mean volume: {audio_volume_analysis.format_db(analysis.stats.mean_volume)} dB")
+    print(f"Max volume: {audio_volume_analysis.format_db(analysis.stats.max_volume)} dB")
+    if cfg.audio_gain is not None:
+        peak = analysis.stats.max_volume + cfg.audio_gain
+        headroom = cfg.audio_peak_ceiling - peak
+        print(f"Estimated post-gain peak: {audio_volume_analysis.format_db(peak)} dB")
+        print(f"Headroom: {audio_volume_analysis.format_db(headroom)} dB")
+    print()
+    return analysis
+
+
 def process_one_file(cfg: Config, input_file: Path, prompt: bool) -> ProcessResult:
     """Process one input file through the transcode workflow."""
     if cfg.mode == "preview":
@@ -1281,6 +1564,18 @@ def run_transcode_workflow(cfg: Config, input_files: list[Path]) -> int:
     failures = 0
     prompted = cfg.assume_yes or cfg.mode == "preview"
     results: list[ProcessResult] = []
+
+    if cfg.mode == "analyze-audio":
+        for input_file in input_files:
+            print(f'processing {input_file.name}')
+            try:
+                process_analyze_audio_file(cfg, input_file)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"ERROR processing {input_file}: {e}", file=sys.stderr)
+                failures += 1
+        return 0 if failures == 0 else 1
 
     if cfg.mode != "validate-duration":
         for input_file in input_files:
