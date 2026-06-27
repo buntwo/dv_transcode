@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -32,6 +33,7 @@ class RenamePlan:
 class PreflightResult:
     plans: list[RenamePlan]
     errors: list[str]
+    skipped: list[str]
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -97,6 +99,19 @@ def display_path(path: Path, root: Path) -> str:
         return str(path)
 
 
+def display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def pad_display(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
+
+
 def padded_sequence_number(sequence_number: int) -> str:
     return str(sequence_number).zfill(2)
 
@@ -133,10 +148,11 @@ def build_preflight(
 ) -> PreflightResult:
     errors: list[str] = []
     plans: list[RenamePlan] = []
+    skipped: list[str] = []
 
     if not file_dir.is_dir():
         errors.append(f"File directory not found: {file_dir}")
-        return PreflightResult([], errors)
+        return PreflightResult([], errors, [])
 
     rows, row_errors = read_mapping_rows(map_file)
     errors.extend(row_errors)
@@ -146,7 +162,7 @@ def build_preflight(
         target_stem = row.original_stem if reverse else mapped_stem(row, preserve_underscores)
         matches = find_matching_files(file_dir, source_stem)
         if not matches:
-            errors.append(f"Row {row.row_number}: no source file found for stem {source_stem}")
+            skipped.append(f"Row {row.row_number}: no source file found for stem {source_stem}")
             continue
 
         for source in matches:
@@ -179,23 +195,41 @@ def build_preflight(
                     f"Target already exists for {plan.source.name}: {display_path(plan.target, file_dir)}"
                 )
 
-    return PreflightResult(plans, errors)
+    return PreflightResult(plans, errors, skipped)
 
 
 def print_report(result: PreflightResult, file_dir: Path, apply: bool) -> None:
     mode = "apply" if apply else "dry-run"
-    for plan in result.plans:
-        action = "RENAME" if apply and not result.errors else "PLAN"
-        print(f"{action} {display_path(plan.source, file_dir)} -> {display_path(plan.target, file_dir)}")
+    plan_rows = [
+        (
+            "RENAME" if apply and not result.errors else "PLAN",
+            display_path(plan.source, file_dir),
+            display_path(plan.target, file_dir),
+        )
+        for plan in result.plans
+    ]
+    action_width = max((display_width(action) for action, _source, _target in plan_rows), default=0)
+    source_width = max((display_width(source) for _action, source, _target in plan_rows), default=0)
+    for action, source, target in plan_rows:
+        print(f"{pad_display(action, action_width)} {pad_display(source, source_width)} -> {target}")
+
+    for skipped in result.skipped:
+        print(f"SKIP {skipped}")
 
     for error in result.errors:
         print(f"ERROR {error}", file=sys.stderr)
 
     if result.errors:
-        print(f"SUMMARY: mode={mode} planned={len(result.plans)} errors={len(result.errors)} renamed=0")
+        print(
+            f"SUMMARY: mode={mode} planned={len(result.plans)} "
+            f"skipped={len(result.skipped)} errors={len(result.errors)} renamed=0"
+        )
     else:
         renamed = len(result.plans) if apply else 0
-        print(f"SUMMARY: mode={mode} planned={len(result.plans)} errors=0 renamed={renamed}")
+        print(
+            f"SUMMARY: mode={mode} planned={len(result.plans)} "
+            f"skipped={len(result.skipped)} errors=0 renamed={renamed}"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

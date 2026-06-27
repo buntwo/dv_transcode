@@ -89,6 +89,74 @@ class NormalizationJob:
 
 
 @dataclass(frozen=True)
+class PreflightEntry:
+    access_file: Path
+    audio_file: Path
+    output_file: Path
+    audio_status: str
+    output_status: str
+    duration_status: str
+    video_duration_seconds: float | None
+    audio_duration_seconds: float | None
+    duration_delta_seconds: float | None
+    audio_filter: str | None
+
+
+@dataclass(frozen=True)
+class PreflightPlan:
+    entries: list[PreflightEntry]
+
+    @property
+    def jobs(self) -> list[NormalizationJob]:
+        jobs: list[NormalizationJob] = []
+        for entry in self.entries:
+            if (
+                entry.audio_status == "found"
+                and entry.duration_status == "ok"
+                and entry.video_duration_seconds is not None
+                and entry.audio_duration_seconds is not None
+                and entry.duration_delta_seconds is not None
+            ):
+                jobs.append(
+                    NormalizationJob(
+                        access_file=entry.access_file,
+                        audio_file=entry.audio_file,
+                        output_file=entry.output_file,
+                        video_duration_seconds=entry.video_duration_seconds,
+                        audio_duration_seconds=entry.audio_duration_seconds,
+                        duration_delta_seconds=entry.duration_delta_seconds,
+                        audio_filter=entry.audio_filter,
+                    )
+                )
+        return jobs
+
+    @property
+    def missing_audio(self) -> list[PreflightEntry]:
+        return [entry for entry in self.entries if entry.audio_status == "missing"]
+
+    @property
+    def output_conflicts(self) -> list[PreflightEntry]:
+        return [entry for entry in self.entries if entry.output_status == "exists, use --force"]
+
+    @property
+    def duration_mismatches(self) -> list[PreflightEntry]:
+        return [entry for entry in self.entries if entry.duration_status == "mismatch"]
+
+    @property
+    def duration_errors(self) -> list[PreflightEntry]:
+        return [entry for entry in self.entries if entry.duration_status.startswith("error:")]
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(
+            self.missing_audio
+            or self.output_conflicts
+            or self.duration_mismatches
+            or self.duration_errors
+        )
+
+
+@dataclass(frozen=True)
 class FixedGainReview:
     job: NormalizationJob
     analysis: VolumeAnalysis
@@ -238,59 +306,78 @@ def probe_media_duration_seconds(path: Path) -> float:
     return seconds
 
 
-def build_jobs(args: argparse.Namespace) -> list[NormalizationJob]:
+def build_preflight_plan(args: argparse.Namespace) -> PreflightPlan:
     access_files = list_access_files(args.access_copy_dir)
     if not access_files:
         raise ValueError(f"no MP4 files found in {args.access_copy_dir}")
 
-    missing_audio: list[Path] = []
-    output_conflicts: list[Path] = []
+    entries: list[PreflightEntry] = []
+    duration_total = sum(1 for path in access_files if audio_file_for_access(path, args.audio_dir).exists())
+    duration_index = 0
     for access_file in access_files:
         audio_file = audio_file_for_access(access_file, args.audio_dir)
         output_file = args.output_dir / access_file.name
-        if not audio_file.exists():
-            missing_audio.append(access_file)
-        if output_file.exists() and not args.force:
-            output_conflicts.append(output_file)
+        audio_status = "found" if audio_file.exists() else "missing"
+        output_status = "will write"
+        if output_file.exists():
+            output_status = "exists, overwrite" if args.force else "exists, use --force"
 
-    if missing_audio:
-        raise ValueError(
-            "missing matching FLAC files for: "
-            + ", ".join(file.name for file in missing_audio)
-        )
-    if output_conflicts:
-        raise ValueError(
-            "output files already exist (use --force): "
-            + ", ".join(file.name for file in output_conflicts)
-        )
+        if audio_status == "missing":
+            entries.append(
+                PreflightEntry(
+                    access_file=access_file,
+                    audio_file=audio_file,
+                    output_file=output_file,
+                    audio_status=audio_status,
+                    output_status=output_status,
+                    duration_status="skipped",
+                    video_duration_seconds=None,
+                    audio_duration_seconds=None,
+                    duration_delta_seconds=None,
+                    audio_filter=None,
+                )
+            )
+            continue
 
-    jobs: list[NormalizationJob] = []
-    total = len(access_files)
-    for access_file in access_files:
+        duration_index += 1
         print(
             "Checking durations "
-            + format_progress(len(jobs) + 1, total, access_file),
+            + format_progress(duration_index, duration_total, access_file),
             file=sys.stderr,
             flush=True,
         )
-        audio_file = audio_file_for_access(access_file, args.audio_dir)
-        output_file = args.output_dir / access_file.name
         audio_filter = build_job_audio_filter(args, access_file)
-        video_duration = probe_media_duration_seconds(access_file)
-        audio_duration = probe_media_duration_seconds(audio_file)
-        delta = abs(video_duration - audio_duration)
-        if delta > args.duration_tolerance:
-            raise ValueError(
-                f"duration mismatch for {access_file.name}: "
-                f"video={video_duration:.3f}s audio={audio_duration:.3f}s delta={delta:.3f}s "
-                f"(tolerance {args.duration_tolerance:.3f}s)"
+        try:
+            video_duration = probe_media_duration_seconds(access_file)
+            audio_duration = probe_media_duration_seconds(audio_file)
+        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+            entries.append(
+                PreflightEntry(
+                    access_file=access_file,
+                    audio_file=audio_file,
+                    output_file=output_file,
+                    audio_status=audio_status,
+                    output_status=output_status,
+                    duration_status=f"error: {exc}",
+                    video_duration_seconds=None,
+                    audio_duration_seconds=None,
+                    duration_delta_seconds=None,
+                    audio_filter=audio_filter,
+                )
             )
+            continue
 
-        jobs.append(
-            NormalizationJob(
+        delta = abs(video_duration - audio_duration)
+        duration_status = "mismatch" if delta > args.duration_tolerance else "ok"
+
+        entries.append(
+            PreflightEntry(
                 access_file=access_file,
                 audio_file=audio_file,
                 output_file=output_file,
+                audio_status=audio_status,
+                output_status=output_status,
+                duration_status=duration_status,
                 video_duration_seconds=video_duration,
                 audio_duration_seconds=audio_duration,
                 duration_delta_seconds=delta,
@@ -298,7 +385,40 @@ def build_jobs(args: argparse.Namespace) -> list[NormalizationJob]:
             )
         )
 
-    return jobs
+    return PreflightPlan(entries)
+
+
+def fail_if_preflight_invalid(plan: PreflightPlan, args: argparse.Namespace) -> None:
+    messages: list[str] = []
+    if plan.missing_audio:
+        messages.append(
+            "missing matching FLAC files for: "
+            + ", ".join(entry.access_file.name for entry in plan.missing_audio)
+        )
+    if plan.output_conflicts:
+        messages.append(
+            "output files already exist (use --force): "
+            + ", ".join(entry.output_file.name for entry in plan.output_conflicts)
+        )
+    if plan.duration_mismatches:
+        messages.append(
+            "duration mismatches over "
+            f"{args.duration_tolerance:.3f}s for: "
+            + ", ".join(entry.access_file.name for entry in plan.duration_mismatches)
+        )
+    if plan.duration_errors:
+        messages.append(
+            "duration probe failed for: "
+            + ", ".join(entry.access_file.name for entry in plan.duration_errors)
+        )
+    if messages:
+        raise ValueError("preflight failed: " + "; ".join(messages))
+
+
+def build_jobs(args: argparse.Namespace) -> list[NormalizationJob]:
+    plan = build_preflight_plan(args)
+    fail_if_preflight_invalid(plan, args)
+    return plan.jobs
 
 
 def analyze_fixed_gain(args: argparse.Namespace, jobs: list[NormalizationJob]) -> list[FixedGainReview]:
@@ -317,7 +437,7 @@ def analyze_fixed_gain(args: argparse.Namespace, jobs: list[NormalizationJob]) -
             )
         )
         if not args.verbose:
-            print(format_progress(index, total, job.audio_file), file=sys.stderr, flush=True)
+            print("Analyzing audio peaks " + format_progress(index, total, job.audio_file), file=sys.stderr, flush=True)
     return reviews
 
 
@@ -330,13 +450,19 @@ def fail_if_unsafe_fixed_gain(reviews: list[FixedGainReview]) -> None:
         )
 
 
+def format_optional_seconds(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.3f}"
+
+
 def format_preflight_report(
     args: argparse.Namespace,
-    jobs: list[NormalizationJob],
+    plan: PreflightPlan,
     fixed_gain_reviews: list[FixedGainReview] | None = None,
 ) -> str:
     lines: list[str] = []
-    lines.append(f"Found {len(jobs)} Access MP4 file(s): {args.access_copy_dir}")
+    lines.append(f"Found {len(plan.entries)} Access MP4 file(s): {args.access_copy_dir}")
     lines.append(f"Using audio directory: {args.audio_dir}")
     lines.append(f"Output directory: {args.output_dir}")
     lines.append(f"Metadata CSV: {args.output_dir / 'metadata.csv'}")
@@ -348,26 +474,40 @@ def format_preflight_report(
     rows = [
         (
             str(index),
-            job.access_file.name,
-            job.audio_file.name,
-            job.output_file.name,
-            f"{job.video_duration_seconds:.3f}",
-            f"{job.audio_duration_seconds:.3f}",
-            f"{job.duration_delta_seconds:.3f}",
+            entry.access_file.name,
+            entry.audio_file.name,
+            entry.output_file.name,
+            entry.audio_status,
+            entry.output_status,
+            format_optional_seconds(entry.video_duration_seconds),
+            format_optional_seconds(entry.audio_duration_seconds),
+            format_optional_seconds(entry.duration_delta_seconds),
+            entry.duration_status,
         )
-        for index, job in enumerate(jobs, start=1)
+        for index, entry in enumerate(plan.entries, start=1)
     ]
-    headers = ("#", "access", "audio", "output", "video_s", "audio_s", "delta_s")
+    headers = (
+        "#",
+        "access",
+        "audio_file",
+        "output_file",
+        "audio_status",
+        "output_status",
+        "video_s",
+        "audio_s",
+        "delta_s",
+        "duration",
+    )
     widths = [len(header) for header in headers]
     for row in rows:
         for index, value in enumerate(row):
             widths[index] = max(widths[index], len(value))
 
     lines.append("Preflight normalization list:")
-    lines.append(format_table_row(headers, widths, right_aligned={0, 4, 5, 6}))
-    lines.append(format_table_row(tuple("-" * len(header) for header in headers), widths, right_aligned={0, 4, 5, 6}))
+    lines.append(format_table_row(headers, widths, right_aligned={0, 6, 7, 8}))
+    lines.append(format_table_row(tuple("-" * len(header) for header in headers), widths, right_aligned={0, 6, 7, 8}))
     for row in rows:
-        lines.append(format_table_row(row, widths, right_aligned={0, 4, 5, 6}))
+        lines.append(format_table_row(row, widths, right_aligned={0, 6, 7, 8}))
 
     if fixed_gain_reviews is not None:
         lines.append("")
@@ -472,10 +612,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         validate_args(args)
-        jobs = build_jobs(args)
+        plan = build_preflight_plan(args)
+        if plan.has_errors:
+            print(format_preflight_report(args, plan))
+            fail_if_preflight_invalid(plan, args)
+        jobs = plan.jobs
         fixed_gain_reviews = analyze_fixed_gain(args, jobs)
+        print(format_preflight_report(args, plan, fixed_gain_reviews))
         fail_if_unsafe_fixed_gain(fixed_gain_reviews)
-        print(format_preflight_report(args, jobs, fixed_gain_reviews))
         if not args.yes and not confirm_preflight():
             return 0
         args.output_dir.mkdir(parents=True, exist_ok=True)

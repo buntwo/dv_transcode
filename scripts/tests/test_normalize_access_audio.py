@@ -85,6 +85,7 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
             with (
                 patch.object(normalize_access_audio.shutil, "which", return_value="/bin/ffmpeg"),
                 patch.object(normalize_access_audio.subprocess, "run") as run_mock,
+                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()) as stdout_mock,
             ):
                 code = normalize_access_audio.main(
                     [
@@ -99,6 +100,14 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
                 )
 
         self.assertEqual(code, 1)
+        stdout = stdout_mock.getvalue()
+        self.assertIn("Preflight normalization list", stdout)
+        self.assertIn("Movie.flac", stdout)
+        self.assertIn("missing", stdout)
+        self.assertLess(
+            stdout.index("Preflight normalization list"),
+            stdout.index("normalize_access_audio.py: error: preflight failed"),
+        )
         run_mock.assert_not_called()
 
     def test_output_existing_requires_force(self) -> None:
@@ -117,6 +126,7 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
                 patch.object(normalize_access_audio.shutil, "which", return_value="/bin/ffmpeg"),
                 patch.object(normalize_access_audio.subprocess, "run") as run_mock,
                 patch.object(normalize_access_audio, "probe_media_duration_seconds", return_value=10.0),
+                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()) as stdout_mock,
             ):
                 code = normalize_access_audio.main(
                     [
@@ -130,6 +140,13 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
                 )
 
         self.assertEqual(code, 1)
+        stdout = stdout_mock.getvalue()
+        self.assertIn("Preflight normalization list", stdout)
+        self.assertIn("exists, use --force", stdout)
+        self.assertLess(
+            stdout.index("Preflight normalization list"),
+            stdout.index("normalize_access_audio.py: error: preflight failed"),
+        )
         run_mock.assert_not_called()
 
     def test_duration_mismatch_fails_over_tolerance(self) -> None:
@@ -149,6 +166,7 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
                 patch.object(normalize_access_audio.shutil, "which", return_value="/bin/ffmpeg"),
                 patch.object(normalize_access_audio.subprocess, "run") as run_mock,
                 patch.object(normalize_access_audio, "probe_media_duration_seconds", side_effect=probe_duration),
+                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()) as stdout_mock,
             ):
                 code = normalize_access_audio.main(
                     [
@@ -164,6 +182,14 @@ class TestNormalizeAccessAudioPreflight(unittest.TestCase):
                 )
 
         self.assertEqual(code, 1)
+        stdout = stdout_mock.getvalue()
+        self.assertIn("Preflight normalization list", stdout)
+        self.assertIn("0.200", stdout)
+        self.assertIn("mismatch", stdout)
+        self.assertLess(
+            stdout.index("Preflight normalization list"),
+            stdout.index("normalize_access_audio.py: error: preflight failed"),
+        )
         run_mock.assert_not_called()
 
     def test_duration_preflight_prints_progress_before_processing(self) -> None:
@@ -346,6 +372,42 @@ class TestNormalizeAccessAudioCommands(unittest.TestCase):
             verbose=False,
         )
 
+    def test_analyze_fixed_gain_prints_labeled_progress(self) -> None:
+        args = normalize_access_audio.parse_args(
+            [
+                "--access-copy-dir",
+                "/mnt/access",
+                "--audio-dir",
+                "/mnt/audio",
+                "--output-dir",
+                "/mnt/output",
+            ]
+        )
+        job = normalize_access_audio.NormalizationJob(
+            access_file=Path("/mnt/access/Movie.mp4"),
+            audio_file=Path("/mnt/audio/Movie.flac"),
+            output_file=Path("/mnt/output/Movie.mp4"),
+            video_duration_seconds=120.0,
+            audio_duration_seconds=120.0,
+            duration_delta_seconds=0.0,
+            audio_filter=None,
+        )
+        stderr = io.StringIO()
+
+        with (
+            patch.object(
+                normalize_access_audio,
+                "run_volumedetect",
+                return_value=audio_volume_analysis.VolumeDetectStats(mean_volume=-30.0, max_volume=-14.0),
+            ),
+            patch.object(normalize_access_audio.sys, "stderr", stderr),
+        ):
+            normalize_access_audio.analyze_fixed_gain(args, [job])
+
+        self.assertIn("Analyzing audio peaks", stderr.getvalue())
+        self.assertIn("1/1", stderr.getvalue())
+        self.assertIn("Movie.flac", stderr.getvalue())
+
 class TestFixedGainMode(unittest.TestCase):
     def test_safe_gain_prints_table_remuxes_after_confirmation_and_writes_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -466,7 +528,7 @@ class TestFixedGainMode(unittest.TestCase):
                     return_value=audio_volume_analysis.VolumeDetectStats(mean_volume=-20.0, max_volume=-10.0),
                 ),
                 patch.object(normalize_access_audio, "run_fixed_gain_remux") as remux_mock,
-                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()),
+                patch.object(normalize_access_audio.sys, "stdout", io.StringIO()) as stdout_mock,
                 patch.object(normalize_access_audio.sys, "stderr", io.StringIO()),
             ):
                 code = normalize_access_audio.main(
@@ -481,6 +543,13 @@ class TestFixedGainMode(unittest.TestCase):
                 )
 
             self.assertEqual(code, 1)
+            stdout = stdout_mock.getvalue()
+            self.assertIn("Fixed-gain analysis", stdout)
+            self.assertIn("exceeds ceiling", stdout)
+            self.assertLess(
+                stdout.index("Fixed-gain analysis"),
+                stdout.index("normalize_access_audio.py: error: fixed gain would exceed peak ceiling"),
+            )
             remux_mock.assert_not_called()
             self.assertFalse((output_dir / "metadata.csv").exists())
 

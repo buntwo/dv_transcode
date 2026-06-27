@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -36,6 +37,12 @@ class TestRenameAccessFromMap(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             code = rename_access_from_map.main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_plan_line(self, output: str, action: str, source: str, target: str) -> None:
+        self.assertRegex(output, rf"{action} {re.escape(source)}\s+-> {re.escape(target)}")
+
+    def visual_arrow_column(self, line: str) -> int:
+        return rename_access_from_map.display_width(line.split("->", 1)[0])
 
     def test_basic_dry_run_leaves_file_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -103,9 +110,101 @@ class TestRenameAccessFromMap(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
-            self.assertIn("PLAN 8.mp4 -> 01 Eight.mp4", stdout)
-            self.assertIn("PLAN 08.mov -> 02 Zero Eight.mov", stdout)
-            self.assertIn("PLAN 001.MP4 -> 03 One.MP4", stdout)
+            self.assert_plan_line(stdout, "PLAN", "8.mp4", "01 Eight.mp4")
+            self.assert_plan_line(stdout, "PLAN", "08.mov", "02 Zero Eight.mov")
+            self.assert_plan_line(stdout, "PLAN", "001.MP4", "03 One.MP4")
+
+    def test_plan_arrows_align_for_mixed_source_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            map_file = root / "map.csv"
+            (root / "8.mp4").write_bytes(b"video")
+            (root / "long_source_name.mp4").write_bytes(b"video")
+            write_map(
+                map_file,
+                [
+                    "original_stem,renamed_stem",
+                    "8,Eight",
+                    "long_source_name,Long",
+                ],
+            )
+
+            code, stdout, stderr = self.run_cli(root, map_file)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            plan_lines = [line for line in stdout.splitlines() if line.startswith("PLAN ")]
+            self.assertEqual(len(plan_lines), 2)
+            self.assertEqual(self.visual_arrow_column(plan_lines[0]), self.visual_arrow_column(plan_lines[1]))
+
+    def test_plan_arrows_align_for_east_asian_source_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            map_file = root / "map.csv"
+            (root / "08.mp4").write_bytes(b"video")
+            (root / "家庭录像.mp4").write_bytes(b"video")
+            write_map(
+                map_file,
+                [
+                    "original_stem,renamed_stem",
+                    "08,Eight",
+                    "家庭录像,Family",
+                ],
+            )
+
+            code, stdout, stderr = self.run_cli(root, map_file)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            plan_lines = [line for line in stdout.splitlines() if line.startswith("PLAN ")]
+            self.assertEqual(len(plan_lines), 2)
+            self.assertEqual(self.visual_arrow_column(plan_lines[0]), self.visual_arrow_column(plan_lines[1]))
+
+    def test_reverse_plan_arrows_align_for_mixed_source_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            map_file = root / "map.csv"
+            (root / "01 Eight.mp4").write_bytes(b"video")
+            (root / "02 Long.mp4").write_bytes(b"video")
+            write_map(
+                map_file,
+                [
+                    "original_stem,renamed_stem",
+                    "8,Eight",
+                    "long_source_name,Long",
+                ],
+            )
+
+            code, stdout, stderr = self.run_cli(root, map_file, reverse=True)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            plan_lines = [line for line in stdout.splitlines() if line.startswith("PLAN ")]
+            self.assertEqual(len(plan_lines), 2)
+            self.assertEqual(self.visual_arrow_column(plan_lines[0]), self.visual_arrow_column(plan_lines[1]))
+
+    def test_reverse_plan_arrows_align_for_east_asian_source_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            map_file = root / "map.csv"
+            (root / "01 Family.mp4").write_bytes(b"video")
+            (root / "02 家庭录像.mp4").write_bytes(b"video")
+            write_map(
+                map_file,
+                [
+                    "original_stem,renamed_stem",
+                    "8,Family",
+                    "long_source_name,家庭录像",
+                ],
+            )
+
+            code, stdout, stderr = self.run_cli(root, map_file, reverse=True)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            plan_lines = [line for line in stdout.splitlines() if line.startswith("PLAN ")]
+            self.assertEqual(len(plan_lines), 2)
+            self.assertEqual(self.visual_arrow_column(plan_lines[0]), self.visual_arrow_column(plan_lines[1]))
 
     def test_missing_required_columns_return_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,7 +359,12 @@ class TestRenameAccessFromMap(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
             self.assertIn("PLAN 15.mkv.contact_sheet.png -> 01 Birthday Party.mkv.contact_sheet.png", stdout)
-            self.assertIn("PLAN 16.mkv.spectrogram.png -> 02 Dinner at Tu's.mkv.spectrogram.png", stdout)
+            self.assert_plan_line(
+                stdout,
+                "PLAN",
+                "16.mkv.spectrogram.png",
+                "02 Dinner at Tu's.mkv.spectrogram.png",
+            )
 
     def test_sidecar_reverse_maps_positioned_name_back_to_original_stem(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,7 +415,12 @@ class TestRenameAccessFromMap(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
             self.assertIn("RENAME 08.mkv.contact_sheet.png -> 01 Birthday Party.mkv.contact_sheet.png", stdout)
-            self.assertIn("RENAME 08.mkv.spectrogram.png -> 01 Birthday Party.mkv.spectrogram.png", stdout)
+            self.assert_plan_line(
+                stdout,
+                "RENAME",
+                "08.mkv.spectrogram.png",
+                "01 Birthday Party.mkv.spectrogram.png",
+            )
             self.assertFalse(contact_sheet.exists())
             self.assertFalse(spectrogram.exists())
             self.assertTrue((root / "01 Birthday Party.mkv.contact_sheet.png").exists())
@@ -332,7 +441,12 @@ class TestRenameAccessFromMap(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
             self.assertIn("RENAME 01 Birthday Party.mkv.contact_sheet.png -> 08.mkv.contact_sheet.png", stdout)
-            self.assertIn("RENAME 01 Birthday Party.mkv.spectrogram.png -> 08.mkv.spectrogram.png", stdout)
+            self.assert_plan_line(
+                stdout,
+                "RENAME",
+                "01 Birthday Party.mkv.spectrogram.png",
+                "08.mkv.spectrogram.png",
+            )
             self.assertFalse(contact_sheet.exists())
             self.assertFalse(spectrogram.exists())
             self.assertTrue((root / "08.mkv.contact_sheet.png").exists())
@@ -373,7 +487,7 @@ class TestRenameAccessFromMap(unittest.TestCase):
                 ],
             )
 
-    def test_missing_source_returns_error_while_multiple_extension_matches_are_planned(self) -> None:
+    def test_missing_source_is_skipped_while_multiple_extension_matches_are_planned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             map_file = root / "map.csv"
@@ -383,10 +497,12 @@ class TestRenameAccessFromMap(unittest.TestCase):
 
             code, stdout, stderr = self.run_cli(root, map_file)
 
-            self.assertEqual(code, 1)
+            self.assertEqual(code, 0)
             self.assertIn("PLAN 08.mov -> 01 Birthday.mov", stdout)
             self.assertIn("PLAN 08.mp4 -> 01 Birthday.mp4", stdout)
-            self.assertIn("no source file found for stem 09", stderr)
+            self.assertIn("SKIP Row 3: no source file found for stem 09", stdout)
+            self.assertIn("skipped=1", stdout)
+            self.assertEqual(stderr, "")
 
     def test_existing_target_and_duplicate_planned_targets_return_errors_and_prevent_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -404,7 +520,7 @@ class TestRenameAccessFromMap(unittest.TestCase):
 
             self.assertEqual(code, 1)
             self.assertIn("PLAN 08.mp4 -> 01 Birthday.mp4", stdout)
-            self.assertIn("PLAN 8.mov -> 02 Birthday.mov", stdout)
+            self.assert_plan_line(stdout, "PLAN", "8.mov", "02 Birthday.mov")
             self.assertIn("Target already exists for 08.mp4", stderr)
             self.assertTrue(source_a.exists())
             self.assertTrue(source_b.exists())
@@ -421,7 +537,7 @@ class TestRenameAccessFromMap(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertEqual(stderr, "")
-            self.assertIn("RENAME 8.mp4 -> 01 Birthday.mp4", stdout)
+            self.assert_plan_line(stdout, "RENAME", "8.mp4", "01 Birthday.mp4")
             self.assertIn("RENAME 08.mp4 -> 02 Birthday.mp4", stdout)
             self.assertTrue((root / "01 Birthday.mp4").exists())
             self.assertTrue((root / "02 Birthday.mp4").exists())
@@ -435,10 +551,11 @@ class TestRenameAccessFromMap(unittest.TestCase):
             (nested / "08.mp4").write_bytes(b"video")
             write_map(map_file, ["original_stem,renamed_stem", "08,Birthday"])
 
-            code, _stdout, stderr = self.run_cli(root, map_file)
+            code, stdout, stderr = self.run_cli(root, map_file)
 
-            self.assertEqual(code, 1)
-            self.assertIn("no source file found for stem 08", stderr)
+            self.assertEqual(code, 0)
+            self.assertIn("SKIP Row 2: no source file found for stem 08", stdout)
+            self.assertEqual(stderr, "")
 
 
 if __name__ == "__main__":
