@@ -969,12 +969,9 @@ def build_ffmpeg_args(
     if cfg.end:
         args += ["-to", cfg.end]
 
-    args += ["-i", str(paths.input_file), "-vf", vf, "-map", "0:v:0"]
-    args += ["-map", "0:a:0?", "-map", "0:a:1?"] if cfg.map_both_audio else ["-map", "0:a:0?"]
-    final_audio_filter = audio_filter if audio_filter is not None else build_audio_filter(cfg, paths.input_file)
-    if final_audio_filter:
-        args += ["-af", final_audio_filter]
+    args += ["-i", str(paths.input_file)]
 
+    args += ["-map", "0:v:0", "-vf", vf]
     if cfg.encoder == "libx265":
         args += [
             "-c:v",
@@ -1004,7 +1001,15 @@ def build_ffmpeg_args(
             "-q:v", str(cfg.q),
         ]
 
-    args += ["-g", "60", "-color_range", "tv", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+    args += ["-g", "60", "-color_range", "tv"]
+
+    args += ["-map", "0:a:0?", "-map", "0:a:1?"] if cfg.map_both_audio else ["-map", "0:a:0?"]
+    final_audio_filter = audio_filter if audio_filter is not None else build_audio_filter(cfg, paths.input_file)
+    if final_audio_filter:
+        args += ["-af", final_audio_filter]
+    args += ["-c:a", "aac", "-b:a", "192k"]
+
+    args += ["-movflags", "+faststart"]
 
     return args + (["-f", "matroska", "-"] if preview else [str(paths.output_file)])
 

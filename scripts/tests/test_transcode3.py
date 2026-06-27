@@ -827,6 +827,26 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("-max_ref_frames", args)
         self.assertNotIn("-q:v", args)
 
+    def test_ffmpeg_args_group_video_options_before_audio_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = make_paths(root)
+            cfg = make_config(
+                format_type="vhs",
+                encoder="libx265",
+                preset="slow",
+                crf=22.0,
+                vhs_notch="ntsc",
+            )
+
+            args = transcode3.build_ffmpeg_args(cfg, paths, "null", preview=False)
+
+        self.assertLess(args.index("-vf"), args.index("-c:v"))
+        self.assertLess(args.index("-c:v"), args.index("-g"))
+        self.assertLess(args.index("-g"), args.index("-af"))
+        self.assertLess(args.index("-af"), args.index("-c:a"))
+        self.assertLess(args.index("-c:a"), args.index("-movflags"))
+
     def test_libx265_vhs_params_are_not_used_for_non_vhs_formats(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),
