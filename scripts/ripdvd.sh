@@ -46,6 +46,21 @@ find_first() {
   return 1
 }
 
+diskutil_size_bytes_from_plist() {
+  local key plist size
+
+  plist="$(cat)"
+  for key in TotalSize MediaSize Size; do
+    size="$(plutil -extract "$key" raw -o - - <<< "$plist" 2>/dev/null || true)"
+    if [[ "$size" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$size"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 diskutil_size_bytes_from_info() {
   local line size
 
@@ -60,6 +75,17 @@ diskutil_size_bytes_from_info() {
   done
 
   return 1
+}
+
+validate_dvd_size_bytes() {
+  local size="$1"
+  local max_dvd_size=20000000000
+
+  [[ "$size" =~ ^[1-9][0-9]*$ ]] || die "Parsed source size is not a positive byte count: $size"
+
+  if (( size > max_dvd_size )); then
+    die "Parsed source size is implausibly large for DVD media: $size bytes. Refusing to use it as a ddrescue size limit."
+  fi
 }
 
 DEVICE=""
@@ -161,7 +187,9 @@ RUNLOG="$OUT_DIR/$LABEL.ddrescue-output.txt"
 SHA="$OUT_DIR/$LABEL.iso.sha256"
 RESUMING=0
 SOURCE_INFO=""
+SOURCE_INFO_PLIST=""
 SOURCE_SIZE=""
+SOURCE_SIZE_SOURCE=""
 DDRESCUE_SIZE_ARGS=()
 DDRESCUELOG_SIZE_ARGS=()
 
@@ -174,9 +202,18 @@ if [[ ! -e "$ISO" && -e "$MAP" ]]; then
 fi
 
 SOURCE_INFO="$(diskutil info "$WHOLE")" || die "Could not inspect $WHOLE"
+SOURCE_INFO_PLIST="$(diskutil info -plist "$WHOLE" 2>/dev/null || true)"
 
 if (( SIZE_FROM_DISKUTIL )); then
-  SOURCE_SIZE="$(diskutil_size_bytes_from_info <<< "$SOURCE_INFO")" || die "Could not parse Disk Size from diskutil info for $WHOLE"
+  if [[ -n "$SOURCE_INFO_PLIST" ]] &&
+     SOURCE_SIZE="$(diskutil_size_bytes_from_plist <<< "$SOURCE_INFO_PLIST")"; then
+    SOURCE_SIZE_SOURCE="diskutil info -plist"
+  else
+    SOURCE_SIZE="$(diskutil_size_bytes_from_info <<< "$SOURCE_INFO")" || die "Could not parse Disk Size from diskutil info for $WHOLE"
+    SOURCE_SIZE_SOURCE="diskutil info"
+  fi
+
+  validate_dvd_size_bytes "$SOURCE_SIZE"
   DDRESCUE_SIZE_ARGS=("-s" "$SOURCE_SIZE")
   DDRESCUELOG_SIZE_ARGS=("-s" "$SOURCE_SIZE")
 fi
@@ -205,7 +242,7 @@ echo "Run log:    $RUNLOG"
 echo "SHA-256:    $SHA"
 echo "Retries:    $RETRIES"
 if [[ -n "$SOURCE_SIZE" ]]; then
-  echo "Size limit: $SOURCE_SIZE bytes from diskutil"
+  echo "Size limit: $SOURCE_SIZE bytes from $SOURCE_SIZE_SOURCE"
 else
   echo "Size limit: none"
 fi
@@ -237,6 +274,7 @@ fi
   echo "RESUMING=$RESUMING"
   echo "SIZE_FROM_DISKUTIL=$SIZE_FROM_DISKUTIL"
   echo "SOURCE_SIZE=$SOURCE_SIZE"
+  echo "SOURCE_SIZE_SOURCE=$SOURCE_SIZE_SOURCE"
 } >> "$RUNLOG"
 
 LAST_RUN_OUTPUT=""
@@ -408,8 +446,7 @@ cleanup_map_backup() {
   fi
 }
 
-cleanup_incomplete_sha() {
-  [[ -e "$SHA" ]] || return 0
+cleanup_incomplete_sha() { [[ -e "$SHA" ]] || return 0
 
   {
     echo
