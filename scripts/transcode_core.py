@@ -202,7 +202,7 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--preset",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
-        help="libx265 preset; only valid with --encoder libx265 (default: medium)",
+        help="libx265 preset; only valid with --encoder libx265 (default: slow)",
     )
     parser.add_argument("--crf", type=float, help="libx265 CRF; only valid with --encoder libx265 (default: 20)")
     parser.add_argument("--vf", dest="video_filter", help="Override the complete ffmpeg -vf filter string")
@@ -270,7 +270,7 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
     mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
     mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
-    default_preset = "slow" if args.format_type == "vhs" else "medium"
+    default_preset = "slow"
     default_crf = 22.0 if args.format_type == "vhs" else 20.0
     preset = args.preset if args.preset is not None else (default_preset if args.encoder == "libx265" else None)
     crf = args.crf if args.crf is not None else (default_crf if args.encoder == "libx265" else None)
@@ -977,7 +977,7 @@ def build_ffmpeg_args(
             "-c:v",
             "libx265",
             "-preset",
-            cfg.preset or "medium",
+            cfg.preset or "slow",
             "-crf",
             f"{cfg.crf if cfg.crf is not None else 20:g}",
             "-profile:v",

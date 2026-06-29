@@ -219,7 +219,7 @@ class TestParseArgs(unittest.TestCase):
         with patch.object(sys, "argv", argv):
             cfg, _ = transcode3.parse_args()
 
-        self.assertEqual(cfg.preset, "medium")
+        self.assertEqual(cfg.preset, "slow")
         self.assertEqual(cfg.crf, 20.0)
 
     def test_parse_args_supports_libx265_preset_and_crf(self) -> None:
@@ -826,6 +826,31 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertNotIn("-spatial_aq", args)
         self.assertNotIn("-max_ref_frames", args)
         self.assertNotIn("-q:v", args)
+
+    def test_libx265_args_default_to_slow_preset_when_config_omits_preset(self) -> None:
+        paths = transcode3.Paths(
+            input_file=Path("/tmp/input.mkv"),
+            stem="input",
+            out_dir=Path("/tmp/Access"),
+            log_dir=Path("/tmp/Logs"),
+            output_file=Path("/tmp/Access/input.mp4"),
+            ffmpeg_log_file=Path("/tmp/Logs/input.log"),
+            command_log_file=Path("/tmp/Logs/input.cmd.log"),
+            csv_raw=Path("/tmp/Logs/input.csv"),
+            csv_with_play=Path("/tmp/Logs/input.with_play.csv"),
+            srt_file=Path("/tmp/Logs/input.srt"),
+            add_play_time_script=Path("/tmp/add_play_time_columns.py"),
+            create_srt_script=Path("/tmp/create_srt.py"),
+        )
+
+        args = transcode3.build_ffmpeg_args(
+            make_config(format_type="video8", encoder="libx265", preset=None, crf=20.0),
+            paths,
+            "null",
+            preview=False,
+        )
+
+        self.assertEqual(args[args.index("-preset") + 1], "slow")
 
     def test_ffmpeg_args_group_video_options_before_audio_options(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
