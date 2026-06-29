@@ -19,7 +19,10 @@ Examples:
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --size-from-diskutil
 
 Notes:
-  Use the whole disk, e.g. /dev/disk4, not /dev/disk4s1.
+  Use the whole disk, e.g. /dev/disk4, unless you want to force a specific
+  optical slice such as /dev/disk4s0.
+  If macOS mounts an optical filesystem slice such as /dev/disk4s0, the script
+  reads from the raw form of that slice instead of the whole disk node.
   A fresh fast pass follows ddrescue's optical-media examples and does not use -d.
   A resumed fast pass and the retry pass use -d by default; pass --no-direct
   to disable that. If -d is unavailable, the script retries without it.
@@ -75,6 +78,105 @@ diskutil_size_bytes_from_info() {
   done
 
   return 1
+}
+
+plist_raw_value() {
+  local key="$1"
+
+  plutil -extract "$key" raw -o - - 2>/dev/null
+}
+
+volume_name_from_device() {
+  local dev="$1"
+  local info name
+
+  info="$(diskutil info -plist "$dev" 2>/dev/null)" || return 1
+  name="$(plist_raw_value VolumeName <<< "$info" || true)"
+
+  if [[ -n "$name" && "$name" != "(null)" ]]; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+
+  return 1
+}
+
+recorded_names_from_diskutil() {
+  local disk_base="$1"
+  local list_plist count i ident line mount_dev dev name
+  local seen=$'\n'
+  local candidates=$'\n'
+
+  list_plist="$(diskutil list -plist "$WHOLE" 2>/dev/null || true)"
+
+  candidates+="$WHOLE"$'\n'
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^(/dev/${disk_base}s[0-9]+)[[:space:]]+on[[:space:]]+.+[[:space:]]+\( ]]; then
+      mount_dev="${BASH_REMATCH[1]}"
+      candidates+="$mount_dev"$'\n'
+    fi
+  done < <(mount)
+
+  if [[ -n "$list_plist" ]]; then
+    count="$(plist_raw_value AllDisksAndPartitions.0.Partitions <<< "$list_plist" || true)"
+    if [[ "$count" =~ ^[0-9]+$ ]]; then
+      for (( i = 0; i < count; i++ )); do
+        ident="$(plist_raw_value "AllDisksAndPartitions.0.Partitions.$i.DeviceIdentifier" <<< "$list_plist" || true)"
+        [[ -n "$ident" ]] || continue
+        candidates+="/dev/$ident"$'\n'
+      done
+    fi
+  fi
+
+  for dev in /dev/"$disk_base"s[0-9]*; do
+    [[ -e "$dev" ]] || continue
+    candidates+="$dev"$'\n'
+  done
+
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    [[ "$seen" != *$'\n'"$dev"$'\n'* ]] || continue
+    seen+="$dev"$'\n'
+
+    name="$(volume_name_from_device "$dev" || true)"
+    if [[ -n "$name" && "$seen" != *$'\n'"$name"$'\n'* ]]; then
+      printf '%s\n' "$name"
+      seen+="$name"$'\n'
+    fi
+  done <<< "$candidates"
+}
+
+mounted_optical_slice_for_disk() {
+  local disk_base="$1"
+  local line dev fstype
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^(/dev/${disk_base}s[0-9]+)[[:space:]]+on[[:space:]]+.+[[:space:]]+\(([^,]+) ]]; then
+      dev="${BASH_REMATCH[1]}"
+      fstype="${BASH_REMATCH[2]}"
+      case "$fstype" in
+        cd9660|udf)
+          printf '%s\n' "$dev"
+          return 0
+          ;;
+      esac
+    fi
+  done < <(mount)
+
+  return 1
+}
+
+raw_device_for() {
+  local dev="$1"
+  local dev_base
+
+  dev_base="$(basename "$dev")"
+  if [[ "$dev_base" == r* ]]; then
+    printf '/dev/%s\n' "$dev_base"
+  else
+    printf '/dev/r%s\n' "$dev_base"
+  fi
 }
 
 validate_dvd_size_bytes() {
@@ -167,15 +269,14 @@ command -v shasum >/dev/null 2>&1 || die "shasum not found"
 [[ "$RETRIES" =~ ^(-1|0|[1-9][0-9]*)$ ]] || die "--retries must be -1 or a non-negative integer, e.g. 3, 10, or -1"
 
 base="$(basename "$DEVICE")"
+device_base="${base#r}"
 
-if [[ "$base" =~ ^disk[0-9]+$ ]]; then
-  WHOLE="/dev/$base"
-  RAW="/dev/r$base"
-elif [[ "$base" =~ ^rdisk[0-9]+$ ]]; then
-  RAW="/dev/$base"
-  WHOLE="/dev/${base#r}"
+if [[ "$device_base" =~ ^(disk[0-9]+)(s[0-9]+)*$ ]]; then
+  whole_base="${BASH_REMATCH[1]}"
+  WHOLE="/dev/$whole_base"
+  REQUESTED_DEVICE="/dev/$device_base"
 else
-  die "Device must look like /dev/diskN or /dev/rdiskN, not a partition like /dev/diskNs1"
+  die "Device must look like /dev/diskN, /dev/rdiskN, or a slice like /dev/diskNsM"
 fi
 
 mkdir -p "$OUT_DIR" || die "Could not create output directory: $OUT_DIR"
@@ -187,7 +288,10 @@ RUNLOG="$OUT_DIR/$LABEL.ddrescue-output.txt"
 SHA="$OUT_DIR/$LABEL.iso.sha256"
 RESUMING=0
 SOURCE_INFO=""
-SOURCE_INFO_PLIST=""
+READ_DEVICE=""
+READ_INFO=""
+READ_INFO_PLIST=""
+RECORDED_NAMES=""
 SOURCE_SIZE=""
 SOURCE_SIZE_SOURCE=""
 DDRESCUE_SIZE_ARGS=()
@@ -201,16 +305,28 @@ if [[ ! -e "$ISO" && -e "$MAP" ]]; then
   die "Mapfile exists but ISO does not: $MAP. Choose a different --name or move the old mapfile."
 fi
 
+if [[ "$REQUESTED_DEVICE" != "$WHOLE" ]]; then
+  READ_DEVICE="$REQUESTED_DEVICE"
+else
+  READ_DEVICE="$(mounted_optical_slice_for_disk "$whole_base" || true)"
+  if [[ -z "$READ_DEVICE" ]]; then
+    READ_DEVICE="$WHOLE"
+  fi
+fi
+RAW="$(raw_device_for "$READ_DEVICE")"
+
 SOURCE_INFO="$(diskutil info "$WHOLE")" || die "Could not inspect $WHOLE"
-SOURCE_INFO_PLIST="$(diskutil info -plist "$WHOLE" 2>/dev/null || true)"
+READ_INFO="$(diskutil info "$READ_DEVICE")" || die "Could not inspect read source $READ_DEVICE"
+READ_INFO_PLIST="$(diskutil info -plist "$READ_DEVICE" 2>/dev/null || true)"
+RECORDED_NAMES="$(recorded_names_from_diskutil "$whole_base" || true)"
 
 if (( SIZE_FROM_DISKUTIL )); then
-  if [[ -n "$SOURCE_INFO_PLIST" ]] &&
-     SOURCE_SIZE="$(diskutil_size_bytes_from_plist <<< "$SOURCE_INFO_PLIST")"; then
-    SOURCE_SIZE_SOURCE="diskutil info -plist"
+  if [[ -n "$READ_INFO_PLIST" ]] &&
+     SOURCE_SIZE="$(diskutil_size_bytes_from_plist <<< "$READ_INFO_PLIST")"; then
+    SOURCE_SIZE_SOURCE="diskutil info -plist $READ_DEVICE"
   else
-    SOURCE_SIZE="$(diskutil_size_bytes_from_info <<< "$SOURCE_INFO")" || die "Could not parse Disk Size from diskutil info for $WHOLE"
-    SOURCE_SIZE_SOURCE="diskutil info"
+    SOURCE_SIZE="$(diskutil_size_bytes_from_info <<< "$READ_INFO")" || die "Could not parse Disk Size from diskutil info for $READ_DEVICE"
+    SOURCE_SIZE_SOURCE="diskutil info $READ_DEVICE"
   fi
 
   validate_dvd_size_bytes "$SOURCE_SIZE"
@@ -235,12 +351,23 @@ printf '%s\n' "$SOURCE_INFO"
 
 echo
 echo "=== Planned output ==="
-echo "Raw source: $RAW"
+echo "Read source: $RAW"
+if [[ "$READ_DEVICE" != "$WHOLE" ]]; then
+  echo "Read node:   $READ_DEVICE"
+fi
 echo "ISO:        $ISO"
 echo "Mapfile:    $MAP"
 echo "Run log:    $RUNLOG"
 echo "SHA-256:    $SHA"
 echo "Retries:    $RETRIES"
+if [[ -n "$RECORDED_NAMES" ]]; then
+  echo "Disc name(s):"
+  while IFS= read -r name; do
+    echo "  $name"
+  done <<< "$RECORDED_NAMES"
+else
+  echo "Disc name:   (not reported)"
+fi
 if [[ -n "$SOURCE_SIZE" ]]; then
   echo "Size limit: $SOURCE_SIZE bytes from $SOURCE_SIZE_SOURCE"
 else
@@ -266,12 +393,14 @@ fi
   echo
   echo "=== ripdvd run: $(date) ==="
   echo "WHOLE=$WHOLE"
+  echo "READ_DEVICE=$READ_DEVICE"
   echo "RAW=$RAW"
   echo "ISO=$ISO"
   echo "MAP=$MAP"
   echo "RETRIES=$RETRIES"
   echo "DIRECT=$DIRECT"
   echo "RESUMING=$RESUMING"
+  echo "RECORDED_NAMES=$RECORDED_NAMES"
   echo "SIZE_FROM_DISKUTIL=$SIZE_FROM_DISKUTIL"
   echo "SOURCE_SIZE=$SOURCE_SIZE"
   echo "SOURCE_SIZE_SOURCE=$SOURCE_SIZE_SOURCE"
