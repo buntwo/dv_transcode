@@ -10,20 +10,28 @@ usage() {
   cat <<'EOF'
 Usage:
   ripdvd.sh --list
-  ripdvd.sh --device /dev/diskN --name LABEL --out DIR [--retries 3] [--yes] [--no-eject] [--no-direct]
+  ripdvd.sh --device /dev/diskN --name LABEL --out DIR [--retries 3] [--yes] [--no-eject] [--no-direct] [--size-from-diskutil]
 
 Examples:
   ./ripdvd.sh --list
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips"
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --retries 10
+  ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --size-from-diskutil
 
 Notes:
   Use the whole disk, e.g. /dev/disk4, not /dev/disk4s1.
+  A fresh fast pass follows ddrescue's optical-media examples and does not use -d.
+  A resumed fast pass and the retry pass use -d by default; pass --no-direct
+  to disable that. If -d is unavailable, the script retries without it.
+  Pass --size-from-diskutil to bound ddrescue to diskutil's Disk Size when
+  the drive reports an implausible end position.
   The script will create:
     LABEL.iso
     LABEL.map
     LABEL.ddrescue-output.txt
-    LABEL.iso.sha256
+    LABEL.iso.sha256 (only after a complete rescue)
+  ddrescue may create LABEL.map.bak during a run. This script removes it
+  only after the current mapfile is complete.
 EOF
 }
 
@@ -38,6 +46,22 @@ find_first() {
   return 1
 }
 
+diskutil_size_bytes_from_info() {
+  local line size
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*(Disk|Total)[[:space:]]+Size: ]] &&
+       [[ "$line" =~ \(([0-9][0-9,]*)[[:space:]]+Bytes\) ]]; then
+      size="${BASH_REMATCH[1]//,/}"
+      [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+      printf '%s\n' "$size"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 DEVICE=""
 LABEL=""
 OUT_DIR="$PWD"
@@ -45,6 +69,7 @@ RETRIES=3
 ASSUME_YES=0
 EJECT=1
 DIRECT=1
+SIZE_FROM_DISKUTIL=0
 LIST_ONLY=0
 
 while [[ $# -gt 0 ]]; do
@@ -85,6 +110,10 @@ while [[ $# -gt 0 ]]; do
       DIRECT=0
       shift
       ;;
+    --size-from-diskutil)
+      SIZE_FROM_DISKUTIL=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -109,30 +138,32 @@ command -v shasum >/dev/null 2>&1 || die "shasum not found"
 [[ -n "$DEVICE" ]] || die "--device is required"
 [[ -n "$LABEL" ]] || die "--name is required"
 [[ "$LABEL" != */* ]] || die "--name must not contain /"
-[[ "$RETRIES" =~ ^-?[0-9]+$ ]] || die "--retries must be an integer, e.g. 3, 10, or -1"
+[[ "$RETRIES" =~ ^(-1|0|[1-9][0-9]*)$ ]] || die "--retries must be -1 or a non-negative integer, e.g. 3, 10, or -1"
 
 base="$(basename "$DEVICE")"
 
-case "$base" in
-  disk[0-9]*)
-    WHOLE="/dev/$base"
-    RAW="/dev/r$base"
-    ;;
-  rdisk[0-9]*)
-    RAW="/dev/$base"
-    WHOLE="/dev/${base#r}"
-    ;;
-  *)
-    die "Device must look like /dev/diskN or /dev/rdiskN, not a partition like /dev/diskNs1"
-    ;;
-esac
+if [[ "$base" =~ ^disk[0-9]+$ ]]; then
+  WHOLE="/dev/$base"
+  RAW="/dev/r$base"
+elif [[ "$base" =~ ^rdisk[0-9]+$ ]]; then
+  RAW="/dev/$base"
+  WHOLE="/dev/${base#r}"
+else
+  die "Device must look like /dev/diskN or /dev/rdiskN, not a partition like /dev/diskNs1"
+fi
 
 mkdir -p "$OUT_DIR" || die "Could not create output directory: $OUT_DIR"
 
 ISO="$OUT_DIR/$LABEL.iso"
 MAP="$OUT_DIR/$LABEL.map"
+MAP_BAK="$MAP.bak"
 RUNLOG="$OUT_DIR/$LABEL.ddrescue-output.txt"
 SHA="$OUT_DIR/$LABEL.iso.sha256"
+RESUMING=0
+SOURCE_INFO=""
+SOURCE_SIZE=""
+DDRESCUE_SIZE_ARGS=()
+DDRESCUELOG_SIZE_ARGS=()
 
 if [[ -e "$ISO" && ! -e "$MAP" ]]; then
   die "ISO exists but mapfile does not: $ISO. Choose a different --name or move the old file."
@@ -142,7 +173,20 @@ if [[ ! -e "$ISO" && -e "$MAP" ]]; then
   die "Mapfile exists but ISO does not: $MAP. Choose a different --name or move the old mapfile."
 fi
 
+SOURCE_INFO="$(diskutil info "$WHOLE")" || die "Could not inspect $WHOLE"
+
+if (( SIZE_FROM_DISKUTIL )); then
+  SOURCE_SIZE="$(diskutil_size_bytes_from_info <<< "$SOURCE_INFO")" || die "Could not parse Disk Size from diskutil info for $WHOLE"
+  DDRESCUE_SIZE_ARGS=("-s" "$SOURCE_SIZE")
+  DDRESCUELOG_SIZE_ARGS=("-s" "$SOURCE_SIZE")
+fi
+
+if [[ -e "$ISO" && -e "$MAP" ]] && "$DDRESCUELOG" -D "$MAP" >/dev/null 2>&1; then
+  die "Existing ISO and mapfile already describe a complete image: $ISO. Choose a different --name or move the old files."
+fi
+
 if [[ -e "$ISO" && -e "$MAP" ]]; then
+  RESUMING=1
   echo "Existing ISO and mapfile found. This run will resume/fill gaps:"
   echo "  $ISO"
   echo "  $MAP"
@@ -150,7 +194,7 @@ fi
 
 echo
 echo "=== Source device ==="
-diskutil info "$WHOLE" || die "Could not inspect $WHOLE"
+printf '%s\n' "$SOURCE_INFO"
 
 echo
 echo "=== Planned output ==="
@@ -160,6 +204,20 @@ echo "Mapfile:    $MAP"
 echo "Run log:    $RUNLOG"
 echo "SHA-256:    $SHA"
 echo "Retries:    $RETRIES"
+if [[ -n "$SOURCE_SIZE" ]]; then
+  echo "Size limit: $SOURCE_SIZE bytes from diskutil"
+else
+  echo "Size limit: none"
+fi
+if (( DIRECT )); then
+  if (( RESUMING )); then
+    echo "Direct I/O: resumed fast pass and retry pass, with automatic fallback"
+  else
+    echo "Direct I/O: retry pass only, with automatic fallback"
+  fi
+else
+  echo "Direct I/O: disabled"
+fi
 
 if (( ! ASSUME_YES )); then
   echo
@@ -175,18 +233,70 @@ fi
   echo "ISO=$ISO"
   echo "MAP=$MAP"
   echo "RETRIES=$RETRIES"
+  echo "DIRECT=$DIRECT"
+  echo "RESUMING=$RESUMING"
+  echo "SIZE_FROM_DISKUTIL=$SIZE_FROM_DISKUTIL"
+  echo "SOURCE_SIZE=$SOURCE_SIZE"
 } >> "$RUNLOG"
 
+LAST_RUN_OUTPUT=""
+
+cleanup_last_run_output() {
+  if [[ -n "$LAST_RUN_OUTPUT" && -e "$LAST_RUN_OUTPUT" ]]; then
+    rm -f -- "$LAST_RUN_OUTPUT"
+  fi
+}
+
+trap cleanup_last_run_output EXIT
+
 run_logged() {
+  local status
+
+  cleanup_last_run_output
+  LAST_RUN_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/ripdvd-command-output.XXXXXX")" || die "Could not create temporary command log"
+
   echo | tee -a "$RUNLOG"
   printf '>>> ' | tee -a "$RUNLOG"
   printf '%q ' "$@" | tee -a "$RUNLOG"
   echo | tee -a "$RUNLOG"
 
-  "$@" 2>&1 | tee -a "$RUNLOG"
-  local status=${PIPESTATUS[0]}
+  "$@" 2>&1 | tee -a "$RUNLOG" | tee "$LAST_RUN_OUTPUT"
+  status=${PIPESTATUS[0]}
 
   echo ">>> exit status: $status" | tee -a "$RUNLOG"
+  return "$status"
+}
+
+run_ddrescue() {
+  local arg status has_direct=0
+  local -a args=("$@")
+  local -a fallback_args=()
+
+  for arg in "${args[@]}"; do
+    if [[ "$arg" == "-d" || "$arg" == "--idirect" ]]; then
+      has_direct=1
+    else
+      fallback_args+=("$arg")
+    fi
+  done
+
+  run_logged "${SUDO[@]}" "$DDRESCUE" "${args[@]}"
+  status=$?
+
+  if (( status != 0 && has_direct )) &&
+     [[ -n "$LAST_RUN_OUTPUT" ]] &&
+     grep -qi "Direct disc access not available" "$LAST_RUN_OUTPUT"; then
+    {
+      echo
+      echo "WARNING: direct disc access is unavailable. Retrying this pass without -d."
+      echo "WARNING: direct disc access will stay disabled for the rest of this run."
+    } | tee -a "$RUNLOG"
+
+    DIRECT=0
+    run_logged "${SUDO[@]}" "$DDRESCUE" "${fallback_args[@]}"
+    status=$?
+  fi
+
   return "$status"
 }
 
@@ -194,12 +304,121 @@ print_status() {
   {
     echo
     echo "=== ddrescuelog status ==="
-    "$DDRESCUELOG" -t "$MAP"
+    "$DDRESCUELOG" -t "${DDRESCUELOG_SIZE_ARGS[@]}" "$MAP"
   } 2>&1 | tee -a "$RUNLOG"
 }
 
 is_done() {
-  "$DDRESCUELOG" -D "$MAP" >/dev/null 2>&1
+  "$DDRESCUELOG" -D "${DDRESCUELOG_SIZE_ARGS[@]}" "$MAP" >/dev/null 2>&1
+}
+
+file_size_bytes() {
+  local size
+
+  if size="$(stat -f %z "$1" 2>/dev/null)" && [[ "$size" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$size"
+    return 0
+  fi
+
+  if size="$(stat -c %s "$1" 2>/dev/null)" && [[ "$size" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$size"
+    return 0
+  fi
+
+  return 1
+}
+
+map_extent_bytes() {
+  local line status_seen=0 pos size status rest end max=0
+
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "$line" =~ [^[:space:]] ]] || continue
+
+    if (( ! status_seen )); then
+      status_seen=1
+      continue
+    fi
+
+    read -r pos size status rest <<< "$line"
+    [[ -n "${pos:-}" && -n "${size:-}" && -n "${status:-}" && -z "${rest:-}" ]] || return 1
+    [[ "$status" =~ ^[?*/+-]$ ]] || return 1
+
+    pos="${pos//_/}"
+    size="${size//_/}"
+    [[ "$pos" =~ ^(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*|0)$ ]] || return 1
+    [[ "$size" =~ ^(0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*|0)$ ]] || return 1
+
+    end=$((pos + size))
+    if (( end > max )); then
+      max=$end
+    fi
+  done < "$MAP"
+
+  (( status_seen )) || return 1
+  printf '%s\n' "$max"
+}
+
+verify_complete_iso() {
+  local expected_size iso_size
+
+  [[ -f "$ISO" ]] || die "ISO is missing or not a regular file: $ISO"
+
+  iso_size="$(file_size_bytes "$ISO")" || die "Could not determine ISO size: $ISO"
+  if [[ -n "$SOURCE_SIZE" ]]; then
+    expected_size="$SOURCE_SIZE"
+  else
+    expected_size="$(map_extent_bytes)" || die "Could not determine mapfile extent: $MAP"
+  fi
+
+  if [[ -n "$SOURCE_SIZE" && "$iso_size" =~ ^[0-9]+$ && "$expected_size" =~ ^[0-9]+$ ]] &&
+     (( iso_size > expected_size )); then
+    command -v truncate >/dev/null 2>&1 || die "ISO is larger than diskutil size ($iso_size > $expected_size bytes), but truncate was not found: $ISO"
+    {
+      echo
+      echo "Truncating ISO from $iso_size bytes to diskutil size $expected_size bytes: $ISO"
+    } | tee -a "$RUNLOG"
+    truncate -s "$expected_size" "$ISO" || die "Failed to truncate ISO to diskutil size: $ISO"
+    iso_size="$(file_size_bytes "$ISO")" || die "Could not determine ISO size after truncating: $ISO"
+  fi
+
+  if [[ "$iso_size" != "$expected_size" ]]; then
+    die "ISO size ($iso_size bytes) does not match expected complete size ($expected_size bytes): $ISO"
+  fi
+}
+
+cleanup_map_backup() {
+  [[ -e "$MAP_BAK" ]] || return 0
+
+  if ! is_done; then
+    {
+      echo
+      echo "Keeping mapfile backup because the current mapfile is not complete: $MAP_BAK"
+    } | tee -a "$RUNLOG"
+    return 0
+  fi
+
+  {
+    echo
+    echo "Deleting completed-run mapfile backup: $MAP_BAK"
+  } | tee -a "$RUNLOG"
+
+  if ! rm -f -- "$MAP_BAK"; then
+    echo "WARNING: failed to delete mapfile backup: $MAP_BAK" | tee -a "$RUNLOG"
+  fi
+}
+
+cleanup_incomplete_sha() {
+  [[ -e "$SHA" ]] || return 0
+
+  {
+    echo
+    echo "Deleting SHA-256 file because the image is incomplete: $SHA"
+  } | tee -a "$RUNLOG"
+
+  if ! rm -f -- "$SHA"; then
+    echo "WARNING: failed to delete SHA-256 file for incomplete image: $SHA" | tee -a "$RUNLOG"
+  fi
 }
 
 SUDO=()
@@ -213,40 +432,50 @@ diskutil unmountDisk "$WHOLE" || true
 
 echo
 echo "=== Fast pass: copy easy sectors first ==="
-run_logged "${SUDO[@]}" "$DDRESCUE" -n -b2048 "$RAW" "$ISO" "$MAP" || true
+fast_args=("${DDRESCUE_SIZE_ARGS[@]}")
+if (( DIRECT && RESUMING )); then
+  fast_args+=("-d")
+fi
+fast_args+=("-n" "-b2048" "$RAW" "$ISO" "$MAP")
+
+run_ddrescue "${fast_args[@]}" || true
 print_status
 
 COMPLETE=0
 
 if is_done; then
   COMPLETE=1
+  verify_complete_iso
   echo
   echo "Fast pass completed the image. No retry pass needed."
 else
   echo
   echo "Mapfile is not complete. Running retry pass..."
 
-  retry_args=()
+  retry_args=("${DDRESCUE_SIZE_ARGS[@]}")
   if (( DIRECT )); then
     retry_args+=("-d")
   fi
   retry_args+=("-r${RETRIES}" "-b2048" "$RAW" "$ISO" "$MAP")
 
-  run_logged "${SUDO[@]}" "$DDRESCUE" "${retry_args[@]}" || true
+  run_ddrescue "${retry_args[@]}" || true
   print_status
 
   if is_done; then
     COMPLETE=1
+    verify_complete_iso
   fi
 fi
 
-echo
-echo "Writing SHA-256..."
-if SHALINE="$(shasum -a 256 "$ISO")"; then
-  echo "$SHALINE" | tee "$SHA" | tee -a "$RUNLOG" >/dev/null
-  echo "$SHALINE"
-else
-  die "Failed to compute SHA-256"
+if (( COMPLETE )); then
+  echo
+  echo "Writing SHA-256..."
+  if SHALINE="$(shasum -a 256 "$ISO")"; then
+    echo "$SHALINE" | tee "$SHA" | tee -a "$RUNLOG" >/dev/null
+    echo "$SHALINE"
+  else
+    die "Failed to compute SHA-256"
+  fi
 fi
 
 if (( EJECT )); then
@@ -257,12 +486,14 @@ fi
 
 echo
 if (( COMPLETE )); then
+  cleanup_map_backup
   echo "DONE: complete image rescued."
   echo "ISO: $ISO"
   echo "Map: $MAP"
   echo "SHA: $SHA"
   exit 0
 else
+  cleanup_incomplete_sha
   echo "WARNING: image is incomplete. Keep the ISO and mapfile; you can retry later."
   echo "Retry later with the same --name and --out to continue from the mapfile."
   echo "ISO: $ISO"
