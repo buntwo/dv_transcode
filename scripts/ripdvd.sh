@@ -10,19 +10,23 @@ usage() {
   cat <<'EOF'
 Usage:
   ripdvd.sh --list
-  ripdvd.sh --device /dev/diskN --name LABEL --out DIR [--retries 3] [--yes] [--no-eject] [--no-direct] [--size-from-diskutil]
+  ripdvd.sh --device /dev/diskN --name LABEL --out DIR [--retries 3] [--yes] [--no-eject] [--no-direct] [--raw-read] [--auto-slice] [--size-from-diskutil]
 
 Examples:
   ./ripdvd.sh --list
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips"
+  ./ripdvd.sh --device /dev/rdisk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips"
+  ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --raw-read
+  ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --auto-slice --raw-read
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --retries 10
   ./ripdvd.sh --device /dev/disk4 --name "2001-08_trip_disc01" --out "$HOME/DVD_Rips" --size-from-diskutil
 
 Notes:
-  Use the whole disk, e.g. /dev/disk4, unless you want to force a specific
-  optical slice such as /dev/disk4s0.
-  If macOS mounts an optical filesystem slice such as /dev/disk4s0, the script
-  reads from the raw form of that slice instead of the whole disk node.
+  The script reads from the exact --device path by default. Pass /dev/rdiskN
+  yourself if you want the raw character device.
+  Pass --raw-read to convert the selected read source to /dev/rdisk*.
+  Pass --auto-slice to read a mounted optical filesystem slice such as
+  /dev/disk4s0 instead of the whole disk node when --device is /dev/disk4.
   A fresh fast pass follows ddrescue's optical-media examples and does not use -d.
   A resumed fast pass and the retry pass use -d by default; pass --no-direct
   to disable that. If -d is unavailable, the script retries without it.
@@ -197,6 +201,8 @@ RETRIES=3
 ASSUME_YES=0
 EJECT=1
 DIRECT=1
+RAW_READ=0
+AUTO_SLICE=0
 SIZE_FROM_DISKUTIL=0
 LIST_ONLY=0
 
@@ -238,6 +244,14 @@ while [[ $# -gt 0 ]]; do
       DIRECT=0
       shift
       ;;
+    --raw-read)
+      RAW_READ=1
+      shift
+      ;;
+    --auto-slice)
+      AUTO_SLICE=1
+      shift
+      ;;
     --size-from-diskutil)
       SIZE_FROM_DISKUTIL=1
       shift
@@ -274,7 +288,7 @@ device_base="${base#r}"
 if [[ "$device_base" =~ ^(disk[0-9]+)(s[0-9]+)*$ ]]; then
   whole_base="${BASH_REMATCH[1]}"
   WHOLE="/dev/$whole_base"
-  REQUESTED_DEVICE="/dev/$device_base"
+  REQUESTED_DEVICE="/dev/$base"
 else
   die "Device must look like /dev/diskN, /dev/rdiskN, or a slice like /dev/diskNsM"
 fi
@@ -305,15 +319,18 @@ if [[ ! -e "$ISO" && -e "$MAP" ]]; then
   die "Mapfile exists but ISO does not: $MAP. Choose a different --name or move the old mapfile."
 fi
 
-if [[ "$REQUESTED_DEVICE" != "$WHOLE" ]]; then
-  READ_DEVICE="$REQUESTED_DEVICE"
-else
+READ_DEVICE="$REQUESTED_DEVICE"
+if (( AUTO_SLICE )) && [[ "$device_base" == "$whole_base" ]]; then
   READ_DEVICE="$(mounted_optical_slice_for_disk "$whole_base" || true)"
   if [[ -z "$READ_DEVICE" ]]; then
-    READ_DEVICE="$WHOLE"
+    READ_DEVICE="$REQUESTED_DEVICE"
   fi
 fi
-RAW="$(raw_device_for "$READ_DEVICE")"
+if (( RAW_READ )); then
+  RAW="$(raw_device_for "$READ_DEVICE")"
+else
+  RAW="$READ_DEVICE"
+fi
 
 SOURCE_INFO="$(diskutil info "$WHOLE")" || die "Could not inspect $WHOLE"
 READ_INFO="$(diskutil info "$READ_DEVICE")" || die "Could not inspect read source $READ_DEVICE"
@@ -352,9 +369,8 @@ printf '%s\n' "$SOURCE_INFO"
 echo
 echo "=== Planned output ==="
 echo "Read source: $RAW"
-if [[ "$READ_DEVICE" != "$WHOLE" ]]; then
-  echo "Read node:   $READ_DEVICE"
-fi
+echo "Requested:   $REQUESTED_DEVICE"
+echo "Read node:   $READ_DEVICE"
 echo "ISO:        $ISO"
 echo "Mapfile:    $MAP"
 echo "Run log:    $RUNLOG"
@@ -372,6 +388,16 @@ if [[ -n "$SOURCE_SIZE" ]]; then
   echo "Size limit: $SOURCE_SIZE bytes from $SOURCE_SIZE_SOURCE"
 else
   echo "Size limit: none"
+fi
+if (( AUTO_SLICE )); then
+  echo "Auto-slice: enabled"
+else
+  echo "Auto-slice: disabled"
+fi
+if (( RAW_READ )); then
+  echo "Raw read:   enabled"
+else
+  echo "Raw read:   disabled"
 fi
 if (( DIRECT )); then
   if (( RESUMING )); then
@@ -393,12 +419,15 @@ fi
   echo
   echo "=== ripdvd run: $(date) ==="
   echo "WHOLE=$WHOLE"
+  echo "REQUESTED_DEVICE=$REQUESTED_DEVICE"
   echo "READ_DEVICE=$READ_DEVICE"
   echo "RAW=$RAW"
   echo "ISO=$ISO"
   echo "MAP=$MAP"
   echo "RETRIES=$RETRIES"
   echo "DIRECT=$DIRECT"
+  echo "RAW_READ=$RAW_READ"
+  echo "AUTO_SLICE=$AUTO_SLICE"
   echo "RESUMING=$RESUMING"
   echo "RECORDED_NAMES=$RECORDED_NAMES"
   echo "SIZE_FROM_DISKUTIL=$SIZE_FROM_DISKUTIL"
