@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import plistlib
 from pathlib import Path
 
 import pytest
 
 from iso_tool import (
+    AttachedVolume,
     ToolError,
     copy_contents,
+    extract_image_files,
     mounted_path_is_video_dvd,
     parse_attached_dev_entries,
     parse_attached_volumes,
@@ -124,6 +127,39 @@ def test_copy_contents_allows_overwrite_when_requested(tmp_path: Path) -> None:
     (source / "photo.jpg").write_text("new", encoding="utf-8")
     (target / "photo.jpg").write_text("old", encoding="utf-8")
 
-    copy_contents(source, target, overwrite=True)
+    assert copy_contents(source, target, overwrite=True) == 1
 
     assert (target / "photo.jpg").read_text(encoding="utf-8") == "new"
+
+
+def test_copy_contents_counts_nested_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    (source / "nested").mkdir(parents=True)
+    (source / "photo.jpg").write_bytes(b"photo")
+    (source / "nested" / "clip.mov").write_bytes(b"clip")
+
+    assert copy_contents(source, target, overwrite=False) == 2
+
+
+def test_extract_image_files_counts_all_mounted_volumes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image = tmp_path / "disc.iso"
+    mount_a = tmp_path / "VOL_A"
+    mount_b = tmp_path / "VOL_B"
+    output = tmp_path / "out"
+    mount_a.mkdir()
+    mount_b.mkdir()
+    (mount_a / "one.txt").write_text("one", encoding="utf-8")
+    (mount_b / "two.txt").write_text("two", encoding="utf-8")
+    (mount_b / "three.txt").write_text("three", encoding="utf-8")
+
+    @contextmanager
+    def fake_attached_image(_image: Path):
+        yield [
+            AttachedVolume("/dev/disk1s1", mount_a),
+            AttachedVolume("/dev/disk1s2", mount_b),
+        ]
+
+    monkeypatch.setattr("iso_tool.attached_image", fake_attached_image)
+
+    assert extract_image_files(image, output, overwrite=False) == 3

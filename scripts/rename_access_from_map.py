@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from utils import display_width
+from utils import pad_display
 
 REQUIRED_COLUMNS = ("original_stem", "renamed_stem")
 
@@ -97,19 +98,6 @@ def display_path(path: Path, root: Path) -> str:
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
-
-
-def display_width(text: str) -> int:
-    width = 0
-    for char in text:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
-    return width
-
-
-def pad_display(text: str, width: int) -> str:
-    return text + " " * max(0, width - display_width(text))
 
 
 def padded_sequence_number(sequence_number: int) -> str:

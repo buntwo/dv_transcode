@@ -675,8 +675,8 @@ fi
 
 if (( EJECT )); then
   echo
-  echo "Ejecting $WHOLE..."
-  diskutil eject "$WHOLE" || true
+  echo "Physically ejecting optical media..."
+  drutil tray eject || true
 fi
 
 echo

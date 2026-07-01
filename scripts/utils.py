@@ -2,7 +2,21 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import unicodedata
 from pathlib import Path
+
+
+def display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def pad_display(text: str, width: int) -> str:
+    return text + " " * max(0, width - display_width(text))
 
 
 def format_progress(current: int, total: int, label: str | Path, width: int = 20) -> str:

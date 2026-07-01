@@ -126,8 +126,9 @@ def ensure_extract_target_available(source: Path, target: Path, overwrite: bool)
         raise ToolError(f"Cannot copy directory over non-directory: {target}")
 
 
-def copy_contents(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
+def copy_contents(source_dir: Path, output_dir: Path, overwrite: bool) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
+    file_count = 0
 
     for current_root, dirnames, filenames in os.walk(source_dir):
         dirnames.sort()
@@ -148,6 +149,9 @@ def copy_contents(source_dir: Path, output_dir: Path, overwrite: bool) -> None:
             target = target_root / filename
             ensure_extract_target_available(source, target, overwrite)
             shutil.copy2(source, target, follow_symlinks=False)
+            file_count += 1
+
+    return file_count
 
 
 def volume_output_dir(base_output_dir: Path, volumes: list[AttachedVolume], volume: AttachedVolume) -> Path:
@@ -158,10 +162,12 @@ def volume_output_dir(base_output_dir: Path, volumes: list[AttachedVolume], volu
     return base_output_dir / volume_name
 
 
-def extract_image_files(image: Path, output_dir: Path, overwrite: bool = False) -> None:
+def extract_image_files(image: Path, output_dir: Path, overwrite: bool = False) -> int:
+    file_count = 0
     with attached_image(image) as volumes:
         for volume in volumes:
-            copy_contents(volume.mount_point, volume_output_dir(output_dir, volumes, volume), overwrite=overwrite)
+            file_count += copy_contents(volume.mount_point, volume_output_dir(output_dir, volumes, volume), overwrite=overwrite)
+    return file_count
 
 
 def child_by_name_casefold(directory: Path, name: str) -> Path | None:
