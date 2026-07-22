@@ -28,6 +28,12 @@ from transcode_naming import build_access_output_name
 from utils import sibling_dir_for_path
 
 DEFAULT_VALIDATE_DURATION_TOLERANCE = 0.17  # 5 NTSC DV frames at 29.97 fps.
+DEFAULT_X265_PRESET = "slow"
+DEFAULT_X265_CRF = {
+    "video8": 22.0,
+    "digital8": 22.0,
+    "vhs": 22.0,
+}
 SCALE_FILTER = "scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int"
 VHS_COLOR_CORRECTION_FILTER = (
     "split=2[orig][work];"
@@ -184,7 +190,17 @@ def default_mask_bottom(format_type: str) -> int:
 
 def default_denoise(format_type: str) -> str:
     """Return the default denoise preset for a source format."""
-    return "verylight" if format_type == "vhs" else "light"
+    return "verylight"
+
+
+def default_encoder(format_type: str) -> str:
+    """Return the default encoder for a source format."""
+    return "libx265"
+
+
+def default_x265_crf(format_type: str) -> float:
+    """Return the default libx265 CRF for a source format."""
+    return DEFAULT_X265_CRF[format_type]
 
 
 def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
@@ -198,13 +214,21 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
     parser.add_argument("--q", type=int, default=70)
     parser.add_argument("--codec", choices=["h264", "hevc"], default="hevc")
-    parser.add_argument("--encoder", choices=["videotoolbox", "libx265"], default="videotoolbox")
+    parser.add_argument(
+        "--encoder",
+        choices=["videotoolbox", "libx265"],
+        help="Video encoder (default: libx265)",
+    )
     parser.add_argument(
         "--preset",
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
-        help="libx265 preset; only valid with --encoder libx265 (default: slow)",
+        help=f"libx265 preset; only valid with --encoder libx265 (default: {DEFAULT_X265_PRESET})",
     )
-    parser.add_argument("--crf", type=float, help="libx265 CRF; only valid with --encoder libx265 (default: 20)")
+    parser.add_argument(
+        "--crf",
+        type=float,
+        help="libx265 CRF; only valid with --encoder libx265 (default: 22)",
+    )
     parser.add_argument("--vf", dest="video_filter", help="Override the complete ffmpeg -vf filter string")
     parser.add_argument("--lut", type=Path, help="Add a lut3d stage using this .cube file")
     parser.add_argument(
@@ -240,7 +264,8 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
 
 def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Validate cross-option constraints for shared transcode arguments."""
-    if args.encoder == "videotoolbox":
+    encoder = args.encoder or default_encoder(args.format_type)
+    if encoder == "videotoolbox":
         if args.preset is not None:
             parser.error("--preset is only valid with --encoder libx265")
         if args.crf is not None:
@@ -270,10 +295,13 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
     mask_top = args.mask_top if args.mask_top is not None else default_mask_top(args.format_type)
     mask_bottom = args.mask_bottom if args.mask_bottom is not None else default_mask_bottom(args.format_type)
     denoise = args.denoise if args.denoise is not None else default_denoise(args.format_type)
-    default_preset = "slow"
-    default_crf = 22.0 if args.format_type == "vhs" else 20.0
-    preset = args.preset if args.preset is not None else (default_preset if args.encoder == "libx265" else None)
-    crf = args.crf if args.crf is not None else (default_crf if args.encoder == "libx265" else None)
+    encoder = args.encoder or default_encoder(args.format_type)
+    preset = args.preset if args.preset is not None else (
+        DEFAULT_X265_PRESET if encoder == "libx265" else None
+    )
+    crf = args.crf if args.crf is not None else (
+        default_x265_crf(args.format_type) if encoder == "libx265" else None
+    )
 
     return Config(
         mode=args.mode,
@@ -287,7 +315,7 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         denoise=denoise,
         q=args.q,
         codec=args.codec,
-        encoder=args.encoder,
+        encoder=encoder,
         preset=preset,
         crf=crf,
         video_filter=args.video_filter,
@@ -977,9 +1005,9 @@ def build_ffmpeg_args(
             "-c:v",
             "libx265",
             "-preset",
-            cfg.preset or "slow",
+            cfg.preset or DEFAULT_X265_PRESET,
             "-crf",
-            f"{cfg.crf if cfg.crf is not None else 20:g}",
+            f"{cfg.crf if cfg.crf is not None else default_x265_crf(cfg.format_type):g}",
             "-profile:v",
             "main10",
             "-pix_fmt",
@@ -1214,6 +1242,11 @@ def print_summary(
     if cfg.start or cfg.end:
         print(f"Range: {cfg.start or 'beginning'} -> {cfg.end or 'end'}")
     print(f"Codec: {cfg.codec}")
+    print(f"Encoder: {cfg.encoder}")
+    if cfg.encoder == "libx265":
+        print(f"x265 preset: {cfg.preset or DEFAULT_X265_PRESET}")
+        crf = cfg.crf if cfg.crf is not None else default_x265_crf(cfg.format_type)
+        print(f"x265 CRF: {crf:g}")
     print(f"Denoise preset: {cfg.denoise}")
     print(f"Top mask rows: {cfg.mask_top}")
     print(f"Bottom mask rows: {cfg.mask_bottom}")
@@ -1267,10 +1300,15 @@ def write_command_log(
         f"Mode: {cfg.mode}",
         f"Format: {cfg.format_type}",
         f"Codec: {cfg.codec}",
+        f"Encoder: {cfg.encoder}",
         f"Denoise: {cfg.denoise}",
         f"Mask top: {cfg.mask_top}",
         f"Mask bottom: {cfg.mask_bottom}",
     ]
+    if cfg.encoder == "libx265":
+        lines.append(f"x265 preset: {cfg.preset or DEFAULT_X265_PRESET}")
+        crf = cfg.crf if cfg.crf is not None else default_x265_crf(cfg.format_type)
+        lines.append(f"x265 CRF: {crf:g}")
     if cfg.format_type == "vhs":
         lines.append(f"VHS audio notch: {cfg.vhs_notch}")
         lines.append(f"VHS color correction: {'on' if cfg.vhs_color_correct else 'off'}")

@@ -143,13 +143,21 @@ scripts/vhs_workflow/transcode_vhs_color_split_normalize_audio.sh \
 This wrapper prints the full normalization plan before asking for confirmation. The underlying normalizer requires exact stem matching: `Access_crf22/Foo.mp4` pairs with `Access_crf22_audio/Foo.flac`. It writes normalized MP4s plus `metadata.csv` in the output directory.
 
 **Video8 vs Digital8**
+Shared encoding defaults:
+
+- All three formats default to `libx265` using the `slow` preset.
+- All three formats default to CRF `22`.
+- libx265 output is 10-bit HEVC (`yuv420p10le`) with the `hvc1` tag for Apple compatibility.
+- Lower CRF values mean higher quality and larger files; use `--crf 20` for a more conservative derivative when needed.
+- Use `--encoder videotoolbox` for the previous hardware-accelerated path. Its default quality value remains `--q 70`.
+
 `video8` flow:
 
 - Input DV is transcoded directly.
 - No DVRescue CSV extraction or subtitle generation happens.
 - Default bottom crop is `7` rows.
 - Default bottom pad is the same as the crop value, so the script restores the cropped height with black padding.
-- Default denoise preset is `light`.
+- Default denoise preset is `verylight`.
 
 `digital8` flow:
 
@@ -179,12 +187,14 @@ Digital8 validation behavior:
   - `analyze-audio`: write/reuse audio-analysis JSON and skip video output
 - Important defaults:
   - `--codec hevc`
-  - `--denoise light`
+  - `video8` and `digital8`: `--encoder libx265 --preset slow --crf 22`
+  - `vhs`: `--encoder libx265 --preset slow --crf 22`
+  - `--denoise verylight`
   - `--deint-mode send_field`
-  - `--q 70`
-  - `video8` default `--crop-bottom 7`
-  - `digital8` default `--crop-bottom 0`
-  - `--pad-bottom` defaults to the crop value
+  - VideoToolbox `--q 70`
+  - `video8` default `--mask-bottom 7`
+  - `digital8` default `--mask-bottom 0`
+  - masked rows are restored with black padding after denoise/color processing
   - duration validation enabled by default after `--mode transcode`
   - duration tolerance default `0.17` seconds, which is 5 NTSC DV frames at 29.97 fps
 - Audio mapping:
@@ -315,6 +325,14 @@ Plain Video8 transcode:
 
 ```bash
 python3 scripts/transcode3.py --mode transcode --format video8 \
+  Originals/Set\ 2/1\ 2001/out.dv
+```
+
+Use the faster VideoToolbox encoder instead:
+
+```bash
+python3 scripts/transcode3.py --mode transcode --format video8 \
+  --encoder videotoolbox \
   Originals/Set\ 2/1\ 2001/out.dv
 ```
 

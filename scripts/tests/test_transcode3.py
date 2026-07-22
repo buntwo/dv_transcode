@@ -185,9 +185,9 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.mask_bottom, 12)
         self.assertEqual(cfg.vhs_notch, "auto")
         self.assertEqual(cfg.audio_channel, "keep")
-        self.assertEqual(cfg.encoder, "videotoolbox")
-        self.assertIsNone(cfg.preset)
-        self.assertIsNone(cfg.crf)
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 22.0)
         self.assertEqual(input_files, [Path("Originals/set/tape/out.mkv")])
 
     def test_parse_args_supports_libx265_defaults(self) -> None:
@@ -207,20 +207,51 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.preset, "slow")
         self.assertEqual(cfg.crf, 22.0)
 
-    def test_parse_args_supports_non_vhs_libx265_defaults(self) -> None:
+    def test_parse_args_uses_video8_libx265_defaults(self) -> None:
         argv = [
             "transcode3.py",
             "--format",
             "video8",
-            "--encoder",
-            "libx265",
             "Originals/set/tape/out.dv",
         ]
         with patch.object(sys, "argv", argv):
             cfg, _ = transcode3.parse_args()
 
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.denoise, "verylight")
         self.assertEqual(cfg.preset, "slow")
-        self.assertEqual(cfg.crf, 20.0)
+        self.assertEqual(cfg.crf, 22.0)
+
+    def test_parse_args_uses_digital8_libx265_defaults(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "digital8",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.denoise, "verylight")
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 22.0)
+
+    def test_parse_args_allows_video8_videotoolbox_override(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--encoder",
+            "videotoolbox",
+            "Originals/set/tape/out.dv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.encoder, "videotoolbox")
+        self.assertIsNone(cfg.preset)
+        self.assertIsNone(cfg.crf)
 
     def test_parse_args_supports_libx265_preset_and_crf(self) -> None:
         argv = [
@@ -246,6 +277,8 @@ class TestParseArgs(unittest.TestCase):
             "transcode3.py",
             "--format",
             "vhs",
+            "--encoder",
+            "videotoolbox",
             "--preset",
             "slow",
             "Originals/set/tape/out.mkv",
@@ -1354,6 +1387,9 @@ class TestTranscodeAccess(unittest.TestCase):
         self.assertEqual(cfg.mask_bottom, 12)
         self.assertEqual(cfg.vhs_notch, "auto")
         self.assertEqual(cfg.audio_channel, "keep")
+        self.assertEqual(cfg.encoder, "libx265")
+        self.assertEqual(cfg.preset, "slow")
+        self.assertEqual(cfg.crf, 22.0)
         self.assertEqual(input_files, [Path("masters/tape/08.mkv")])
 
     def test_access_parse_args_can_override_vhs_mask_defaults(self) -> None:
@@ -1518,6 +1554,8 @@ class TestTranscodeAccess(unittest.TestCase):
             "transcode_access.py",
             "--format",
             "vhs",
+            "--encoder",
+            "videotoolbox",
             "--crf",
             "20",
             "masters/tape/08.mkv",
