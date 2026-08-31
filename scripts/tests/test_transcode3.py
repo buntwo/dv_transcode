@@ -23,6 +23,8 @@ def make_config(**overrides) -> transcode3.Config:
         "format_type": "video8",
         "start": None,
         "end": None,
+        "crop_top": 0,
+        "crop_bottom": 0,
         "mask_top": 0,
         "mask_bottom": 0,
         "denoise": "off",
@@ -220,7 +222,7 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.encoder, "libx265")
         self.assertEqual(cfg.denoise, "verylight")
         self.assertEqual(cfg.preset, "slow")
-        self.assertEqual(cfg.crf, 22.0)
+        self.assertEqual(cfg.crf, 20.0)
 
     def test_parse_args_uses_digital8_libx265_defaults(self) -> None:
         argv = [
@@ -235,7 +237,50 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.encoder, "libx265")
         self.assertEqual(cfg.denoise, "verylight")
         self.assertEqual(cfg.preset, "slow")
-        self.assertEqual(cfg.crf, 22.0)
+        self.assertEqual(cfg.crf, 20.0)
+
+    def test_parse_args_supports_permanent_crop(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--crop-top",
+            "5",
+            "--crop-bottom",
+            "1",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.crop_top, 5)
+        self.assertEqual(cfg.crop_bottom, 1)
+
+    def test_parse_args_rejects_negative_permanent_crop(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--crop-top",
+            "-1",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
+
+    def test_parse_args_rejects_permanent_crop_with_custom_filter(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--crop-top",
+            "5",
+            "--vf",
+            "null",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
 
     def test_parse_args_allows_video8_videotoolbox_override(self) -> None:
         argv = [
@@ -712,6 +757,22 @@ class TestGenerateDigital8Sidecars(unittest.TestCase):
 
 
 class TestFiltersAndArgs(unittest.TestCase):
+    def test_permanent_crop_precedes_mask_and_preserves_display_aspect(self) -> None:
+        paths = make_paths(Path("/tmp"))
+        cfg = make_config(crop_top=5, crop_bottom=1, mask_bottom=7, denoise="verylight")
+
+        vf = transcode3.build_vf(cfg, paths)
+
+        permanent_crop = "crop=w=iw:h=ih-6:x=0:y=5:keep_aspect=1:exact=1"
+        mask_crop = "crop=w=iw:h=ih-7:x=0:y=0"
+        denoise = "hqdn3d=1.5:1.125:2.25:1.6875"
+        mask_pad = "pad=w=iw:h=ih+7:x=0:y=0:color=black"
+        self.assertIn(permanent_crop, vf)
+        self.assertLess(vf.index("bwdif="), vf.index(permanent_crop))
+        self.assertLess(vf.index(permanent_crop), vf.index(mask_crop))
+        self.assertLess(vf.index(mask_crop), vf.index(denoise))
+        self.assertLess(vf.index(denoise), vf.index(mask_pad))
+
     def test_limited_range_tagging_omits_hardcoded_smpte_color_metadata(self) -> None:
         paths = transcode3.Paths(
             input_file=Path("/tmp/input.mkv"),

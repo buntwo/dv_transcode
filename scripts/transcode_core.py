@@ -30,8 +30,8 @@ from utils import sibling_dir_for_path
 DEFAULT_VALIDATE_DURATION_TOLERANCE = 0.17  # 5 NTSC DV frames at 29.97 fps.
 DEFAULT_X265_PRESET = "slow"
 DEFAULT_X265_CRF = {
-    "video8": 22.0,
-    "digital8": 22.0,
+    "video8": 20.0,
+    "digital8": 20.0,
     "vhs": 22.0,
 }
 SCALE_FILTER = "scale=trunc(ih*dar/2)*2:ih:flags=lanczos+accurate_rnd+full_chroma_int"
@@ -71,6 +71,8 @@ class Config:
     originals_dirname: str
     access_dirname: str
     logs_dirname: str
+    crop_top: int = 0
+    crop_bottom: int = 0
     vhs_notch: str = "auto"
     audio_channel: str = "keep"
     audio_gain: float | None = None
@@ -209,6 +211,8 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--format", dest="format_type", choices=["video8", "digital8", "vhs"], required=True)
     parser.add_argument("--start")
     parser.add_argument("--end")
+    parser.add_argument("--crop-top", type=int, default=0, help="Permanently remove rows from the top")
+    parser.add_argument("--crop-bottom", type=int, default=0, help="Permanently remove rows from the bottom")
     parser.add_argument("--mask-top", type=int)
     parser.add_argument("--mask-bottom", type=int)
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
@@ -227,7 +231,10 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--crf",
         type=float,
-        help="libx265 CRF; only valid with --encoder libx265 (default: 22)",
+        help=(
+            "libx265 CRF; only valid with --encoder libx265 "
+            "(default: 20 for video8/digital8, 22 for vhs)"
+        ),
     )
     parser.add_argument("--vf", dest="video_filter", help="Override the complete ffmpeg -vf filter string")
     parser.add_argument("--lut", type=Path, help="Add a lut3d stage using this .cube file")
@@ -274,6 +281,12 @@ def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argpar
         parser.error("--encoder libx265 requires --codec hevc")
     if args.video_filter is not None and not args.video_filter.strip():
         parser.error("--vf cannot be blank")
+    if args.crop_top < 0:
+        parser.error("--crop-top cannot be negative")
+    if args.crop_bottom < 0:
+        parser.error("--crop-bottom cannot be negative")
+    if args.video_filter is not None and (args.crop_top or args.crop_bottom):
+        parser.error("--crop-top/--crop-bottom cannot be combined with --vf; include crop in --vf")
     if args.video_filter is not None and args.lut is not None:
         parser.error("--lut cannot be combined with --vf; include lut3d in --vf")
     if args.video_filter is not None and args.vhs_color_correct:
@@ -330,6 +343,8 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         originals_dirname=getattr(args, "originals_dirname", "Originals"),
         access_dirname=args.access_dirname,
         logs_dirname=args.logs_dirname,
+        crop_top=args.crop_top,
+        crop_bottom=args.crop_bottom,
         vhs_notch=args.vhs_notch,
         audio_channel=args.audio_channel,
         audio_gain=args.audio_gain,
@@ -920,6 +935,17 @@ def build_crop_filter(mask_top: int, mask_bottom: int) -> str | None:
     return f"crop=w=iw:h=ih-{masked_rows}:x=0:y={mask_top}"
 
 
+def build_permanent_crop_filter(crop_top: int, crop_bottom: int) -> str | None:
+    """Build a permanent crop that preserves the input display aspect ratio."""
+    cropped_rows = crop_top + crop_bottom
+    if cropped_rows <= 0:
+        return None
+    return (
+        f"crop=w=iw:h=ih-{cropped_rows}:x=0:y={crop_top}:"
+        "keep_aspect=1:exact=1"
+    )
+
+
 def build_pad_filter(mask_top: int, mask_bottom: int) -> str | None:
     """Build a pad that restores masked rows after denoise/color work."""
     masked_rows = mask_top + mask_bottom
@@ -934,6 +960,9 @@ def build_vf(cfg: Config, paths: Paths) -> str:
         return cfg.video_filter
 
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
+
+    if permanent_crop_filter := build_permanent_crop_filter(cfg.crop_top, cfg.crop_bottom):
+        filters.append(permanent_crop_filter)
 
     if crop_filter := build_crop_filter(cfg.mask_top, cfg.mask_bottom):
         filters.append(crop_filter)
@@ -1248,6 +1277,8 @@ def print_summary(
         crf = cfg.crf if cfg.crf is not None else default_x265_crf(cfg.format_type)
         print(f"x265 CRF: {crf:g}")
     print(f"Denoise preset: {cfg.denoise}")
+    print(f"Crop top rows: {cfg.crop_top}")
+    print(f"Crop bottom rows: {cfg.crop_bottom}")
     print(f"Top mask rows: {cfg.mask_top}")
     print(f"Bottom mask rows: {cfg.mask_bottom}")
     if cfg.format_type == "vhs":
@@ -1302,6 +1333,8 @@ def write_command_log(
         f"Codec: {cfg.codec}",
         f"Encoder: {cfg.encoder}",
         f"Denoise: {cfg.denoise}",
+        f"Crop top: {cfg.crop_top}",
+        f"Crop bottom: {cfg.crop_bottom}",
         f"Mask top: {cfg.mask_top}",
         f"Mask bottom: {cfg.mask_bottom}",
     ]

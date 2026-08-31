@@ -146,9 +146,9 @@ This wrapper prints the full normalization plan before asking for confirmation. 
 Shared encoding defaults:
 
 - All three formats default to `libx265` using the `slow` preset.
-- All three formats default to CRF `22`.
+- `video8` and `digital8` default to CRF `20`; `vhs` defaults to CRF `22`.
 - libx265 output is 10-bit HEVC (`yuv420p10le`) with the `hvc1` tag for Apple compatibility.
-- Lower CRF values mean higher quality and larger files; use `--crf 20` for a more conservative derivative when needed.
+- Lower CRF values mean higher quality and larger files; VHS can be overridden with `--crf 20` for a more conservative derivative when needed.
 - Use `--encoder videotoolbox` for the previous hardware-accelerated path. Its default quality value remains `--q 70`.
 
 `video8` flow:
@@ -187,10 +187,11 @@ Digital8 validation behavior:
   - `analyze-audio`: write/reuse audio-analysis JSON and skip video output
 - Important defaults:
   - `--codec hevc`
-  - `video8` and `digital8`: `--encoder libx265 --preset slow --crf 22`
+  - `video8` and `digital8`: `--encoder libx265 --preset slow --crf 20`
   - `vhs`: `--encoder libx265 --preset slow --crf 22`
   - `--denoise verylight`
   - `--deint-mode send_field`
+  - `--crop-top 0` and `--crop-bottom 0`; permanent cropping preserves the input display aspect ratio
   - VideoToolbox `--q 70`
   - `video8` default `--mask-bottom 7`
   - `digital8` default `--mask-bottom 0`
