@@ -6,13 +6,14 @@ repo_root=$(cd "$workflow_root/.." && pwd)
 workspace_root=$(cd "$repo_root/.." && pwd)
 transcoder="$repo_root/scripts/transcode_access.py"
 
+# shellcheck disable=SC2034  # Used by currently commented manifest rows.
 delivery_20260702="$workspace_root/2.2, 2.4, audio/Archival Master Files [Video]/tu.brian.2026.07.02/data/masters/tape"
 delivery_20260731='/Volumes/video masters/Brian Zoe childhood home videos - 8mm/Archival Works Bag 20260731/Tu.Brian.2026.07.31/data/masters/tape'
 
 manifest=(
-  "$delivery_20260702/063_12_13_98.mkv|2 12.13.98 -|Set_2_2_out.mp4"
-  "$delivery_20260702/064_Brian_Piano_2001.mkv|4 Brian Piano 2001|Set_2_4_out.mp4"
-  "$delivery_20260731/001_2001.mkv|1 2001|Set_2_1_out.mp4"
+  #"$delivery_20260702/063_12_13_98.mkv|2 12.13.98 -|Set_2_2_out.mp4"
+  #"$delivery_20260702/064_Brian_Piano_2001.mkv|4 Brian Piano 2001|Set_2_4_out.mp4"
+  #"$delivery_20260731/001_2001.mkv|1 2001|Set_2_1_out.mp4"
   "$delivery_20260731/002_1999.mkv|3 窗子漏水, 1999|Set_2_3_out.mp4"
   # Redo requested from the transfer company; uncomment this one line when replaced.
   # "$delivery_20260731/003_1999.mkv|5 1999|Set_2_5_out.mp4"
@@ -99,7 +100,8 @@ echo "Set 2 professional-master transcode"
 echo "  Access:     $access_root"
 echo "  Logs:       $logs_root"
 echo "  Transcode:  Video8, libx265 slow, CRF 20, denoise verylight"
-echo "  Geometry:   crop 6 top / 0 bottom, preserve 4:3, mask bottom 7"
+echo "  Geometry:   crop 6 top, pad 6 bottom, mask bottom 12, output 640x480"
+echo "  Audio:      +12 dB fixed gain, -1.5 dB peak ceiling"
 echo
 echo "Manifest ($manifest_count masters):"
 
@@ -165,6 +167,11 @@ for ((i = 0; i < manifest_count; i++)); do
     --mode transcode \
     --format video8 \
     --crop-top 6 \
+    --pad-bottom 6 \
+    --mask-bottom 12 \
+    --output-height 480 \
+    --audio-gain 12 \
+    --audio-peak-ceiling -1.5 \
     --output-dir "$target_dir" \
     --log-dir "$log_dir" \
     --yes \

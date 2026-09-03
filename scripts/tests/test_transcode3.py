@@ -25,6 +25,9 @@ def make_config(**overrides) -> transcode3.Config:
         "end": None,
         "crop_top": 0,
         "crop_bottom": 0,
+        "pad_top": 0,
+        "pad_bottom": 0,
+        "output_height": None,
         "mask_top": 0,
         "mask_bottom": 0,
         "denoise": "off",
@@ -256,6 +259,26 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(cfg.crop_top, 5)
         self.assertEqual(cfg.crop_bottom, 1)
 
+    def test_parse_args_supports_permanent_padding_and_output_height(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--crop-top",
+            "6",
+            "--pad-bottom",
+            "6",
+            "--output-height",
+            "480",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg, _ = transcode3.parse_args()
+
+        self.assertEqual(cfg.crop_top, 6)
+        self.assertEqual(cfg.pad_bottom, 6)
+        self.assertEqual(cfg.output_height, 480)
+
     def test_parse_args_rejects_negative_permanent_crop(self) -> None:
         argv = [
             "transcode3.py",
@@ -263,6 +286,30 @@ class TestParseArgs(unittest.TestCase):
             "video8",
             "--crop-top",
             "-1",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
+
+    def test_parse_args_rejects_negative_permanent_padding(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--pad-bottom",
+            "-1",
+            "Originals/set/tape/out.mkv",
+        ]
+        with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
+            transcode3.parse_args()
+
+    def test_parse_args_rejects_odd_output_height(self) -> None:
+        argv = [
+            "transcode3.py",
+            "--format",
+            "video8",
+            "--output-height",
+            "479",
             "Originals/set/tape/out.mkv",
         ]
         with patch.object(sys, "argv", argv), self.assertRaises(SystemExit):
@@ -772,6 +819,30 @@ class TestFiltersAndArgs(unittest.TestCase):
         self.assertLess(vf.index(permanent_crop), vf.index(mask_crop))
         self.assertLess(vf.index(mask_crop), vf.index(denoise))
         self.assertLess(vf.index(denoise), vf.index(mask_pad))
+
+    def test_opposite_edge_padding_preserves_sar_before_uniform_output_scale(self) -> None:
+        paths = make_paths(Path("/tmp"))
+        cfg = make_config(
+            crop_top=6,
+            pad_bottom=6,
+            mask_bottom=12,
+            output_height=480,
+            denoise="verylight",
+        )
+
+        vf = transcode3.build_vf(cfg, paths)
+
+        permanent_crop = "crop=w=iw:h=ih-6:x=0:y=6:exact=1"
+        mask_crop = "crop=w=iw:h=ih-12:x=0:y=0"
+        mask_pad = "pad=w=iw:h=ih+12:x=0:y=0:color=black"
+        permanent_pad = "pad=w=iw:h=ih+6:x=0:y=0:color=black"
+        scale = "scale=trunc(480*dar/2)*2:480:flags=lanczos+accurate_rnd+full_chroma_int"
+        self.assertIn(permanent_crop, vf)
+        self.assertNotIn("keep_aspect=1", vf)
+        self.assertLess(vf.index(permanent_crop), vf.index(mask_crop))
+        self.assertLess(vf.index(mask_crop), vf.index(mask_pad))
+        self.assertLess(vf.index(mask_pad), vf.index(permanent_pad))
+        self.assertLess(vf.index(permanent_pad), vf.index(scale))
 
     def test_limited_range_tagging_omits_hardcoded_smpte_color_metadata(self) -> None:
         paths = transcode3.Paths(

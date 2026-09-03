@@ -53,6 +53,20 @@ What is optional vs enforced:
 - Transcode duration validation is enabled by default in `--mode transcode` and can be skipped with `--no-validate-duration`.
 - `--mode preview` never writes final access outputs and never runs duration validation.
 
+Digital8 replay batches:
+
+- `../set1.sh`, `../set3.sh`, and `../unnumbered.sh` reproduce the historical split flags and unsplit grouping specs for their respective batches, then transcode the logical outputs and captures that were intentionally left whole. The entrypoints and their shared `../_digital8_split_transcode_common.sh` helper live beside the `scripts/` repository in the media workspace.
+- The scripts use current paths under `8mm Originals/`, not the obsolete absolute paths recorded in the historical `.cmd` files. Set 3 tapes 17 and 18 use the current apostrophe-free `Brians` spelling.
+- A tape/job is skipped when its corresponding relative directory already exists under `8mm Access/`, allowing later invocations to continue with directories that have not yet produced access copies.
+- Each split tape is completed and duration-validated before the next begins. Numbered split files are removed after regrouping, and lettered logical DV files are removed after a successful validated transcode, limiting scratch-space use; pass `--keep-parts` to retain the lettered files.
+- Run any batch with `--plan-only` to inspect its complete manifest without reading or writing media.
+
+Access-copy verification:
+
+- `../verify_set1.sh`, `../verify_set2.sh`, `../verify_set3.sh`, and `../verify_unnumbered.sh` compare the local `8mm Access/` batch against `/Volumes/video/Brian Zoe childhood home videos/`.
+- Each verifier requires an exact MP4 file count and exact relative paths and filenames. First-video-stream durations are derived from ffprobe timestamps and time bases and may differ by at most 1 ms by default, far below one 59.94 fps frame; override this with `--duration-tolerance SECONDS`.
+- A verifier exits nonzero for any mismatch or unreadable file. Pass `--quiet` to print only mismatches and the final summary.
+
 **VHS Color Split Workflow**
 For the VHS color-split access workflow, run these commands from `/Users/btu/scratch/Videos`.
 The VHS shell entrypoints and rename map live in this repository under `scripts/vhs_workflow/`; the shared Python tools remain under `scripts/scripts/`. Media outputs still live under `/Users/btu/scratch/Videos` by default. Master video files are expected under `/Volumes/TU/tu.brian.2026.05.09/data/masters/tape` by default. Generated task files such as `transcode_vhs_color_split.tasks` are not checked in.

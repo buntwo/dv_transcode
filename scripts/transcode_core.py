@@ -73,6 +73,9 @@ class Config:
     logs_dirname: str
     crop_top: int = 0
     crop_bottom: int = 0
+    pad_top: int = 0
+    pad_bottom: int = 0
+    output_height: int | None = None
     vhs_notch: str = "auto"
     audio_channel: str = "keep"
     audio_gain: float | None = None
@@ -213,6 +216,13 @@ def add_common_transcode_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--end")
     parser.add_argument("--crop-top", type=int, default=0, help="Permanently remove rows from the top")
     parser.add_argument("--crop-bottom", type=int, default=0, help="Permanently remove rows from the bottom")
+    parser.add_argument("--pad-top", type=int, default=0, help="Permanently add black rows at the top after cropping")
+    parser.add_argument("--pad-bottom", type=int, default=0, help="Permanently add black rows at the bottom after cropping")
+    parser.add_argument(
+        "--output-height",
+        type=int,
+        help="Uniformly scale the final square-pixel output to this height",
+    )
     parser.add_argument("--mask-top", type=int)
     parser.add_argument("--mask-bottom", type=int)
     parser.add_argument("--denoise", choices=["off", "verylight", "light", "medium", "strong"])
@@ -285,8 +295,23 @@ def validate_common_transcode_args(parser: argparse.ArgumentParser, args: argpar
         parser.error("--crop-top cannot be negative")
     if args.crop_bottom < 0:
         parser.error("--crop-bottom cannot be negative")
-    if args.video_filter is not None and (args.crop_top or args.crop_bottom):
-        parser.error("--crop-top/--crop-bottom cannot be combined with --vf; include crop in --vf")
+    if args.pad_top < 0:
+        parser.error("--pad-top cannot be negative")
+    if args.pad_bottom < 0:
+        parser.error("--pad-bottom cannot be negative")
+    if args.output_height is not None and (args.output_height <= 0 or args.output_height % 2):
+        parser.error("--output-height must be a positive even integer")
+    if args.video_filter is not None and (
+        args.crop_top
+        or args.crop_bottom
+        or args.pad_top
+        or args.pad_bottom
+        or args.output_height is not None
+    ):
+        parser.error(
+            "--crop-top/--crop-bottom/--pad-top/--pad-bottom/--output-height "
+            "cannot be combined with --vf; include the geometry operations in --vf"
+        )
     if args.video_filter is not None and args.lut is not None:
         parser.error("--lut cannot be combined with --vf; include lut3d in --vf")
     if args.video_filter is not None and args.vhs_color_correct:
@@ -345,6 +370,9 @@ def config_from_args(args: argparse.Namespace, *, layout: str) -> Config:
         logs_dirname=args.logs_dirname,
         crop_top=args.crop_top,
         crop_bottom=args.crop_bottom,
+        pad_top=args.pad_top,
+        pad_bottom=args.pad_bottom,
+        output_height=args.output_height,
         vhs_notch=args.vhs_notch,
         audio_channel=args.audio_channel,
         audio_gain=args.audio_gain,
@@ -935,23 +963,46 @@ def build_crop_filter(mask_top: int, mask_bottom: int) -> str | None:
     return f"crop=w=iw:h=ih-{masked_rows}:x=0:y={mask_top}"
 
 
-def build_permanent_crop_filter(crop_top: int, crop_bottom: int) -> str | None:
-    """Build a permanent crop that preserves the input display aspect ratio."""
+def build_permanent_crop_filter(
+    crop_top: int,
+    crop_bottom: int,
+    *,
+    preserve_display_aspect: bool,
+) -> str | None:
+    """Build the permanent crop stage."""
     cropped_rows = crop_top + crop_bottom
     if cropped_rows <= 0:
         return None
-    return (
-        f"crop=w=iw:h=ih-{cropped_rows}:x=0:y={crop_top}:"
-        "keep_aspect=1:exact=1"
-    )
+    crop = f"crop=w=iw:h=ih-{cropped_rows}:x=0:y={crop_top}"
+    if preserve_display_aspect:
+        crop += ":keep_aspect=1"
+    return crop + ":exact=1"
 
 
-def build_pad_filter(mask_top: int, mask_bottom: int) -> str | None:
+def build_permanent_pad_filter(pad_top: int, pad_bottom: int) -> str | None:
+    """Build permanent black padding applied after crop and cleanup."""
+    padded_rows = pad_top + pad_bottom
+    if padded_rows <= 0:
+        return None
+    return f"pad=w=iw:h=ih+{padded_rows}:x=0:y={pad_top}:color=black"
+
+
+def build_mask_pad_filter(mask_top: int, mask_bottom: int) -> str | None:
     """Build a pad that restores masked rows after denoise/color work."""
     masked_rows = mask_top + mask_bottom
     if masked_rows <= 0:
         return None
     return f"pad=w=iw:h=ih+{masked_rows}:x=0:y={mask_top}:color=black"
+
+
+def build_scale_filter(output_height: int | None) -> str:
+    """Build square-pixel scaling, optionally normalizing output height."""
+    if output_height is None:
+        return SCALE_FILTER
+    return (
+        f"scale=trunc({output_height}*dar/2)*2:{output_height}:"
+        "flags=lanczos+accurate_rnd+full_chroma_int"
+    )
 
 
 def build_vf(cfg: Config, paths: Paths) -> str:
@@ -961,7 +1012,12 @@ def build_vf(cfg: Config, paths: Paths) -> str:
 
     filters = [f"bwdif=mode={cfg.deint_mode}:parity=auto:deint=all"]
 
-    if permanent_crop_filter := build_permanent_crop_filter(cfg.crop_top, cfg.crop_bottom):
+    has_permanent_padding = bool(cfg.pad_top or cfg.pad_bottom)
+    if permanent_crop_filter := build_permanent_crop_filter(
+        cfg.crop_top,
+        cfg.crop_bottom,
+        preserve_display_aspect=not has_permanent_padding,
+    ):
         filters.append(permanent_crop_filter)
 
     if crop_filter := build_crop_filter(cfg.mask_top, cfg.mask_bottom):
@@ -973,11 +1029,14 @@ def build_vf(cfg: Config, paths: Paths) -> str:
     if cfg.vhs_color_correct:
         filters.append(VHS_COLOR_CORRECTION_FILTER)
 
-    if pad_filter := build_pad_filter(cfg.mask_top, cfg.mask_bottom):
+    if pad_filter := build_mask_pad_filter(cfg.mask_top, cfg.mask_bottom):
         filters.append(pad_filter)
 
+    if permanent_pad_filter := build_permanent_pad_filter(cfg.pad_top, cfg.pad_bottom):
+        filters.append(permanent_pad_filter)
+
     filters += [
-        SCALE_FILTER,
+        build_scale_filter(cfg.output_height),
         "setsar=1",
         "setparams=range=limited",
     ]
@@ -1279,6 +1338,10 @@ def print_summary(
     print(f"Denoise preset: {cfg.denoise}")
     print(f"Crop top rows: {cfg.crop_top}")
     print(f"Crop bottom rows: {cfg.crop_bottom}")
+    print(f"Pad top rows: {cfg.pad_top}")
+    print(f"Pad bottom rows: {cfg.pad_bottom}")
+    if cfg.output_height is not None:
+        print(f"Output height: {cfg.output_height}")
     print(f"Top mask rows: {cfg.mask_top}")
     print(f"Bottom mask rows: {cfg.mask_bottom}")
     if cfg.format_type == "vhs":
@@ -1335,6 +1398,9 @@ def write_command_log(
         f"Denoise: {cfg.denoise}",
         f"Crop top: {cfg.crop_top}",
         f"Crop bottom: {cfg.crop_bottom}",
+        f"Pad top: {cfg.pad_top}",
+        f"Pad bottom: {cfg.pad_bottom}",
+        f"Output height: {cfg.output_height if cfg.output_height is not None else 'source'}",
         f"Mask top: {cfg.mask_top}",
         f"Mask bottom: {cfg.mask_bottom}",
     ]
